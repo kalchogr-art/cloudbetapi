@@ -4,5 +4,15 @@
   "name": "cloudbet-match-matcher",
   "observability": {
     "enabled": true
-  }
+  },
+  "services": [
+    {
+      "binding": "V27",
+      "service": "goal-watch-proxy"
+    },
+    {
+      "binding": "CLOUDBET",
+      "service": "cloudbetapi"
+    }
+  ]
 }
