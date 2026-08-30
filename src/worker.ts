@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER — DEBUG
+// CLOUDBET MATCH MATCHER — CLOUDBET RAW DEBUG
 // ============================================================
 
 function json(data: unknown, status = 200): Response {
@@ -16,17 +16,30 @@ function json(data: unknown, status = 200): Response {
 }
 
 async function readJson(response: Response): Promise<any> {
-  const text = await response.text();
+
+  const text =
+    await response.text();
 
   try {
-    return text ? JSON.parse(text) : {};
+
+    return text
+      ? JSON.parse(text)
+      : {};
+
   } catch {
+
     return {
       invalid_json: true,
-      raw: text.slice(0, 5000)
+      raw: text.slice(0, 10000)
     };
+
   }
 }
+
+
+// ============================================================
+// ROUTER
+// ============================================================
 
 export default {
 
@@ -35,16 +48,21 @@ export default {
     env: any
   ): Promise<Response> {
 
-    const url = new URL(request.url);
+    const url =
+      new URL(request.url);
 
     const path =
-      url.pathname.replace(/\/+$/, "") || "/";
+      url.pathname.replace(
+        /\/+$/,
+        ""
+      ) || "/";
+
 
     try {
 
-      // ========================================================
+      // ======================================================
       // HEALTH
-      // ========================================================
+      // ======================================================
 
       if (
         path === "/" ||
@@ -76,12 +94,12 @@ export default {
       }
 
 
-      // ========================================================
-      // DEBUG CLOUDBET
-      // ========================================================
+      // ======================================================
+      // CLOUDBET RAW
+      // ======================================================
 
       if (
-        path === "/debug-cloudbet"
+        path === "/cloudbet-raw"
       ) {
 
         const response =
@@ -106,17 +124,12 @@ export default {
             : [];
 
 
-        const liveEvents =
-          Array.isArray(
-            data?.live_events
-          )
-            ? data.live_events
-            : [];
-
-
         return json({
 
           success: true,
+
+          endpoint:
+            "cloudbet-raw",
 
           cloudbet_http_status:
             response.status,
@@ -142,31 +155,17 @@ export default {
             data?.live_events ??
             null,
 
-          live_events_array_length:
-            liveEvents.length,
-
           matching_events:
             data?.matching_events ??
             null,
 
-          matches_array_length:
+          matches_count:
             matches.length,
 
-          first_match:
-            matches[0] ||
-            null,
-
-          second_match:
-            matches[1] ||
-            null,
-
-          first_live_event:
-            liveEvents[0] ||
-            null,
-
-          errors:
-            data?.errors ||
-            [],
+          // Показваме целия response
+          // за да видим реалната структура.
+          cloudbet_response:
+            data,
 
           timestamp:
             new Date().toISOString()
@@ -176,74 +175,9 @@ export default {
       }
 
 
-      // ========================================================
-      // DEBUG V27
-      // ========================================================
-
-      if (
-        path === "/debug-v27"
-      ) {
-
-        const response =
-          await env.V27.fetch(
-            new Request(
-              "https://v27.internal/"
-            )
-          );
-
-
-        const data =
-          await readJson(
-            response
-          );
-
-
-        const matches =
-          Array.isArray(
-            data?.matches
-          )
-            ? data.matches
-            : [];
-
-
-        const liveMatches =
-          Array.isArray(
-            data?.live_matches
-          )
-            ? data.live_matches
-            : [];
-
-
-        return json({
-
-          success: true,
-
-          v27_http_status:
-            response.status,
-
-          response_keys:
-            Object.keys(
-              data || {}
-            ),
-
-          matches_array_length:
-            matches.length,
-
-          live_matches_array_length:
-            liveMatches.length,
-
-          first_match:
-            matches[0] ||
-            liveMatches[0] ||
-            null,
-
-          timestamp:
-            new Date().toISOString()
-
-        });
-
-      }
-
+      // ======================================================
+      // 404
+      // ======================================================
 
       return json({
 
@@ -258,9 +192,7 @@ export default {
 
           "/health",
 
-          "/debug-cloudbet",
-
-          "/debug-v27"
+          "/cloudbet-raw"
 
         ]
 
