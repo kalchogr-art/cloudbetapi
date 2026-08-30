@@ -1,9 +1,12 @@
 // ============================================================
-// CLOUDBET — LIVE HT OVER 0.5 V5
+// CLOUDBET — LIVE HT OVER 0.5 + MINUTE
 // READ ONLY
 // ============================================================
 
 const API_BASE =
+  "https://sports-api.cloudbet.com/pub/v2/odds";
+
+const EVENT_API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
 
 const API_KEY_NAME =
@@ -65,6 +68,7 @@ function getApiKey(env) {
 // ============================================================
 
 async function cloudbetFetch(
+  base,
   path,
   env
 ) {
@@ -74,7 +78,7 @@ async function cloudbetFetch(
 
   const response =
     await fetch(
-      `${API_BASE}${path}`,
+      `${base}${path}`,
       {
         method: "GET",
 
@@ -111,6 +115,7 @@ async function cloudbetFetch(
 
   }
 
+
   if (!response.ok) {
 
     throw new Error(
@@ -122,6 +127,7 @@ async function cloudbetFetch(
     );
 
   }
+
 
   return data;
 
@@ -135,6 +141,7 @@ async function cloudbetFetch(
 async function getSoccer(env) {
 
   return cloudbetFetch(
+    API_BASE,
     "/sports/soccer",
     env
   );
@@ -207,7 +214,7 @@ function extractCompetitions(
 
 
 // ============================================================
-// COMPETITION EVENTS
+// COMPETITION
 // ============================================================
 
 async function getCompetition(
@@ -216,9 +223,12 @@ async function getCompetition(
 ) {
 
   return cloudbetFetch(
+    API_BASE,
+
     `/competitions/${encodeURIComponent(
       competitionKey
     )}`,
+
     env
   );
 
@@ -226,7 +236,29 @@ async function getCompetition(
 
 
 // ============================================================
-// LIVE CHECK
+// SINGLE EVENT
+// ============================================================
+
+async function getEvent(
+  env,
+  eventId
+) {
+
+  return cloudbetFetch(
+    EVENT_API_BASE,
+
+    `/events/${encodeURIComponent(
+      eventId
+    )}`,
+
+    env
+  );
+
+}
+
+
+// ============================================================
+// LIVE
 // ============================================================
 
 function isLive(event) {
@@ -240,200 +272,174 @@ function isLive(event) {
 
 
 // ============================================================
-// MINUTE PARSER
+// DEEP MINUTE SEARCH
 // ============================================================
 
-function parseMinute(value) {
+function findMinuteDeep(
+  obj,
+  depth = 0
+) {
 
   if (
-    value === null ||
-    value === undefined
+    obj === null ||
+    obj === undefined ||
+    depth > 8
   ) {
+
     return null;
+
   }
+
 
   if (
-    typeof value === "number"
+    typeof obj === "number"
   ) {
 
-    return Number.isFinite(value)
-      ? Math.floor(value)
-      : null;
+    if (
+      Number.isFinite(obj) &&
+      obj >= 0 &&
+      obj <= 130
+    ) {
 
-  }
+      return Math.floor(obj);
 
-  const text =
-    String(value).trim();
+    }
 
-  if (!text) {
     return null;
+
   }
 
-  let match =
-    text.match(
-      /^(\d{1,3})\s*:\s*\d{1,2}/
-    );
 
-  if (match) {
-    return Number(match[1]);
+  if (
+    typeof obj === "string"
+  ) {
+
+    const text =
+      obj.trim();
+
+    if (!text) {
+      return null;
+    }
+
+
+    let match =
+      text.match(
+        /^(\d{1,3})\s*:\s*\d{1,2}/
+      );
+
+    if (match) {
+
+      return Number(
+        match[1]
+      );
+
+    }
+
+
+    match =
+      text.match(
+        /^(\d{1,3})\s*['′]/
+      );
+
+    if (match) {
+
+      return Number(
+        match[1]
+      );
+
+    }
+
+
+    return null;
+
   }
 
-  match =
-    text.match(
-      /(\d{1,3})\s*['′]/
-    );
 
-  if (match) {
-    return Number(match[1]);
+  if (
+    typeof obj !== "object"
+  ) {
+
+    return null;
+
   }
 
-  match =
-    text.match(
-      /^(\d{1,3})$/
-    );
 
-  if (match) {
-    return Number(match[1]);
-  }
+  const preferredKeys = [
 
-  return null;
+    "minute",
 
-}
+    "minutes",
 
+    "matchMinute",
 
-// ============================================================
-// GET MINUTE
-// ============================================================
+    "match_minute",
 
-function getMinute(event) {
+    "elapsedMinute",
 
-  const candidates = [
+    "elapsed_minute",
 
-    event?.minute,
+    "elapsed",
 
-    event?.matchMinute,
+    "clock",
 
-    event?.match_minute,
+    "matchTime",
 
-    event?.elapsedMinute,
+    "match_time",
 
-    event?.elapsed_minute,
+    "gameTime",
 
-    event?.clock,
+    "game_time",
 
-    event?.time,
+    "currentMinute",
 
-    event?.matchTime,
+    "current_minute",
 
-    event?.match_time
+    "time"
 
   ];
 
+
   for (
-    const value of candidates
+    const key of preferredKeys
   ) {
 
-    const minute =
-      parseMinute(value);
-
     if (
-      minute !== null
+      !Object.prototype.hasOwnProperty.call(
+        obj,
+        key
+      )
     ) {
 
-      return minute;
+      continue;
+
+    }
+
+
+    const parsed =
+      findMinuteDeep(
+        obj[key],
+        depth + 1
+      );
+
+
+    if (
+      parsed !== null
+    ) {
+
+      return parsed;
 
     }
 
   }
 
+
   return null;
 
 }
 
 
 // ============================================================
-// SCORE
-// ============================================================
-
-function getScore(event) {
-
-  let home = 0;
-  let away = 0;
-
-  if (
-    event?.score &&
-    typeof event.score === "object"
-  ) {
-
-    home =
-      Number(
-        event.score.home ??
-        event.score.home_score ??
-        0
-      );
-
-    away =
-      Number(
-        event.score.away ??
-        event.score.away_score ??
-        0
-      );
-
-  }
-
-  if (
-    event?.home &&
-    typeof event.home === "object"
-  ) {
-
-    home =
-      Number(
-        event.home.score ??
-        event.home.goals ??
-        home
-      );
-
-  }
-
-  if (
-    event?.away &&
-    typeof event.away === "object"
-  ) {
-
-    away =
-      Number(
-        event.away.score ??
-        event.away.goals ??
-        away
-      );
-
-  }
-
-  return {
-
-    home:
-      Number.isFinite(home)
-        ? home
-        : 0,
-
-    away:
-      Number.isFinite(away)
-        ? away
-        : 0
-
-  };
-
-}
-
-
-// ============================================================
-// FIND HT OVER 0.5
-// ============================================================
-//
-// CORRECT CLOUDBET MARKET:
-//
-// soccer.total_goals_period_first_half
-//
+// HT OVER 0.5
 // ============================================================
 
 function findHTOver05(event) {
@@ -501,15 +507,12 @@ function findHTOver05(event) {
       const selection of selections
     ) {
 
-      const outcome =
+      if (
         String(
           selection?.outcome || ""
-        )
-        .toLowerCase();
-
-
-      if (
-        outcome !== "over"
+        ).toLowerCase()
+        !==
+        "over"
       ) {
 
         continue;
@@ -517,15 +520,11 @@ function findHTOver05(event) {
       }
 
 
-      const params =
+      if (
         String(
           selection?.params || ""
-        )
-        .toLowerCase();
-
-
-      if (
-        params !==
+        ).toLowerCase()
+        !==
         "total=0.5"
       ) {
 
@@ -582,6 +581,12 @@ function findHTOver05(event) {
             selection?.probability || 0
           ),
 
+        status:
+          selection.status,
+
+        side:
+          selection?.side || null,
+
         minStake:
           Number(
             selection?.minStake || 0
@@ -591,12 +596,6 @@ function findHTOver05(event) {
           Number(
             selection?.maxStake || 0
           ),
-
-        status:
-          selection.status,
-
-        side:
-          selection?.side || null,
 
         marketUrl:
           selection?.marketUrl || null
@@ -614,7 +613,7 @@ function findHTOver05(event) {
 
 
 // ============================================================
-// MATCH NAME
+// TEAM NAME
 // ============================================================
 
 function getTeamName(team) {
@@ -626,6 +625,7 @@ function getTeamName(team) {
     return team;
 
   }
+
 
   if (
     team &&
@@ -640,16 +640,18 @@ function getTeamName(team) {
 
   }
 
+
   return null;
 
 }
 
 
 // ============================================================
-// NORMALIZE MATCH
+// MATCH NORMALIZER + MINUTE
 // ============================================================
 
-function normalizeMatch(
+async function normalizeMatch(
+  env,
   event,
   competition,
   bet
@@ -665,15 +667,58 @@ function normalizeMatch(
       event?.away
     );
 
-  const minute =
-    getMinute(
-      event
-    );
 
-  const score =
-    getScore(
-      event
-    );
+  let eventDetails =
+    null;
+
+  let minute =
+    null;
+
+
+  // ----------------------------------------------------------
+  // TRY SINGLE EVENT ENDPOINT
+  // ----------------------------------------------------------
+
+  try {
+
+    eventDetails =
+      await getEvent(
+        env,
+        event?.id
+      );
+
+
+    minute =
+      findMinuteDeep(
+        eventDetails
+      );
+
+  } catch {
+
+    eventDetails =
+      null;
+
+    minute =
+      null;
+
+  }
+
+
+  // ----------------------------------------------------------
+  // ALSO SEARCH ORIGINAL EVENT
+  // ----------------------------------------------------------
+
+  if (
+    minute === null
+  ) {
+
+    minute =
+      findMinuteDeep(
+        event
+      );
+
+  }
+
 
   return {
 
@@ -703,16 +748,6 @@ function normalizeMatch(
       minute !== null
         ? `${minute}'`
         : null,
-
-    score: {
-
-      home:
-        score.home,
-
-      away:
-        score.away
-
-    },
 
     competition: {
 
@@ -844,13 +879,15 @@ async function scanLive(
 
   const errors = [];
 
-  let totalEvents = 0;
+  let totalEvents =
+    0;
 
-  let liveEvents = 0;
+  let liveEvents =
+    0;
 
 
   // ==========================================================
-  // SCAN
+  // SCAN COMPETITIONS
   // ==========================================================
 
   for (
@@ -860,7 +897,7 @@ async function scanLive(
 
     try {
 
-      const result =
+      const data =
         await getCompetition(
           env,
           competition.key
@@ -869,9 +906,9 @@ async function scanLive(
 
       const events =
         Array.isArray(
-          result?.events
+          data?.events
         )
-          ? result.events
+          ? data.events
           : [];
 
 
@@ -909,14 +946,17 @@ async function scanLive(
         }
 
 
-        matches.push(
-
-          normalizeMatch(
+        const match =
+          await normalizeMatch(
+            env,
             event,
             competition,
             bet
-          )
+          );
 
+
+        matches.push(
+          match
         );
 
       }
@@ -943,26 +983,23 @@ async function scanLive(
 
 
   // ==========================================================
-  // SORT BY MINUTE
+  // SORT
   // ==========================================================
 
   matches.sort(
     (a, b) => {
 
-      const aMinute =
+      const am =
         a.minute === null
-          ? -1
+          ? 999
           : a.minute;
 
-      const bMinute =
+      const bm =
         b.minute === null
-          ? -1
+          ? 999
           : b.minute;
 
-      return (
-        aMinute -
-        bMinute
-      );
+      return am - bm;
 
     }
   );
@@ -983,6 +1020,9 @@ async function scanLive(
       "soccer",
 
     filter: {
+
+      live:
+        true,
 
       status:
         "TRADING_LIVE",
@@ -1044,9 +1084,11 @@ async function scanLive(
 
 async function health(env) {
 
-  let exists = false;
+  let exists =
+    false;
 
-  let length = 0;
+  let length =
+    0;
 
 
   try {
@@ -1054,14 +1096,16 @@ async function health(env) {
     const key =
       getApiKey(env);
 
-    exists = true;
+    exists =
+      true;
 
     length =
       key.length;
 
   } catch {
 
-    exists = false;
+    exists =
+      false;
 
   }
 
@@ -1072,7 +1116,7 @@ async function health(env) {
       true,
 
     worker:
-      "CLOUDBET LIVE HT OVER 0.5 V5",
+      "CLOUDBET LIVE HT OVER 0.5 + MINUTE",
 
     mode:
       "READ ONLY",
@@ -1139,7 +1183,7 @@ export default {
 
 
       // ------------------------------------------------------
-      // LIVE HT OVER 0.5
+      // LIVE
       // ------------------------------------------------------
 
       if (
@@ -1200,7 +1244,7 @@ export default {
             false,
 
           worker:
-            "CLOUDBET LIVE HT OVER 0.5 V5",
+            "CLOUDBET LIVE HT OVER 0.5 + MINUTE",
 
           error:
             error?.message ||
@@ -1216,7 +1260,6 @@ export default {
       );
 
     }
-
   }
 
-};
+}
