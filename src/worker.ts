@@ -1,17 +1,103 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run "npm run dev" in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run "npm run deploy" to publish your worker
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
-
 export default {
-  async fetch(request, env, ctx) {
-    // You can view your logs in the Observability dashboard
-    console.info({ message: 'Hello World Worker received a request!' }); 
-    return new Response('уо мадагакере!');
+  async fetch(
+    request: Request,
+    env: any
+  ): Promise<Response> {
+
+    const result: any = {
+      success: true,
+      worker: "cloudbet-match-matcher",
+      bindings: {}
+    };
+
+    // ==========================================================
+    // TEST V27
+    // ==========================================================
+
+    try {
+
+      const response =
+        await env.V27.fetch(
+          new Request(
+            "https://v27.internal/"
+          )
+        );
+
+      const text =
+        await response.text();
+
+      result.bindings.V27 = {
+        success: response.ok,
+        status: response.status,
+        response_length: text.length,
+        response_preview:
+          text.slice(0, 500)
+      };
+
+    } catch (error) {
+
+      result.bindings.V27 = {
+        success: false,
+        error:
+          error?.message ||
+          String(error)
+      };
+
+    }
+
+
+    // ==========================================================
+    // TEST CLOUDBET
+    // ==========================================================
+
+    try {
+
+      const response =
+        await env.CLOUDBET.fetch(
+          new Request(
+            "https://cloudbet.internal/live"
+          )
+        );
+
+      const text =
+        await response.text();
+
+      result.bindings.CLOUDBET = {
+        success: response.ok,
+        status: response.status,
+        response_length: text.length,
+        response_preview:
+          text.slice(0, 500)
+      };
+
+    } catch (error) {
+
+      result.bindings.CLOUDBET = {
+        success: false,
+        error:
+          error?.message ||
+          String(error)
+      };
+
+    }
+
+
+    return new Response(
+      JSON.stringify(
+        result,
+        null,
+        2
+      ),
+      {
+        status: 200,
+        headers: {
+          "content-type":
+            "application/json; charset=UTF-8",
+          "cache-control":
+            "no-store"
+        }
+      }
+    );
+
   }
 };
