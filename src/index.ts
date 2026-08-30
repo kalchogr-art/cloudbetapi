@@ -15,9 +15,10 @@
 //   /soccer-events    -> Soccer events + markets
 //   /live             -> LIVE soccer events + markets
 //
-// IMPORTANT:
-// Cloudbet Soccer:
-//   sports -> soccer -> competitions -> competition events
+// ADDED:
+//   - Over 0.5 FT extraction
+//   - Current score extraction
+//   - Match minute extraction when supplied by Cloudbet
 //
 // NO BETS ARE PLACED.
 // ============================================================
@@ -253,7 +254,7 @@ async function getSoccer(env) {
 
 
 // ============================================================
-// COMPETITIONS
+// EXTRACT COMPETITIONS
 // ============================================================
 
 function extractCompetitions(
@@ -354,16 +355,7 @@ async function getCompetition(
 
 
 // ============================================================
-// MARKET NORMALIZER
-// ============================================================
-//
-// Cloudbet returns markets in:
-//
-// event.markets
-//
-// We preserve the complete raw markets AND create
-// a normalized summary.
-//
+// MARKET SUMMARY
 // ============================================================
 
 function getMarketSummary(
@@ -515,6 +507,701 @@ function getMarketSummary(
 
 
 // ============================================================
+// OVER 0.5 FT
+// ============================================================
+//
+// Looks specifically for:
+//
+// market:
+//   soccer.total_goals
+//
+// submarket:
+//   period=ft
+//
+// outcome:
+//   over
+//
+// params:
+//   total=0.5
+//
+// status:
+//   SELECTION_ENABLED
+//
+// side:
+//   BACK
+//
+// ============================================================
+
+function getOver05(
+  event
+) {
+
+  const marketSummary =
+    getMarketSummary(event);
+
+
+  for (
+    const market
+    of marketSummary
+  ) {
+
+    if (
+      market.market !==
+      "soccer.total_goals"
+    ) {
+
+      continue;
+
+    }
+
+
+    if (
+      market.submarket !==
+      "period=ft"
+    ) {
+
+      continue;
+
+    }
+
+
+    for (
+      const selection
+      of market.selections
+    ) {
+
+      if (
+        selection.outcome !==
+        "over"
+      ) {
+
+        continue;
+
+      }
+
+
+      if (
+        selection.params !==
+        "total=0.5"
+      ) {
+
+        continue;
+
+      }
+
+
+      if (
+        selection.status !==
+        "SELECTION_ENABLED"
+      ) {
+
+        continue;
+
+      }
+
+
+      if (
+        selection.side !==
+        "BACK"
+      ) {
+
+        continue;
+
+      }
+
+
+      return {
+
+        available:
+          true,
+
+        price:
+          selection.price,
+
+        probability:
+          selection.probability,
+
+        minStake:
+          selection.minStake,
+
+        maxStake:
+          selection.maxStake,
+
+        status:
+          selection.status,
+
+        side:
+          selection.side,
+
+        market:
+          market.market,
+
+        submarket:
+          market.submarket,
+
+        outcome:
+          selection.outcome,
+
+        params:
+          selection.params,
+
+        marketUrl:
+          selection.marketUrl
+
+      };
+
+    }
+
+  }
+
+
+  return {
+
+    available:
+      false,
+
+    price:
+      null,
+
+    probability:
+      null,
+
+    minStake:
+      null,
+
+    maxStake:
+      null,
+
+    status:
+      null,
+
+    side:
+      null,
+
+    market:
+      "soccer.total_goals",
+
+    submarket:
+      "period=ft",
+
+    outcome:
+      "over",
+
+    params:
+      "total=0.5",
+
+    marketUrl:
+      null
+
+  };
+
+}
+
+
+// ============================================================
+// SCORE
+// ============================================================
+
+function getScore(
+  event
+) {
+
+  const homeCandidates = [
+
+    event?.score?.home,
+
+    event?.scores?.home,
+
+    event?.home?.score,
+
+    event?.homeScore,
+
+    event?.home_score
+
+  ];
+
+
+  const awayCandidates = [
+
+    event?.score?.away,
+
+    event?.scores?.away,
+
+    event?.away?.score,
+
+    event?.awayScore,
+
+    event?.away_score
+
+  ];
+
+
+  let home = null;
+  let away = null;
+
+
+  for (
+    const value
+    of homeCandidates
+  ) {
+
+    if (
+      value !== null &&
+      value !== undefined &&
+      value !== ""
+    ) {
+
+      const n =
+        Number(value);
+
+      if (
+        Number.isFinite(n)
+      ) {
+
+        home = n;
+
+        break;
+
+      }
+
+    }
+
+  }
+
+
+  for (
+    const value
+    of awayCandidates
+  ) {
+
+    if (
+      value !== null &&
+      value !== undefined &&
+      value !== ""
+    ) {
+
+      const n =
+        Number(value);
+
+      if (
+        Number.isFinite(n)
+      ) {
+
+        away = n;
+
+        break;
+
+      }
+
+    }
+
+  }
+
+
+  return {
+
+    home,
+
+    away,
+
+    text:
+      home !== null &&
+      away !== null
+        ? `${home}:${away}`
+        : null
+
+  };
+
+}
+
+
+// ============================================================
+// MATCH MINUTE
+// ============================================================
+//
+// Cloudbet may expose the live clock under different fields.
+// We check the fields that can safely contain the match time.
+//
+// We DO NOT calculate a fake minute from cutoffTime.
+//
+// ============================================================
+
+function getMatchMinute(
+  event
+) {
+
+  const directCandidates = [
+
+    event?.minute,
+
+    event?.match_minute,
+
+    event?.matchMinute,
+
+    event?.live_minute,
+
+    event?.liveMinute,
+
+    event?.current_minute,
+
+    event?.currentMinute,
+
+    event?.elapsed_minute,
+
+    event?.elapsedMinute
+
+  ];
+
+
+  for (
+    const value
+    of directCandidates
+  ) {
+
+    const parsed =
+      parseMinute(
+        value
+      );
+
+
+    if (
+      parsed !== null
+    ) {
+
+      return {
+
+        minute:
+          parsed,
+
+        display:
+          `${parsed}'`,
+
+        source:
+          "direct"
+
+      };
+
+    }
+
+  }
+
+
+  const nestedCandidates = [
+
+    event?.clock,
+
+    event?.timer,
+
+    event?.match_time,
+
+    event?.matchTime,
+
+    event?.time,
+
+    event?.live
+
+  ];
+
+
+  for (
+    const value
+    of nestedCandidates
+  ) {
+
+    if (
+      value === null ||
+      value === undefined
+    ) {
+
+      continue;
+
+    }
+
+
+    if (
+      typeof value === "object"
+    ) {
+
+      const objectCandidates = [
+
+        value?.minute,
+
+        value?.display,
+
+        value?.value,
+
+        value?.elapsed,
+
+        value?.time
+
+      ];
+
+
+      for (
+        const nested
+        of objectCandidates
+      ) {
+
+        const parsed =
+          parseMinute(
+            nested
+          );
+
+
+        if (
+          parsed !== null
+        ) {
+
+          return {
+
+            minute:
+              parsed,
+
+            display:
+              `${parsed}'`,
+
+            source:
+              "nested"
+
+          };
+
+        }
+
+      }
+
+    } else {
+
+      const parsed =
+        parseMinute(
+          value
+        );
+
+
+      if (
+        parsed !== null
+      ) {
+
+        return {
+
+          minute:
+            parsed,
+
+          display:
+            `${parsed}'`,
+
+          source:
+            "nested"
+
+        };
+
+      }
+
+    }
+
+  }
+
+
+  return {
+
+    minute:
+      null,
+
+    display:
+      null,
+
+    source:
+      null
+
+  };
+
+}
+
+
+// ============================================================
+// PARSE MINUTE
+// ============================================================
+
+function parseMinute(
+  value
+) {
+
+  if (
+    value === null ||
+    value === undefined ||
+    value === ""
+  ) {
+
+    return null;
+
+  }
+
+
+  if (
+    typeof value === "number"
+  ) {
+
+    if (
+      !Number.isFinite(value)
+    ) {
+
+      return null;
+
+    }
+
+
+    const n =
+      Math.floor(value);
+
+
+    if (
+      n < 0 ||
+      n > 130
+    ) {
+
+      return null;
+
+    }
+
+
+    return n;
+
+  }
+
+
+  const text =
+    String(value)
+      .trim();
+
+
+  if (!text)
+    return null;
+
+
+  // 34'
+  const apostrophe =
+    text.match(
+      /^(\d{1,3})\s*['′]/
+    );
+
+
+  if (
+    apostrophe
+  ) {
+
+    return validateMinute(
+      Number(
+        apostrophe[1]
+      )
+    );
+
+  }
+
+
+  // 34:21
+  const clock =
+    text.match(
+      /^(\d{1,3}):(\d{1,2})/
+    );
+
+
+  if (
+    clock
+  ) {
+
+    return validateMinute(
+      Number(
+        clock[1]
+      )
+    );
+
+  }
+
+
+  // 34+2
+  const added =
+    text.match(
+      /^(\d{1,3})\s*\+\s*(\d{1,2})/
+    );
+
+
+  if (
+    added
+  ) {
+
+    return validateMinute(
+      Number(
+        added[1]
+      ) +
+      Number(
+        added[2]
+      )
+    );
+
+  }
+
+
+  // plain number
+  const plain =
+    text.match(
+      /^(\d{1,3})$/
+    );
+
+
+  if (
+    plain
+  ) {
+
+    return validateMinute(
+      Number(
+        plain[1]
+      )
+    );
+
+  }
+
+
+  return null;
+
+}
+
+
+// ============================================================
+// VALIDATE MINUTE
+// ============================================================
+
+function validateMinute(
+  value
+) {
+
+  if (
+    !Number.isFinite(value)
+  ) {
+
+    return null;
+
+  }
+
+
+  const minute =
+    Math.floor(value);
+
+
+  if (
+    minute < 0 ||
+    minute > 130
+  ) {
+
+    return null;
+
+  }
+
+
+  return minute;
+
+}
+
+
+// ============================================================
 // EVENT NORMALIZER
 // ============================================================
 
@@ -556,6 +1243,18 @@ function normalizeEvent(
     getMarketSummary(event);
 
 
+  const over05 =
+    getOver05(event);
+
+
+  const score =
+    getScore(event);
+
+
+  const matchMinute =
+    getMatchMinute(event);
+
+
   return {
 
     id:
@@ -588,6 +1287,26 @@ function normalizeEvent(
       event?.cutoffTime ||
       null,
 
+    // --------------------------------------------------------
+    // CURRENT SCORE
+    // --------------------------------------------------------
+
+    score,
+
+    // --------------------------------------------------------
+    // CURRENT MATCH MINUTE
+    // --------------------------------------------------------
+
+    match_minute:
+      matchMinute,
+
+    // --------------------------------------------------------
+    // OVER 0.5 FT
+    // --------------------------------------------------------
+
+    over_05_ft:
+      over05,
+
     competition: {
 
       key:
@@ -615,7 +1334,7 @@ function normalizeEvent(
       marketSummary,
 
     // --------------------------------------------------------
-    // RAW CLOUDbet MARKETS
+    // RAW CLOUDBET MARKETS
     // --------------------------------------------------------
 
     markets:
@@ -634,10 +1353,6 @@ async function getSoccerEvents(
   env,
   request
 ) {
-
-  // ----------------------------------------------------------
-  // SOCCER CATALOGUE
-  // ----------------------------------------------------------
 
   const soccerResult =
     await getSoccer(env);
@@ -874,7 +1589,7 @@ async function getLive(
 
     // --------------------------------------------------------
     // ALL LIVE EVENTS
-    // INCLUDING MARKETS
+    // INCLUDING SCORE + MINUTE + OVER 0.5
     // --------------------------------------------------------
 
     live_events:
@@ -928,7 +1643,7 @@ async function health(
       true,
 
     worker:
-      "CLOUDBET SOCCER API V3",
+      "CLOUDBET SOCCER API V4",
 
     mode:
       "READ ONLY",
@@ -1236,7 +1951,7 @@ export default {
             false,
 
           worker:
-            "CLOUDBET SOCCER API V3",
+            "CLOUDBET SOCCER API V4",
 
           error:
             error?.message ||
