@@ -1,8 +1,4 @@
-// ============================================================
-// CLOUDBET MATCH MATCHER
-// V27 + CLOUDBET SERVICE BINDINGS
-// READ ONLY
-// ============================================================
+const MATCH_THRESHOLD = 0.45;
 
 type Env = {
   V27: Fetcher;
@@ -11,149 +7,144 @@ type Env = {
 
 type Obj = Record<string, any>;
 
-
-// ============================================================
-// JSON
-// ============================================================
-
-function json(
-  data: Obj,
-  status = 200
-): Response {
-
-  return new Response(
-    JSON.stringify(data, null, 2),
-    {
-      status,
-      headers: {
-        "content-type":
-          "application/json; charset=UTF-8",
-        "cache-control":
-          "no-store"
-      }
+function json(data: Obj, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=UTF-8",
+      "cache-control": "no-store"
     }
-  );
-
+  });
 }
 
-
-// ============================================================
-// SERVICE BINDING JSON
-// ============================================================
-
-async function bindingJson(
+async function getJson(
   binding: Fetcher,
   name: string,
   path: string
 ): Promise<Obj> {
 
-  const response =
-    await binding.fetch(
-      new Request(
-        `https://internal${path}`
-      )
-    );
+  const response = await binding.fetch(
+    new Request(`https://internal${path}`)
+  );
 
-  const text =
-    await response.text();
+  const text = await response.text();
 
   if (!response.ok) {
-
     throw new Error(
       `${name} HTTP ${response.status}`
     );
-
   }
 
   try {
-
-    return text
-      ? JSON.parse(text)
-      : {};
-
+    return text ? JSON.parse(text) : {};
   } catch {
-
     throw new Error(
-      `${name} returned non-JSON`
+      `${name} returned invalid JSON`
     );
-
   }
-
 }
 
 
 // ============================================================
-// NORMALIZE NAME
+// NORMALIZE
 // ============================================================
 
-function normalizeName(
-  value: any
-): string {
+function norm(value: any): string {
 
-  if (
-    value === null ||
-    value === undefined
-  ) {
-    return "";
-  }
-
-  return String(value)
+  return String(value ?? "")
     .toLowerCase()
     .normalize("NFD")
-    .replace(
-      /[\u0300-\u036f]/g,
-      ""
-    )
-    .replace(
-      /\(w\)|\(women\)/g,
-      " women"
-    )
-    .replace(
-      /\(u19\)/g,
-      " u19"
-    )
-    .replace(
-      /\(u20\)/g,
-      " u20"
-    )
-    .replace(
-      /\(u21\)/g,
-      " u21"
-    )
-    .replace(
-      /\(u23\)/g,
-      " u23"
-    )
-    .replace(
-      /\bfootball club\b/g,
-      ""
-    )
-    .replace(
-      /[^a-z0-9]+/g,
-      " "
-    )
-    .replace(
-      /\s+/g,
-      " "
-    )
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/\bfootball club\b/g, "")
+    .replace(/\bfc\b/g, "")
+    .replace(/\bsc\b/g, "")
+    .replace(/\bac\b/g, "")
+    .replace(/\bca\b/g, "")
+    .replace(/\bcf\b/g, "")
+    .replace(/\bcd\b/g, "")
+    .replace(/\bclub\b/g, "")
+    .replace(/\bcalcio\b/g, "")
+    .replace(/\bspa\b/g, "")
+    .replace(/\bsv\b/g, "")
+    .replace(/\bss\b/g, "")
+    .replace(/\bafc\b/g, "")
+    .replace(/\bw\b/g, "women")
+    .replace(/[()]/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 
 }
 
 
 // ============================================================
-// TOKENS
+// TOKEN SCORE
 // ============================================================
 
-function tokens(
-  value: any
-): string[] {
+function tokenScore(
+  a: any,
+  b: any
+): number {
 
-  return normalizeName(value)
-    .split(" ")
-    .filter(
-      x => x.length >= 2
-    );
+  const aa =
+    norm(a)
+      .split(" ")
+      .filter(Boolean);
+
+  const bb =
+    norm(b)
+      .split(" ")
+      .filter(Boolean);
+
+  if (
+    !aa.length ||
+    !bb.length
+  ) {
+    return 0;
+  }
+
+  if (
+    norm(a) === norm(b)
+  ) {
+    return 1;
+  }
+
+  let hits = 0;
+
+  for (
+    const x of aa
+  ) {
+
+    if (
+      bb.includes(x)
+    ) {
+      hits++;
+      continue;
+    }
+
+    if (
+      bb.some(
+        y =>
+          x.length >= 4 &&
+          y.length >= 4 &&
+          (
+            x.includes(y) ||
+            y.includes(x)
+          )
+      )
+    ) {
+      hits++;
+    }
+
+  }
+
+  return (
+    hits /
+    Math.max(
+      aa.length,
+      bb.length
+    )
+  );
 
 }
 
@@ -167,11 +158,8 @@ function teamScore(
   b: any
 ): number {
 
-  const na =
-    normalizeName(a);
-
-  const nb =
-    normalizeName(b);
+  const na = norm(a);
+  const nb = norm(b);
 
   if (
     !na ||
@@ -190,42 +178,12 @@ function teamScore(
     na.includes(nb) ||
     nb.includes(na)
   ) {
-    return 0.95;
+    return 0.90;
   }
 
-  const ta =
-    new Set(tokens(a));
-
-  const tb =
-    new Set(tokens(b));
-
-  if (
-    !ta.size ||
-    !tb.size
-  ) {
-    return 0;
-  }
-
-  let common = 0;
-
-  for (
-    const token of ta
-  ) {
-
-    if (
-      tb.has(token)
-    ) {
-      common++;
-    }
-
-  }
-
-  return (
-    common /
-    Math.max(
-      ta.size,
-      tb.size
-    )
+  return tokenScore(
+    a,
+    b
   );
 
 }
@@ -235,7 +193,7 @@ function teamScore(
 // MATCH SCORE
 // ============================================================
 
-function matchScore(
+function calculateMatchScore(
   v27: Obj,
   cb: Obj
 ): number {
@@ -273,110 +231,75 @@ function matchScore(
 
 
 // ============================================================
-// V27 MATCHES
+// EXTRACT MATCHES
 // ============================================================
 
-function getV27Matches(
+function extractV27(
   data: Obj
 ): Obj[] {
 
   if (
-    Array.isArray(
-      data.matches
-    )
+    Array.isArray(data.matches)
   ) {
     return data.matches;
   }
 
   if (
-    Array.isArray(
-      data.live_matches
-    )
+    Array.isArray(data.live_matches)
   ) {
     return data.live_matches;
   }
 
   if (
-    Array.isArray(
-      data.data
-    )
+    Array.isArray(data.data)
   ) {
     return data.data;
   }
 
   return [];
-
 }
 
 
-// ============================================================
-// CLOUDBET MATCHES
-// ============================================================
-
-function getCloudbetMatches(
+function extractCloudbet(
   data: Obj
 ): Obj[] {
 
   if (
-    Array.isArray(
-      data.matches
-    )
+    Array.isArray(data.matches)
   ) {
     return data.matches;
   }
 
   return [];
-
 }
 
 
 // ============================================================
-// HT OVER 0.5
+// CLOUDBET HT OVER 0.5
 // ============================================================
 
 function findHTOver05(
   event: Obj
 ): Obj | null {
 
-  const markets =
-    event.markets;
-
-  if (
-    !markets ||
-    typeof markets !== "object"
-  ) {
-    return null;
-  }
-
   const market =
-    markets[
+    event?.markets?.[
       "soccer.total_goals_period_first_half"
     ];
 
   if (
-    !market ||
-    typeof market !== "object"
-  ) {
-    return null;
-  }
-
-  const submarkets =
-    market.submarkets;
-
-  if (
-    !submarkets ||
-    typeof submarkets !== "object"
+    !market?.submarkets
   ) {
     return null;
   }
 
   for (
     const [
-      key,
+      submarketKey,
       rawSubmarket
     ]
     of Object.entries(
-      submarkets
+      market.submarkets
     )
   ) {
 
@@ -395,26 +318,21 @@ function findHTOver05(
       of selections
     ) {
 
-      const outcome =
-        String(
-          selection?.outcome ||
-          ""
-        ).toLowerCase();
-
-      const params =
-        String(
-          selection?.params ||
-          ""
-        ).toLowerCase();
-
       if (
-        outcome !== "over"
+        String(
+          selection?.outcome
+        ).toLowerCase()
+        !==
+        "over"
       ) {
         continue;
       }
 
       if (
-        params !==
+        String(
+          selection?.params
+        ).toLowerCase()
+        !==
         "total=0.5"
       ) {
         continue;
@@ -433,21 +351,18 @@ function findHTOver05(
         );
 
       if (
-        !Number.isFinite(
-          odds
-        ) ||
+        !Number.isFinite(odds) ||
         odds <= 1
       ) {
         continue;
       }
 
       return {
-
         market:
           "soccer.total_goals_period_first_half",
 
         submarket:
-          key,
+          submarketKey,
 
         outcome:
           selection.outcome,
@@ -459,33 +374,17 @@ function findHTOver05(
 
         probability:
           Number(
-            selection?.probability ||
-            0
+            selection?.probability || 0
           ),
 
         status:
           selection.status,
 
         side:
-          selection?.side ||
-          null,
-
-        minStake:
-          Number(
-            selection?.minStake ||
-            0
-          ),
-
-        maxStake:
-          Number(
-            selection?.maxStake ||
-            0
-          ),
+          selection?.side || null,
 
         marketUrl:
-          selection?.marketUrl ||
-          null
-
+          selection?.marketUrl || null
       };
 
     }
@@ -498,87 +397,159 @@ function findHTOver05(
 
 
 // ============================================================
-// MATCH GAMES
+// MATCH
 // ============================================================
 
-function matchGames(
-  v27Matches: Obj[],
-  cloudbetMatches: Obj[]
-): Obj[] {
+function findBestMatch(
+  v27: Obj,
+  cloudbet: Obj[],
+  used: Set<any>
+) {
 
-  const results: Obj[] = [];
+  let best: Obj | null = null;
+  let bestScore = 0;
+
+  for (
+    const cb of cloudbet
+  ) {
+
+    if (
+      used.has(cb.id)
+    ) {
+      continue;
+    }
+
+    if (
+      !cb.home ||
+      !cb.away
+    ) {
+      continue;
+    }
+
+    const score =
+      calculateMatchScore(
+        v27,
+        cb
+      );
+
+    if (
+      score > bestScore
+    ) {
+
+      bestScore =
+        score;
+
+      best =
+        cb;
+
+    }
+
+  }
+
+  return {
+    best,
+    score: bestScore
+  };
+
+}
+
+
+// ============================================================
+// MAIN
+// ============================================================
+
+async function matcher(
+  env: Env
+): Promise<Obj> {
+
+  const started =
+    Date.now();
+
+  const [
+    v27Data,
+    cloudbetData
+  ] = await Promise.all([
+
+    getJson(
+      env.V27,
+      "V27",
+      "/"
+    ),
+
+    getJson(
+      env.CLOUDBET,
+      "CLOUDBET",
+      "/live"
+    )
+
+  ]);
+
+  const v27Matches =
+    extractV27(
+      v27Data
+    );
+
+  const cloudbetMatches =
+    extractCloudbet(
+      cloudbetData
+    );
 
   const used =
     new Set<any>();
 
+  const matches: Obj[] = [];
+
+  const unmatched: Obj[] = [];
+
   for (
-    const v27
-    of v27Matches
+    const v27 of v27Matches
   ) {
 
-    if (
-      !v27?.home ||
-      !v27?.away
-    ) {
-      continue;
-    }
-
-    let best:
-      Obj | null = null;
-
-    let bestScore = 0;
-
-    for (
-      const cb
-      of cloudbetMatches
-    ) {
-
-      if (
-        used.has(cb.id)
-      ) {
-        continue;
-      }
-
-      if (
-        !cb?.home ||
-        !cb?.away
-      ) {
-        continue;
-      }
-
-      const score =
-        matchScore(
-          v27,
-          cb
-        );
-
-      if (
-        score >
-        bestScore
-      ) {
-
-        bestScore =
-          score;
-
-        best =
-          cb;
-
-      }
-
-    }
+    const result =
+      findBestMatch(
+        v27,
+        cloudbetMatches,
+        used
+      );
 
     if (
-      !best ||
-      bestScore < 0.70
+      !result.best ||
+      result.score <
+      MATCH_THRESHOLD
     ) {
+
+      unmatched.push({
+
+        v27_match:
+          v27.match ||
+          `${v27.home} - ${v27.away}`,
+
+        v27_home:
+          v27.home,
+
+        v27_away:
+          v27.away,
+
+        best_cloudbet:
+          result.best
+            ? result.best.match
+            : null,
+
+        best_score:
+          Number(
+            result.score.toFixed(3)
+          )
+
+      });
+
       continue;
     }
 
     used.add(
-      best.id
+      result.best.id
     );
 
-    results.push({
+    matches.push({
 
       match:
         v27.match ||
@@ -589,6 +560,11 @@ function matchGames(
 
       away:
         v27.away,
+
+      match_score:
+        Number(
+          result.score.toFixed(3)
+        ),
 
       v27: {
 
@@ -608,10 +584,7 @@ function matchGames(
 
         score:
           v27.score ??
-          {
-            home: null,
-            away: null
-          },
+          null,
 
         hunter_score:
           v27?.goal_signal?.score ??
@@ -623,101 +596,37 @@ function matchGames(
       cloudbet: {
 
         id:
-          best.id,
+          result.best.id,
 
         key:
-          best.key,
+          result.best.key,
 
         match:
-          best.match,
+          result.best.match,
 
         home:
-          best.home,
+          result.best.home,
 
         away:
-          best.away,
+          result.best.away,
 
         status:
-          best.status,
+          result.best.status,
 
         competition:
-          best.competition ??
+          result.best.competition ??
           null
 
       },
 
       ht_over_05:
         findHTOver05(
-          best
-        ),
-
-      match_score:
-        Number(
-          bestScore.toFixed(3)
+          result.best
         )
 
     });
 
   }
-
-  return results;
-
-}
-
-
-// ============================================================
-// MAIN MATCHER
-// ============================================================
-
-async function runMatcher(
-  env: Env
-): Promise<Obj> {
-
-  const started =
-    Date.now();
-
-
-  // ==========================================================
-  // V27 ROOT + CLOUDBET /live
-  // ==========================================================
-
-  const [
-    v27Data,
-    cloudbetData
-  ] = await Promise.all([
-
-    bindingJson(
-      env.V27,
-      "V27",
-      "/"
-    ),
-
-    bindingJson(
-      env.CLOUDBET,
-      "CLOUDBET",
-      "/live"
-    )
-
-  ]);
-
-
-  const v27Matches =
-    getV27Matches(
-      v27Data
-    );
-
-  const cloudbetMatches =
-    getCloudbetMatches(
-      cloudbetData
-    );
-
-
-  const matches =
-    matchGames(
-      v27Matches,
-      cloudbetMatches
-    );
-
 
   return {
 
@@ -740,6 +649,13 @@ async function runMatcher(
 
     },
 
+    settings: {
+
+      match_threshold:
+        MATCH_THRESHOLD
+
+    },
+
     stats: {
 
       v27_matches:
@@ -752,11 +668,7 @@ async function runMatcher(
         matches.length,
 
       unmatched:
-        Math.max(
-          0,
-          v27Matches.length -
-          matches.length
-        ),
+        unmatched.length,
 
       processing_ms:
         Date.now() -
@@ -765,6 +677,13 @@ async function runMatcher(
     },
 
     matches,
+
+    unmatched:
+
+      unmatched.slice(
+        0,
+        30
+      ),
 
     timestamp:
       new Date().toISOString()
@@ -796,12 +715,7 @@ export default {
         ""
       ) || "/";
 
-
     try {
-
-      // ------------------------------------------------------
-      // HEALTH
-      // ------------------------------------------------------
 
       if (
         path === "/" ||
@@ -822,27 +736,11 @@ export default {
           api_key:
             "NOT USED",
 
-          bindings: {
+          v27:
+            "SERVICE BINDING",
 
-            V27:
-              "goal-watch-proxy",
-
-            CLOUDBET:
-              "cloudbetapi"
-
-          },
-
-          endpoints: [
-
-            "/",
-
-            "/health",
-
-            "/live",
-
-            "/match"
-
-          ],
+          cloudbet:
+            "SERVICE BINDING /live",
 
           timestamp:
             new Date().toISOString()
@@ -851,83 +749,56 @@ export default {
 
       }
 
-
-      // ------------------------------------------------------
-      // MATCHER
-      // ------------------------------------------------------
-
       if (
         path === "/live" ||
         path === "/match"
       ) {
 
         return json(
-          await runMatcher(
+          await matcher(
             env
           )
         );
 
       }
 
+      return json({
 
-      // ------------------------------------------------------
-      // 404
-      // ------------------------------------------------------
+        success:
+          false,
 
-      return json(
+        error:
+          "Unknown endpoint",
 
-        {
+        available_endpoints: [
+          "/",
+          "/health",
+          "/live",
+          "/match"
+        ]
 
-          success:
-            false,
-
-          error:
-            "Unknown endpoint",
-
-          available_endpoints: [
-
-            "/",
-
-            "/health",
-
-            "/live",
-
-            "/match"
-
-          ]
-
-        },
-
-        404
-
-      );
+      }, 404);
 
     } catch (
       error: any
     ) {
 
-      return json(
+      return json({
 
-        {
+        success:
+          false,
 
-          success:
-            false,
+        worker:
+          "cloudbet-match-matcher",
 
-          worker:
-            "cloudbet-match-matcher",
+        error:
+          error?.message ||
+          String(error),
 
-          error:
-            error?.message ||
-            String(error),
+        timestamp:
+          new Date().toISOString()
 
-          timestamp:
-            new Date().toISOString()
-
-        },
-
-        500
-
-      );
+      }, 500);
 
     }
 
