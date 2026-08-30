@@ -1,7 +1,6 @@
 // ============================================================
 // CLOUDBET MATCH MATCHER
 // V27 + CLOUDBET SERVICE BINDINGS
-// NO API KEY
 // READ ONLY
 // ============================================================
 
@@ -10,7 +9,7 @@ type Env = {
   CLOUDBET: Fetcher;
 };
 
-type JsonObject = Record<string, any>;
+type Obj = Record<string, any>;
 
 
 // ============================================================
@@ -18,27 +17,23 @@ type JsonObject = Record<string, any>;
 // ============================================================
 
 function json(
-  data: JsonObject,
+  data: Obj,
   status = 200
 ): Response {
 
   return new Response(
-    JSON.stringify(
-      data,
-      null,
-      2
-    ),
+    JSON.stringify(data, null, 2),
     {
       status,
       headers: {
         "content-type":
           "application/json; charset=UTF-8",
-
         "cache-control":
           "no-store"
       }
     }
   );
+
 }
 
 
@@ -48,22 +43,21 @@ function json(
 
 async function bindingJson(
   binding: Fetcher,
-  name: string
-): Promise<JsonObject> {
+  name: string,
+  path: string
+): Promise<Obj> {
 
   const response =
     await binding.fetch(
       new Request(
-        "https://internal/"
+        `https://internal${path}`
       )
     );
 
   const text =
     await response.text();
 
-  if (
-    !response.ok
-  ) {
+  if (!response.ok) {
 
     throw new Error(
       `${name} HTTP ${response.status}`
@@ -71,14 +65,11 @@ async function bindingJson(
 
   }
 
-  let data: JsonObject;
-
   try {
 
-    data =
-      text
-        ? JSON.parse(text)
-        : {};
+    return text
+      ? JSON.parse(text)
+      : {};
 
   } catch {
 
@@ -88,7 +79,6 @@ async function bindingJson(
 
   }
 
-  return data;
 }
 
 
@@ -104,9 +94,7 @@ function normalizeName(
     value === null ||
     value === undefined
   ) {
-
     return "";
-
   }
 
   return String(value)
@@ -161,9 +149,7 @@ function tokens(
   value: any
 ): string[] {
 
-  return normalizeName(
-    value
-  )
+  return normalizeName(value)
     .split(" ")
     .filter(
       x => x.length >= 2
@@ -191,26 +177,20 @@ function teamScore(
     !na ||
     !nb
   ) {
-
     return 0;
-
   }
 
   if (
     na === nb
   ) {
-
     return 1;
-
   }
 
   if (
     na.includes(nb) ||
     nb.includes(na)
   ) {
-
     return 0.95;
-
   }
 
   const ta =
@@ -223,9 +203,7 @@ function teamScore(
     !ta.size ||
     !tb.size
   ) {
-
     return 0;
-
   }
 
   let common = 0;
@@ -237,9 +215,7 @@ function teamScore(
     if (
       tb.has(token)
     ) {
-
       common++;
-
     }
 
   }
@@ -260,8 +236,8 @@ function teamScore(
 // ============================================================
 
 function matchScore(
-  v27: JsonObject,
-  cb: JsonObject
+  v27: Obj,
+  cb: Obj
 ): number {
 
   const direct =
@@ -270,13 +246,11 @@ function matchScore(
         v27.home,
         cb.home
       ) +
-
       teamScore(
         v27.away,
         cb.away
       )
     ) / 2;
-
 
   const reverse =
     (
@@ -284,13 +258,11 @@ function matchScore(
         v27.home,
         cb.away
       ) +
-
       teamScore(
         v27.away,
         cb.home
       )
     ) / 2;
-
 
   return Math.max(
     direct,
@@ -305,17 +277,15 @@ function matchScore(
 // ============================================================
 
 function getV27Matches(
-  data: JsonObject
-): JsonObject[] {
+  data: Obj
+): Obj[] {
 
   if (
     Array.isArray(
       data.matches
     )
   ) {
-
     return data.matches;
-
   }
 
   if (
@@ -323,9 +293,7 @@ function getV27Matches(
       data.live_matches
     )
   ) {
-
     return data.live_matches;
-
   }
 
   if (
@@ -333,9 +301,7 @@ function getV27Matches(
       data.data
     )
   ) {
-
     return data.data;
-
   }
 
   return [];
@@ -348,14 +314,18 @@ function getV27Matches(
 // ============================================================
 
 function getCloudbetMatches(
-  data: JsonObject
-): JsonObject[] {
+  data: Obj
+): Obj[] {
 
-  return Array.isArray(
-    data.matches
-  )
-    ? data.matches
-    : [];
+  if (
+    Array.isArray(
+      data.matches
+    )
+  ) {
+    return data.matches;
+  }
+
+  return [];
 
 }
 
@@ -365,8 +335,8 @@ function getCloudbetMatches(
 // ============================================================
 
 function findHTOver05(
-  event: JsonObject
-): JsonObject | null {
+  event: Obj
+): Obj | null {
 
   const markets =
     event.markets;
@@ -375,9 +345,7 @@ function findHTOver05(
     !markets ||
     typeof markets !== "object"
   ) {
-
     return null;
-
   }
 
   const market =
@@ -386,11 +354,10 @@ function findHTOver05(
     ];
 
   if (
-    !market
+    !market ||
+    typeof market !== "object"
   ) {
-
     return null;
-
   }
 
   const submarkets =
@@ -400,28 +367,27 @@ function findHTOver05(
     !submarkets ||
     typeof submarkets !== "object"
   ) {
-
     return null;
-
   }
 
   for (
     const [
       key,
-      submarket
+      rawSubmarket
     ]
     of Object.entries(
       submarkets
     )
   ) {
 
+    const submarket =
+      rawSubmarket as Obj;
+
     const selections =
       Array.isArray(
-        (submarket as JsonObject)
-          ?.selections
+        submarket.selections
       )
-        ? (submarket as JsonObject)
-            .selections
+        ? submarket.selections
         : [];
 
     for (
@@ -444,27 +410,21 @@ function findHTOver05(
       if (
         outcome !== "over"
       ) {
-
         continue;
-
       }
 
       if (
         params !==
         "total=0.5"
       ) {
-
         continue;
-
       }
 
       if (
         selection?.status !==
         "SELECTION_ENABLED"
       ) {
-
         continue;
-
       }
 
       const odds =
@@ -478,9 +438,7 @@ function findHTOver05(
         ) ||
         odds <= 1
       ) {
-
         continue;
-
       }
 
       return {
@@ -510,6 +468,22 @@ function findHTOver05(
 
         side:
           selection?.side ||
+          null,
+
+        minStake:
+          Number(
+            selection?.minStake ||
+            0
+          ),
+
+        maxStake:
+          Number(
+            selection?.maxStake ||
+            0
+          ),
+
+        marketUrl:
+          selection?.marketUrl ||
           null
 
       };
@@ -524,57 +498,52 @@ function findHTOver05(
 
 
 // ============================================================
-// MATCH
+// MATCH GAMES
 // ============================================================
 
 function matchGames(
-  v27Matches: JsonObject[],
-  cloudbetMatches: JsonObject[]
-): JsonObject[] {
+  v27Matches: Obj[],
+  cloudbetMatches: Obj[]
+): Obj[] {
 
-  const results: JsonObject[] = [];
+  const results: Obj[] = [];
 
   const used =
     new Set<any>();
 
   for (
-    const v27 of v27Matches
+    const v27
+    of v27Matches
   ) {
 
     if (
       !v27?.home ||
       !v27?.away
     ) {
-
       continue;
-
     }
 
     let best:
-      JsonObject | null =
-      null;
+      Obj | null = null;
 
     let bestScore = 0;
 
     for (
-      const cb of cloudbetMatches
+      const cb
+      of cloudbetMatches
     ) {
 
       if (
         used.has(cb.id)
       ) {
-
         continue;
-
       }
 
       if (
         !cb?.home ||
         !cb?.away
       ) {
-
         continue;
-
       }
 
       const score =
@@ -602,9 +571,7 @@ function matchGames(
       !best ||
       bestScore < 0.70
     ) {
-
       continue;
-
     }
 
     used.add(
@@ -699,19 +666,19 @@ function matchGames(
 
 
 // ============================================================
-// MAIN
+// MAIN MATCHER
 // ============================================================
 
 async function runMatcher(
   env: Env
-): Promise<JsonObject> {
+): Promise<Obj> {
 
   const started =
     Date.now();
 
 
   // ==========================================================
-  // ONLY TWO SERVICE BINDING REQUESTS
+  // V27 ROOT + CLOUDBET /live
   // ==========================================================
 
   const [
@@ -721,12 +688,14 @@ async function runMatcher(
 
     bindingJson(
       env.V27,
-      "V27"
+      "V27",
+      "/"
     ),
 
     bindingJson(
       env.CLOUDBET,
-      "CLOUDBET"
+      "CLOUDBET",
+      "/live"
     )
 
   ]);
@@ -767,7 +736,7 @@ async function runMatcher(
         "V27 SERVICE BINDING",
 
       cloudbet:
-        "CLOUDBET SERVICE BINDING"
+        "CLOUDBET SERVICE BINDING /live"
 
     },
 
@@ -850,7 +819,7 @@ export default {
           mode:
             "READ ONLY",
 
-          cloudbet_api_key:
+          api_key:
             "NOT USED",
 
           bindings: {
@@ -862,6 +831,18 @@ export default {
               "cloudbetapi"
 
           },
+
+          endpoints: [
+
+            "/",
+
+            "/health",
+
+            "/live",
+
+            "/match"
+
+          ],
 
           timestamp:
             new Date().toISOString()
@@ -904,10 +885,15 @@ export default {
             "Unknown endpoint",
 
           available_endpoints: [
+
             "/",
+
             "/health",
+
             "/live",
+
             "/match"
+
           ]
 
         },
