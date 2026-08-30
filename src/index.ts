@@ -1,7 +1,26 @@
 // ============================================================
-// CLOUDBET — LIVE HT OVER 0.5 + MINUTE
-// READ ONLY
+// CLOUDBET — LIVE MATCH DIAGNOSTIC V2
+//
+// PURPOSE:
+// READ ONLY diagnostic worker.
+//
+// IMPORTANT:
+// HT OVER 0.5 FILTER IS DISABLED.
+//
+// We now collect ALL LIVE Cloudbet soccer events.
+// Goal:
+// 1. See real Cloudbet live matches
+// 2. See exact team names
+// 3. See exact event IDs
+// 4. See minute data
+// 5. Inspect market structure
+// 6. Prepare correct data for V27 ↔ Cloudbet matcher
+//
+// NO BETTING.
+// NO ORDERS.
+// NO BETTING ACTIONS.
 // ============================================================
+
 
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
@@ -20,7 +39,11 @@ const API_KEY_NAME =
 function json(data, status = 200) {
 
   return new Response(
-    JSON.stringify(data, null, 2),
+    JSON.stringify(
+      data,
+      null,
+      2
+    ),
     {
       status,
 
@@ -166,8 +189,10 @@ function extractCompetitions(
       ? soccer.categories
       : [];
 
+
   for (
-    const category of categories
+    const category
+    of categories
   ) {
 
     const list =
@@ -177,15 +202,20 @@ function extractCompetitions(
         ? category.competitions
         : [];
 
+
     for (
-      const competition of list
+      const competition
+      of list
     ) {
 
       if (
         !competition?.key
       ) {
+
         continue;
+
       }
+
 
       competitions.push({
 
@@ -207,6 +237,7 @@ function extractCompetitions(
     }
 
   }
+
 
   return competitions;
 
@@ -264,7 +295,11 @@ async function getEvent(
 function isLive(event) {
 
   return (
-    event?.status ===
+    String(
+      event?.status ||
+      ""
+    ).toUpperCase()
+    ===
     "TRADING_LIVE"
   );
 
@@ -301,7 +336,9 @@ function findMinuteDeep(
       obj <= 130
     ) {
 
-      return Math.floor(obj);
+      return Math.floor(
+        obj
+      );
 
     }
 
@@ -318,7 +355,9 @@ function findMinuteDeep(
       obj.trim();
 
     if (!text) {
+
       return null;
+
     }
 
 
@@ -394,13 +433,20 @@ function findMinuteDeep(
 
     "current_minute",
 
-    "time"
+    "time",
+
+    "timer",
+
+    "periodTime",
+
+    "period_time"
 
   ];
 
 
   for (
-    const key of preferredKeys
+    const key
+    of preferredKeys
   ) {
 
     if (
@@ -439,17 +485,219 @@ function findMinuteDeep(
 
 
 // ============================================================
-// HT OVER 0.5
+// TEAM NAME
 // ============================================================
 
-function findHTOver05(event) {
-
-  const markets =
-    event?.markets;
+function getTeamName(team) {
 
   if (
-    !markets ||
-    typeof markets !== "object"
+    typeof team === "string"
+  ) {
+
+    return team.trim();
+
+  }
+
+
+  if (
+    team &&
+    typeof team === "object"
+  ) {
+
+    return String(
+      team.name ||
+      team.key ||
+      team.abbreviation ||
+      ""
+    ).trim();
+
+  }
+
+
+  return "";
+
+}
+
+
+// ============================================================
+// TEAM EXTRACTION
+// ============================================================
+
+function resolveTeams(
+  event
+) {
+
+  const directHome =
+    getTeamName(
+      event?.home
+    );
+
+  const directAway =
+    getTeamName(
+      event?.away
+    );
+
+
+  if (
+    directHome &&
+    directAway
+  ) {
+
+    return {
+
+      home:
+        directHome,
+
+      away:
+        directAway,
+
+      source:
+        "fields"
+
+    };
+
+  }
+
+
+  const text =
+    String(
+      event?.name ||
+      event?.match ||
+      event?.event_name ||
+      event?.eventName ||
+      ""
+    ).trim();
+
+
+  if (text) {
+
+    let match =
+      text.match(
+        /^(.+?)\s+-\s+(.+)$/
+      );
+
+
+    if (match) {
+
+      return {
+
+        home:
+          match[1].trim(),
+
+        away:
+          match[2].trim(),
+
+        source:
+          "name"
+
+      };
+
+    }
+
+
+    match =
+      text.match(
+        /^(.+?)\s+v\s+(.+)$/i
+      );
+
+
+    if (match) {
+
+      return {
+
+        home:
+          match[1].trim(),
+
+        away:
+          match[2].trim(),
+
+        source:
+          "name"
+
+      };
+
+    }
+
+
+    match =
+      text.match(
+        /^(.+?)\s+vs\.?\s+(.+)$/i
+      );
+
+
+    if (match) {
+
+      return {
+
+        home:
+          match[1].trim(),
+
+        away:
+          match[2].trim(),
+
+        source:
+          "name"
+
+      };
+
+    }
+
+
+    match =
+      text.match(
+        /^(.+?)\s+@\s+(.+)$/
+      );
+
+
+    if (match) {
+
+      return {
+
+        home:
+          match[2].trim(),
+
+        away:
+          match[1].trim(),
+
+        source:
+          "name"
+
+      };
+
+    }
+
+  }
+
+
+  return {
+
+    home:
+      directHome,
+
+    away:
+      directAway,
+
+    source:
+      "partial"
+
+  };
+
+}
+
+
+// ============================================================
+// SCORE
+// ============================================================
+
+function findScoreDeep(
+  obj,
+  depth = 0
+) {
+
+  if (
+    obj === null ||
+    obj === undefined ||
+    depth > 8
   ) {
 
     return null;
@@ -457,17 +705,303 @@ function findHTOver05(event) {
   }
 
 
+  if (
+    typeof obj !== "object"
+  ) {
+
+    return null;
+
+  }
+
+
+  const homeKeys = [
+
+    "home",
+
+    "homeScore",
+
+    "home_score",
+
+    "scoreHome",
+
+    "homeGoals",
+
+    "home_goals"
+
+  ];
+
+
+  const awayKeys = [
+
+    "away",
+
+    "awayScore",
+
+    "away_score",
+
+    "scoreAway",
+
+    "awayGoals",
+
+    "away_goals"
+
+  ];
+
+
+  let home =
+    null;
+
+  let away =
+    null;
+
+
+  for (
+    const key
+    of homeKeys
+  ) {
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        obj,
+        key
+      )
+    ) {
+
+      const value =
+        Number(
+          obj[key]
+        );
+
+
+      if (
+        Number.isFinite(value)
+      ) {
+
+        home =
+          Math.floor(
+            value
+          );
+
+        break;
+
+      }
+
+    }
+
+  }
+
+
+  for (
+    const key
+    of awayKeys
+  ) {
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        obj,
+        key
+      )
+    ) {
+
+      const value =
+        Number(
+          obj[key]
+        );
+
+
+      if (
+        Number.isFinite(value)
+      ) {
+
+        away =
+          Math.floor(
+            value
+          );
+
+        break;
+
+      }
+
+    }
+
+  }
+
+
+  if (
+    home !== null &&
+    away !== null
+  ) {
+
+    return {
+
+      home,
+
+      away
+
+    };
+
+  }
+
+
+  for (
+    const value
+    of Object.values(
+      obj
+    )
+  ) {
+
+    if (
+      value &&
+      typeof value === "object"
+    ) {
+
+      const found =
+        findScoreDeep(
+          value,
+          depth + 1
+        );
+
+
+      if (
+        found
+      ) {
+
+        return found;
+
+      }
+
+    }
+
+  }
+
+
+  return null;
+
+}
+
+
+// ============================================================
+// MARKET SUMMARY
+// ============================================================
+
+function inspectMarkets(
+  event
+) {
+
+  const markets =
+    event?.markets;
+
+
+  if (
+    !markets ||
+    typeof markets !== "object"
+  ) {
+
+    return {
+
+      exists:
+        false,
+
+      count:
+        0,
+
+      keys:
+        []
+
+    };
+
+  }
+
+
+  const keys =
+    Object.keys(
+      markets
+    );
+
+
+  return {
+
+    exists:
+      true,
+
+    count:
+      keys.length,
+
+    keys:
+      keys.slice(
+        0,
+        100
+      )
+
+  };
+
+}
+
+
+// ============================================================
+// HT MARKET INSPECTION
+//
+// IMPORTANT:
+// This does NOT filter the match.
+// It only tells us whether the HT market exists.
+// ============================================================
+
+function inspectHTMarket(
+  event
+) {
+
+  const markets =
+    event?.markets;
+
+
+  if (
+    !markets ||
+    typeof markets !== "object"
+  ) {
+
+    return {
+
+      exists:
+        false,
+
+      market:
+        null,
+
+      submarkets:
+        []
+
+    };
+
+  }
+
+
+  const marketKey =
+    "soccer.total_goals_period_first_half";
+
+
   const market =
     markets[
-      "soccer.total_goals_period_first_half"
+      marketKey
     ];
+
 
   if (
     !market ||
     typeof market !== "object"
   ) {
 
-    return null;
+    return {
+
+      exists:
+        false,
+
+      market:
+        null,
+
+      submarkets:
+        []
+
+    };
 
   }
 
@@ -475,19 +1009,34 @@ function findHTOver05(event) {
   const submarkets =
     market?.submarkets;
 
+
   if (
     !submarkets ||
     typeof submarkets !== "object"
   ) {
 
-    return null;
+    return {
+
+      exists:
+        true,
+
+      market:
+        marketKey,
+
+      submarkets:
+        []
+
+    };
 
   }
 
 
+  const result = [];
+
+
   for (
     const [
-      submarketKey,
+      key,
       submarket
     ]
     of Object.entries(
@@ -503,221 +1052,172 @@ function findHTOver05(event) {
         : [];
 
 
-    for (
-      const selection of selections
-    ) {
+    result.push({
 
-      if (
-        String(
-          selection?.outcome || ""
-        ).toLowerCase()
-        !==
-        "over"
-      ) {
+      key,
 
-        continue;
+      selection_count:
+        selections.length,
 
-      }
+      selections:
+        selections
+          .slice(
+            0,
+            20
+          )
+          .map(
+            selection => ({
 
+              outcome:
+                selection?.outcome ??
+                null,
 
-      if (
-        String(
-          selection?.params || ""
-        ).toLowerCase()
-        !==
-        "total=0.5"
-      ) {
+              params:
+                selection?.params ??
+                null,
 
-        continue;
+              price:
+                selection?.price ??
+                null,
 
-      }
+              probability:
+                selection?.probability ??
+                null,
 
+              status:
+                selection?.status ??
+                null,
 
-      if (
-        selection?.status !==
-        "SELECTION_ENABLED"
-      ) {
+              side:
+                selection?.side ??
+                null
 
-        continue;
+            })
+          )
 
-      }
-
-
-      const price =
-        Number(
-          selection?.price || 0
-        );
-
-
-      if (
-        !Number.isFinite(price) ||
-        price <= 1
-      ) {
-
-        continue;
-
-      }
-
-
-      return {
-
-        market:
-          "soccer.total_goals_period_first_half",
-
-        submarket:
-          submarketKey,
-
-        outcome:
-          selection.outcome,
-
-        params:
-          selection.params,
-
-        odds:
-          price,
-
-        probability:
-          Number(
-            selection?.probability || 0
-          ),
-
-        status:
-          selection.status,
-
-        side:
-          selection?.side || null,
-
-        minStake:
-          Number(
-            selection?.minStake || 0
-          ),
-
-        maxStake:
-          Number(
-            selection?.maxStake || 0
-          ),
-
-        marketUrl:
-          selection?.marketUrl || null
-
-      };
-
-    }
+    });
 
   }
 
 
-  return null;
+  return {
+
+    exists:
+      true,
+
+    market:
+      marketKey,
+
+    submarkets:
+      result
+
+  };
 
 }
 
 
 // ============================================================
-// TEAM NAME
-// ============================================================
-
-function getTeamName(team) {
-
-  if (
-    typeof team === "string"
-  ) {
-
-    return team;
-
-  }
-
-
-  if (
-    team &&
-    typeof team === "object"
-  ) {
-
-    return (
-      team.name ||
-      team.key ||
-      null
-    );
-
-  }
-
-
-  return null;
-
-}
-
-
-// ============================================================
-// MATCH NORMALIZER + MINUTE
+// NORMALIZE EVENT
 // ============================================================
 
 async function normalizeMatch(
   env,
   event,
-  competition,
-  bet
+  competition
 ) {
 
-  const home =
-    getTeamName(
-      event?.home
-    );
-
-  const away =
-    getTeamName(
-      event?.away
+  const teams =
+    resolveTeams(
+      event
     );
 
 
   let eventDetails =
     null;
 
+
   let minute =
-    null;
+    findMinuteDeep(
+      event
+    );
+
+
+  let score =
+    findScoreDeep(
+      event
+    );
 
 
   // ----------------------------------------------------------
-  // TRY SINGLE EVENT ENDPOINT
+  // SINGLE EVENT ENDPOINT
   // ----------------------------------------------------------
 
   try {
 
-    eventDetails =
-      await getEvent(
-        env,
-        event?.id
-      );
+    if (
+      event?.id
+    ) {
+
+      eventDetails =
+        await getEvent(
+          env,
+          event.id
+        );
 
 
-    minute =
-      findMinuteDeep(
-        eventDetails
-      );
+      const detailMinute =
+        findMinuteDeep(
+          eventDetails
+        );
+
+
+      if (
+        detailMinute !== null
+      ) {
+
+        minute =
+          detailMinute;
+
+      }
+
+
+      const detailScore =
+        findScoreDeep(
+          eventDetails
+        );
+
+
+      if (
+        detailScore
+      ) {
+
+        score =
+          detailScore;
+
+      }
+
+    }
 
   } catch {
 
     eventDetails =
       null;
 
-    minute =
-      null;
-
   }
 
 
-  // ----------------------------------------------------------
-  // ALSO SEARCH ORIGINAL EVENT
-  // ----------------------------------------------------------
+  const marketInfo =
+    inspectMarkets(
+      eventDetails ||
+      event
+    );
 
-  if (
-    minute === null
-  ) {
 
-    minute =
-      findMinuteDeep(
-        event
-      );
-
-  }
+  const htMarket =
+    inspectHTMarket(
+      eventDetails ||
+      event
+    );
 
 
   return {
@@ -730,17 +1230,23 @@ async function normalizeMatch(
       event?.key ??
       null,
 
-    match:
-      event?.name ||
-      (
-        home && away
-          ? `${home} - ${away}`
-          : null
-      ),
+    name:
+      event?.name ??
+      event?.match ??
+      null,
 
-    home,
+    home:
+      teams.home,
 
-    away,
+    away:
+      teams.away,
+
+    team_source:
+      teams.source,
+
+    status:
+      event?.status ??
+      null,
 
     minute,
 
@@ -749,54 +1255,28 @@ async function normalizeMatch(
         ? `${minute}'`
         : null,
 
+    score,
+
     competition: {
 
       key:
-        competition?.key ||
+        competition?.key ??
         null,
 
       name:
-        competition?.name ||
+        competition?.name ??
         null
 
     },
 
-    bet: {
+    market_info:
+      marketInfo,
 
-      market:
-        bet.market,
+    ht_market:
+      htMarket,
 
-      period:
-        "HT",
-
-      outcome:
-        "OVER",
-
-      total:
-        "0.5",
-
-      odds:
-        bet.odds,
-
-      probability:
-        bet.probability,
-
-      status:
-        bet.status,
-
-      side:
-        bet.side,
-
-      minStake:
-        bet.minStake,
-
-      maxStake:
-        bet.maxStake,
-
-      marketUrl:
-        bet.marketUrl
-
-    }
+    event_detail_loaded:
+      !!eventDetails
 
   };
 
@@ -843,7 +1323,8 @@ async function scanLive(
     !Number.isFinite(limit)
   ) {
 
-    limit = 40;
+    limit =
+      40;
 
   }
 
@@ -853,7 +1334,9 @@ async function scanLive(
       1,
       Math.min(
         100,
-        Math.floor(limit)
+        Math.floor(
+          limit
+        )
       )
     );
 
@@ -878,6 +1361,7 @@ async function scanLive(
   const matches = [];
 
   const errors = [];
+
 
   let totalEvents =
     0;
@@ -921,8 +1405,16 @@ async function scanLive(
         of events
       ) {
 
+        // ----------------------------------------------------
+        // IMPORTANT:
+        // NO HT OVER 0.5 FILTER HERE.
+        // ALL LIVE EVENTS ARE KEPT.
+        // ----------------------------------------------------
+
         if (
-          !isLive(event)
+          !isLive(
+            event
+          )
         ) {
 
           continue;
@@ -933,25 +1425,11 @@ async function scanLive(
         liveEvents++;
 
 
-        const bet =
-          findHTOver05(
-            event
-          );
-
-
-        if (!bet) {
-
-          continue;
-
-        }
-
-
         const match =
           await normalizeMatch(
             env,
             event,
-            competition,
-            bet
+            competition
           );
 
 
@@ -961,7 +1439,9 @@ async function scanLive(
 
       }
 
-    } catch (error) {
+    } catch (
+      error
+    ) {
 
       errors.push({
 
@@ -983,26 +1463,66 @@ async function scanLive(
 
 
   // ==========================================================
-  // SORT
+  // SORT BY MINUTE
   // ==========================================================
 
   matches.sort(
-    (a, b) => {
+    (
+      a,
+      b
+    ) => {
 
       const am =
         a.minute === null
           ? 999
           : a.minute;
 
+
       const bm =
         b.minute === null
           ? 999
           : b.minute;
 
+
       return am - bm;
 
     }
   );
+
+
+  // ==========================================================
+  // STATS
+  // ==========================================================
+
+  const withNames =
+    matches.filter(
+      match =>
+        match.home &&
+        match.away
+    ).length;
+
+
+  const withMinute =
+    matches.filter(
+      match =>
+        match.minute !== null
+    ).length;
+
+
+  const withScore =
+    matches.filter(
+      match =>
+        match.score &&
+        match.score.home !== null &&
+        match.score.away !== null
+    ).length;
+
+
+  const withHTMarket =
+    matches.filter(
+      match =>
+        match.ht_market?.exists
+    ).length;
 
 
   return {
@@ -1011,13 +1531,16 @@ async function scanLive(
       true,
 
     endpoint:
-      "live-ht-over-0.5",
+      "live-all-matches",
 
     source:
       "Cloudbet",
 
     sport:
       "soccer",
+
+    test_mode:
+      "ALL CLOUDBET MATCHES — HT OVER 0.5 FILTER DISABLED",
 
     filter: {
 
@@ -1027,20 +1550,11 @@ async function scanLive(
       status:
         "TRADING_LIVE",
 
-      market:
-        "soccer.total_goals_period_first_half",
+      ht_over_05:
+        "DISABLED",
 
-      period:
-        "FIRST_HALF",
-
-      outcome:
-        "over",
-
-      total:
-        "0.5",
-
-      selection_status:
-        "SELECTION_ENABLED"
+      betting:
+        "DISABLED"
 
     },
 
@@ -1057,14 +1571,30 @@ async function scanLive(
 
     },
 
-    total_events:
-      totalEvents,
+    stats: {
 
-    live_events:
-      liveEvents,
+      total_events:
+        totalEvents,
 
-    matching_events:
-      matches.length,
+      live_events:
+        liveEvents,
+
+      matches_returned:
+        matches.length,
+
+      matches_with_names:
+        withNames,
+
+      matches_with_minute:
+        withMinute,
+
+      matches_with_score:
+        withScore,
+
+      matches_with_ht_market:
+        withHTMarket
+
+    },
 
     matches,
 
@@ -1082,7 +1612,9 @@ async function scanLive(
 // HEALTH
 // ============================================================
 
-async function health(env) {
+async function health(
+  env
+) {
 
   let exists =
     false;
@@ -1094,10 +1626,14 @@ async function health(env) {
   try {
 
     const key =
-      getApiKey(env);
+      getApiKey(
+        env
+      );
+
 
     exists =
       true;
+
 
     length =
       key.length;
@@ -1116,10 +1652,13 @@ async function health(env) {
       true,
 
     worker:
-      "CLOUDBET LIVE HT OVER 0.5 + MINUTE",
+      "CLOUDBET LIVE MATCH DIAGNOSTIC V2",
 
     mode:
       "READ ONLY",
+
+    ht_over_05_filter:
+      "DISABLED",
 
     secret: {
 
@@ -1176,7 +1715,9 @@ export default {
       ) {
 
         return json(
-          await health(env)
+          await health(
+            env
+          )
         );
 
       }
@@ -1234,7 +1775,9 @@ export default {
 
       );
 
-    } catch (error) {
+    } catch (
+      error
+    ) {
 
       return json(
 
@@ -1244,7 +1787,7 @@ export default {
             false,
 
           worker:
-            "CLOUDBET LIVE HT OVER 0.5 + MINUTE",
+            "CLOUDBET LIVE MATCH DIAGNOSTIC V2",
 
           error:
             error?.message ||
@@ -1260,6 +1803,7 @@ export default {
       );
 
     }
+
   }
 
-}
+};
