@@ -17,14 +17,13 @@
 // 6. CONFIDENT / POSSIBLE / TRUE UNMATCHED
 // 7. DIAGNOSTIC MODE
 // 8. READ ONLY
+// 9. FIXED REVERSED CONFIDENT SCORING
 // ============================================================
-
 
 interface Env {
   V27: Fetcher;
   CLOUDBET: Fetcher;
 }
-
 
 type AnyObj = Record<string, any>;
 
@@ -879,6 +878,7 @@ function detailedMatchScore(
 
     return {
       total: 0,
+      baseScore: 0,
       homeScore: 0,
       awayScore: 0,
       reverseHomeScore: 0,
@@ -1029,17 +1029,46 @@ function classifyMatch(
     detail.total;
 
 
-  // Reversed is never automatically
-  // considered confident unless BOTH
-  // teams are extremely strong.
+  // ==========================================================
+  // REVERSED MATCH
+  //
+  // IMPORTANT FIX:
+  // When direction is REVERSED, the correct team scores are
+  // reverseHomeScore and reverseAwayScore.
+  //
+  // Do NOT use normal homeScore / awayScore here.
+  // ==========================================================
+
   if (
     detail.direction ===
       "REVERSED"
   ) {
 
+    const reversedHome =
+      detail.reverseHomeScore;
+
+    const reversedAway =
+      detail.reverseAwayScore;
+
+    const reversedTotal =
+      (
+        reversedHome +
+        reversedAway
+      ) / 2;
+
+
+    // --------------------------------------------------------
+    // STRICT REVERSED CONFIDENT MATCH
+    // --------------------------------------------------------
+
     if (
-      home >= 0.90 &&
-      away >= 0.90
+      reversedHome >= 0.90 &&
+      reversedAway >= 0.90 &&
+      reversedTotal >=
+        Math.max(
+          threshold,
+          CONFIDENT_TOTAL_SCORE
+        )
     ) {
 
       return {
@@ -1050,6 +1079,11 @@ function classifyMatch(
           "STRONG_REVERSED_TWO_SIDED_MATCH"
       };
     }
+
+
+    // --------------------------------------------------------
+    // REVERSED CANDIDATE
+    // --------------------------------------------------------
 
     return {
       classification:
@@ -2756,7 +2790,7 @@ function health(): Response {
         "One team strong while the other is weak",
 
       reversed:
-        "Home/Away reversed candidates are separately classified"
+        "Home/Away reversed candidates use reversed team scores and are separately classified"
     },
 
 
