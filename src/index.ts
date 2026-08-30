@@ -1,7 +1,6 @@
 // ============================================================
-// CLOUDBET — LIVE SOCCER DISCOVERY
+// CLOUDBET — FAST LIVE SOCCER DISCOVERY
 // READ ONLY
-// ЦЕЛ: намираме реалните футболни мачове на живо
 // ============================================================
 
 const API =
@@ -9,6 +8,9 @@ const API =
 
 const KEY =
   "CLOUDBET_API_KEY";
+
+const MAX_COMPETITIONS = 40;
+const BATCH_SIZE = 8;
 
 function json(data, status = 200) {
   return new Response(
@@ -23,7 +25,7 @@ function json(data, status = 200) {
   );
 }
 
-function apiKey(env) {
+function getKey(env) {
   const key = env?.[KEY];
 
   if (!key || typeof key !== "string") {
@@ -37,9 +39,10 @@ async function cb(path, env) {
   const response = await fetch(
     `${API}${path}`,
     {
+      method: "GET",
       headers: {
-        "accept": "application/json",
-        "X-API-Key": apiKey(env),
+        accept: "application/json",
+        "X-API-Key": getKey(env),
         "cache-control": "no-cache"
       }
     }
@@ -47,12 +50,12 @@ async function cb(path, env) {
 
   const text = await response.text();
 
-  let data;
+  let data = {};
 
   try {
     data = text ? JSON.parse(text) : {};
   } catch {
-    data = { raw: text };
+    data = {};
   }
 
   if (!response.ok) {
@@ -64,125 +67,47 @@ async function cb(path, env) {
   return data;
 }
 
-// ------------------------------------------------------------
+// ============================================================
 // SOCCER CATALOGUE
-// ------------------------------------------------------------
+// ============================================================
 
 async function getSoccer(env) {
   return cb("/sports/soccer", env);
 }
 
-// ------------------------------------------------------------
+// ============================================================
 // COMPETITIONS
-// ------------------------------------------------------------
+// ============================================================
 
-function competitions(data) {
+function getCompetitions(data) {
   const result = [];
 
   for (const category of data?.categories || []) {
 
-    for (const c of category?.competitions || []) {
+    for (const competition of category?.competitions || []) {
 
-      if (!c?.key) continue;
+      if (!competition?.key) continue;
 
       result.push({
-        key: c.key,
-        name: c.name || c.key,
-        eventCount: Number(c.eventCount || 0)
+        key: competition.key,
+        name:
+          competition.name ||
+          competition.key,
+        eventCount:
+          Number(
+            competition.eventCount || 0
+          )
       });
 
     }
-
   }
 
   return result;
 }
 
-// ------------------------------------------------------------
-// FIND MINUTE
-// ------------------------------------------------------------
-
-function minute(obj, depth = 0) {
-
-  if (obj == null || depth > 7) {
-    return null;
-  }
-
-  if (typeof obj === "number") {
-    if (obj >= 0 && obj <= 130) {
-      return Math.floor(obj);
-    }
-    return null;
-  }
-
-  if (typeof obj === "string") {
-
-    let m = obj.match(
-      /^(\d{1,3})\s*:\s*\d{1,2}/
-    );
-
-    if (m) return Number(m[1]);
-
-    m = obj.match(
-      /^(\d{1,3})\s*['′]/
-    );
-
-    if (m) return Number(m[1]);
-
-    return null;
-  }
-
-  if (typeof obj !== "object") {
-    return null;
-  }
-
-  const keys = [
-    "minute",
-    "minutes",
-    "matchMinute",
-    "match_minute",
-    "elapsed",
-    "elapsedMinute",
-    "elapsed_minute",
-    "clock",
-    "matchTime",
-    "match_time",
-    "gameTime",
-    "game_time",
-    "currentMinute",
-    "current_minute",
-    "time"
-  ];
-
-  for (const key of keys) {
-
-    if (
-      Object.prototype.hasOwnProperty.call(
-        obj,
-        key
-      )
-    ) {
-
-      const value =
-        minute(
-          obj[key],
-          depth + 1
-        );
-
-      if (value !== null) {
-        return value;
-      }
-
-    }
-
-  }
-
-  return null;
-}
-
-// ------------------------------------------------------------
+// ============================================================
 // TEAM
-// ------------------------------------------------------------
+// ============================================================
 
 function team(value) {
 
@@ -205,19 +130,86 @@ function team(value) {
   return "";
 }
 
-// ------------------------------------------------------------
-// SCORE
-// ------------------------------------------------------------
+// ============================================================
+// MINUTE
+// ============================================================
 
-function score(event) {
+function getMinute(obj) {
+
+  if (!obj || typeof obj !== "object") {
+    return null;
+  }
+
+  const keys = [
+    "minute",
+    "matchMinute",
+    "match_minute",
+    "elapsed",
+    "elapsedMinute",
+    "elapsed_minute",
+    "currentMinute",
+    "current_minute",
+    "clock",
+    "matchTime",
+    "match_time",
+    "gameTime",
+    "game_time",
+    "time"
+  ];
+
+  for (const key of keys) {
+
+    const value = obj[key];
+
+    if (
+      typeof value === "number" &&
+      value >= 0 &&
+      value <= 130
+    ) {
+      return Math.floor(value);
+    }
+
+    if (typeof value === "string") {
+
+      let m =
+        value.match(
+          /^(\d{1,3})\s*:\s*\d{1,2}/
+        );
+
+      if (m) {
+        return Number(m[1]);
+      }
+
+      m =
+        value.match(
+          /^(\d{1,3})\s*['′]/
+        );
+
+      if (m) {
+        return Number(m[1]);
+      }
+
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
+// SCORE
+// ============================================================
+
+function getScore(event) {
 
   const s =
     event?.score ||
     event?.scores ||
-    event?.result ||
-    null;
+    event?.result;
 
-  if (!s || typeof s !== "object") {
+  if (
+    !s ||
+    typeof s !== "object"
+  ) {
     return null;
   }
 
@@ -236,11 +228,11 @@ function score(event) {
   };
 }
 
-// ------------------------------------------------------------
-// IS REAL FOOTBALL MATCH
-// ------------------------------------------------------------
+// ============================================================
+// REAL MATCH
+// ============================================================
 
-function isFootballMatch(event) {
+function isMatch(event) {
 
   const home =
     team(event?.home);
@@ -254,99 +246,187 @@ function isFootballMatch(event) {
   );
 }
 
-// ------------------------------------------------------------
-// DISCOVER LIVE
-// ------------------------------------------------------------
+// ============================================================
+// LIVE CHECK
+// ============================================================
+
+function isLive(event) {
+
+  const status =
+    String(
+      event?.status || ""
+    ).toUpperCase();
+
+  const live =
+    event?.live;
+
+  if (
+    status === "TRADING_LIVE"
+  ) {
+    return true;
+  }
+
+  if (
+    live === true
+  ) {
+    return true;
+  }
+
+  if (
+    typeof live === "string" &&
+    [
+      "LIVE",
+      "IN_PLAY",
+      "TRADING_LIVE",
+      "TRUE"
+    ].includes(
+      live.toUpperCase()
+    )
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+// ============================================================
+// FETCH COMPETITION
+// ============================================================
+
+async function fetchCompetition(
+  competition,
+  env
+) {
+
+  try {
+
+    const data =
+      await cb(
+        `/competitions/${encodeURIComponent(
+          competition.key
+        )}`,
+        env
+      );
+
+    const events =
+      Array.isArray(data?.events)
+        ? data.events
+        : [];
+
+    return {
+      competition,
+      events,
+      error: null
+    };
+
+  } catch (error) {
+
+    return {
+      competition,
+      events: [],
+      error:
+        error?.message ||
+        String(error)
+    };
+
+  }
+}
+
+// ============================================================
+// FAST DISCOVERY
+// ============================================================
 
 async function discover(env) {
 
   const soccer =
     await getSoccer(env);
 
-  const list =
-    competitions(soccer);
+  const all =
+    getCompetitions(soccer);
+
+  const selected =
+    all
+      .filter(
+        c =>
+          c.eventCount > 0
+      )
+      .slice(
+        0,
+        MAX_COMPETITIONS
+      );
 
   const matches = [];
   const errors = [];
 
   let totalEvents = 0;
-
   let footballEvents = 0;
-
-  let liveCandidates = 0;
+  let liveEvents = 0;
 
   // ----------------------------------------------------------
-  // CHECK ALL AVAILABLE COMPETITIONS
+  // PARALLEL BATCHES
   // ----------------------------------------------------------
 
-  for (const competition of list) {
+  for (
+    let i = 0;
+    i < selected.length;
+    i += BATCH_SIZE
+  ) {
 
-    try {
+    const batch =
+      selected.slice(
+        i,
+        i + BATCH_SIZE
+      );
 
-      const data =
-        await cb(
-          `/competitions/${encodeURIComponent(
-            competition.key
-          )}`,
-          env
-        );
+    const results =
+      await Promise.all(
+        batch.map(
+          competition =>
+            fetchCompetition(
+              competition,
+              env
+            )
+        )
+      );
 
-      const events =
-        Array.isArray(data?.events)
-          ? data.events
-          : [];
+    for (
+      const result
+      of results
+    ) {
+
+      if (result.error) {
+
+        errors.push({
+          competition:
+            result.competition.key,
+          name:
+            result.competition.name,
+          error:
+            result.error
+        });
+
+        continue;
+      }
 
       totalEvents +=
-        events.length;
+        result.events.length;
 
-      for (const event of events) {
+      for (
+        const event
+        of result.events
+      ) {
 
-        if (!isFootballMatch(event)) {
+        if (!isMatch(event)) {
           continue;
         }
 
         footballEvents++;
 
-        // ----------------------------------------------------
-        // LIVE INDICATORS
-        // ----------------------------------------------------
-
-        const m =
-          minute(event);
-
-        const status =
-          String(
-            event?.status || ""
-          ).toUpperCase();
-
-        const liveField =
-          event?.live;
-
-        const liveBoolean =
-          liveField === true;
-
-        const liveString =
-          typeof liveField === "string" &&
-          [
-            "LIVE",
-            "IN_PLAY",
-            "TRADING_LIVE",
-            "TRUE"
-          ].includes(
-            liveField.toUpperCase()
-          );
-
-        const looksLive =
-          status === "TRADING_LIVE" ||
-          liveBoolean ||
-          liveString ||
-          m !== null;
-
-        if (!looksLive) {
+        if (!isLive(event)) {
           continue;
         }
 
-        liveCandidates++;
+        liveEvents++;
 
         matches.push({
 
@@ -377,52 +457,66 @@ async function discover(env) {
             null,
 
           minute:
-            m,
+            getMinute(event),
 
           score:
-            score(event),
+            getScore(event),
 
           competition: {
             key:
-              competition.key,
+              result.competition.key,
 
             name:
-              competition.name
+              result.competition.name
           },
 
           event_keys:
             Object.keys(event || {})
 
         });
-
       }
-
-    } catch (error) {
-
-      errors.push({
-
-        competition:
-          competition.key,
-
-        name:
-          competition.name,
-
-        error:
-          error?.message ||
-          String(error)
-
-      });
-
     }
 
+    // --------------------------------------------------------
+    // IF WE FOUND LIVE MATCHES, STOP SCANNING
+    // --------------------------------------------------------
+
+    if (matches.length > 0) {
+      break;
+    }
   }
+
+  // ==========================================================
+  // SORT
+  // ==========================================================
+
+  matches.sort(
+    (a, b) => {
+
+      const am =
+        a.minute === null
+          ? 999
+          : a.minute;
+
+      const bm =
+        b.minute === null
+          ? 999
+          : b.minute;
+
+      return am - bm;
+    }
+  );
+
+  // ==========================================================
+  // RESULT
+  // ==========================================================
 
   return {
 
     success: true,
 
     test:
-      "CLOUDBET LIVE SOCCER DISCOVERY",
+      "CLOUDBET FAST LIVE SOCCER",
 
     filter:
       "SOCCER + LIVE ONLY",
@@ -430,14 +524,13 @@ async function discover(env) {
     source:
       "Cloudbet",
 
-    catalogue: {
+    stats: {
 
       competition_count:
-        list.length
+        all.length,
 
-    },
-
-    stats: {
+      competitions_checked:
+        selected.length,
 
       total_events:
         totalEvents,
@@ -445,8 +538,8 @@ async function discover(env) {
       football_events:
         footballEvents,
 
-      live_candidates:
-        liveCandidates,
+      live_events:
+        liveEvents,
 
       matches_found:
         matches.length
@@ -469,7 +562,10 @@ async function discover(env) {
 
 export default {
 
-  async fetch(request, env) {
+  async fetch(
+    request,
+    env
+  ) {
 
     const url =
       new URL(request.url);
@@ -492,7 +588,7 @@ export default {
           success: true,
 
           worker:
-            "cloudbet-live-soccer-discovery",
+            "cloudbet-fast-live-soccer",
 
           mode:
             "READ ONLY",
@@ -501,7 +597,9 @@ export default {
             "/live",
 
           secret:
-            Boolean(env?.[KEY]),
+            Boolean(
+              env?.[KEY]
+            ),
 
           timestamp:
             new Date().toISOString()
@@ -510,7 +608,9 @@ export default {
 
       }
 
-      if (path === "/live") {
+      if (
+        path === "/live"
+      ) {
 
         return json(
           await discover(env)
@@ -525,12 +625,11 @@ export default {
         error:
           "Unknown endpoint",
 
-        available:
-          [
-            "/",
-            "/health",
-            "/live"
-          ]
+        available: [
+          "/",
+          "/health",
+          "/live"
+        ]
 
       }, 404);
 
@@ -541,7 +640,7 @@ export default {
         success: false,
 
         worker:
-          "cloudbet-live-soccer-discovery",
+          "cloudbet-fast-live-soccer",
 
         error:
           error?.message ||
