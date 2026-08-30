@@ -1,0 +1,16 @@
+{
+	"compatibility_date": "2025-10-08",
+	"main": "src/index.ts",
+	"name": "cloudbetapi",
+	"upload_source_maps": true,
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_id": "47504554-5bf5-493e-ab82-c32901b11811",
+			"database_name": "CloudbetApi"
+		}
+	],
+	"observability": {
+		"enabled": true
+	}
+}
