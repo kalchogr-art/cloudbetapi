@@ -2,18 +2,20 @@
 // CLOUDBET MATCH MATCHER — DIAGNOSTIC V3
 //
 // V27 = Flashscore source
-// CLOUDBET = Cloudbet HT OVER 0.5 source
+// CLOUDBET = Cloudbet source
 //
 // IMPORTANT:
 // Flashscore ID != Cloudbet ID
 // Matching is done by team names.
 //
-// V3 FIX:
+// V3:
 // V27 sometimes returns only:
 //   match: "HOME - AWAY"
 // instead of separate home / away fields.
 //
-// This version extracts teams from match text automatically.
+// TEST MODE:
+// Cloudbet Over 0.5 HT filter DISABLED.
+// We compare ALL Cloudbet matches against V27.
 //
 // READ ONLY.
 // NO BETTING.
@@ -355,7 +357,7 @@ function extractTeamsFromMatch(
 
 
   // ----------------------------------------------------------
-  // "HOME - AWAY"
+  // HOME - AWAY
   // ----------------------------------------------------------
 
   let match =
@@ -374,7 +376,7 @@ function extractTeamsFromMatch(
 
 
   // ----------------------------------------------------------
-  // "HOME v AWAY"
+  // HOME v AWAY
   // ----------------------------------------------------------
 
   match =
@@ -393,7 +395,7 @@ function extractTeamsFromMatch(
 
 
   // ----------------------------------------------------------
-  // "HOME vs AWAY"
+  // HOME vs AWAY
   // ----------------------------------------------------------
 
   match =
@@ -412,7 +414,7 @@ function extractTeamsFromMatch(
 
 
   // ----------------------------------------------------------
-  // "HOME @ AWAY"
+  // HOME @ AWAY
   // ----------------------------------------------------------
 
   match =
@@ -1032,60 +1034,6 @@ function getScore(
 
 
 // ============================================================
-// CLOUD BET TARGET
-// ============================================================
-
-function isTargetCloudbetMatch(
-  match: any
-): boolean {
-
-  const bet =
-    match?.bet;
-
-  if (!bet) {
-
-    return false;
-
-  }
-
-  return (
-
-    String(
-      bet.market ||
-      ""
-    ) ===
-    "soccer.total_goals_period_first_half"
-
-    &&
-
-    String(
-      bet.outcome ||
-      ""
-    ).toUpperCase() ===
-    "OVER"
-
-    &&
-
-    String(
-      bet.total ||
-      ""
-    ) ===
-    "0.5"
-
-    &&
-
-    String(
-      bet.status ||
-      ""
-    ) ===
-    "SELECTION_ENABLED"
-
-  );
-
-}
-
-
-// ============================================================
 // BUILD MATCH VIEW
 // ============================================================
 
@@ -1113,6 +1061,8 @@ function buildMatchView(
     raw_match:
       match?.match ||
       match?.name ||
+      match?.event_name ||
+      match?.eventName ||
       null,
 
     home:
@@ -1193,11 +1143,22 @@ async function diagnostic(
     cloudbetResult.data;
 
 
+  // ==========================================================
+  // ALL V27 MATCHES
+  // ==========================================================
+
   const flashscoreMatches =
     getV27Matches(
       v27
     );
 
+
+  // ==========================================================
+  // ALL CLOUDBET MATCHES
+  //
+  // IMPORTANT:
+  // NO OVER 0.5 FILTER HERE.
+  // ==========================================================
 
   const allCloudbetMatches =
     getCloudbetMatches(
@@ -1206,10 +1167,7 @@ async function diagnostic(
 
 
   const cloudbetMatches =
-    allCloudbetMatches
-      .filter(
-        isTargetCloudbetMatch
-      );
+    allCloudbetMatches;
 
 
   // ==========================================================
@@ -1217,27 +1175,32 @@ async function diagnostic(
   // ==========================================================
 
   const cloudbetDebug =
-    cloudbetMatches.map(
-      (cb: any) => {
+    cloudbetMatches
+      .slice(
+        0,
+        100
+      )
+      .map(
+        (cb: any) => {
 
-        const view =
-          buildMatchView(
-            cb,
-            "Cloudbet"
-          );
+          const view =
+            buildMatchView(
+              cb,
+              "Cloudbet"
+            );
 
-        return {
+          return {
 
-          ...view,
+            ...view,
 
-          bet:
-            cb?.bet ||
-            null
+            bet:
+              cb?.bet ||
+              null
 
-        };
+          };
 
-      }
-    );
+        }
+      );
 
 
   const flashscoreDebug =
@@ -1532,6 +1495,8 @@ async function diagnostic(
         cloudbet_match:
           cb?.name ||
           cb?.match ||
+          cb?.event_name ||
+          cb?.eventName ||
           null,
 
         cloudbet_home:
@@ -1573,6 +1538,8 @@ async function diagnostic(
         cloudbet_match:
           cb?.name ||
           cb?.match ||
+          cb?.event_name ||
+          cb?.eventName ||
           null,
 
         cloudbet_home:
@@ -1608,6 +1575,8 @@ async function diagnostic(
       cloudbet_match:
         cb?.name ||
         cb?.match ||
+        cb?.event_name ||
+        cb?.eventName ||
         null,
 
       cloudbet_home:
@@ -1641,6 +1610,9 @@ async function diagnostic(
 
     mode:
       "READ ONLY",
+
+    test_mode:
+      "ALL CLOUDBET MATCHES — HT OVER 0.5 FILTER DISABLED",
 
     source: {
 
@@ -1686,7 +1658,7 @@ async function diagnostic(
       cloudbet_total_matches:
         allCloudbetMatches.length,
 
-      cloudbet_ht_over05:
+      cloudbet_matches_tested:
         cloudbetMatches.length,
 
       exact_matches:
@@ -1778,6 +1750,9 @@ export default {
 
           mode:
             "DIAGNOSTIC V3",
+
+          test_mode:
+            "ALL CLOUDBET MATCHES",
 
           bindings: {
 
