@@ -1,24 +1,28 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V5
+// CLOUDBET MATCH MATCHER V6 — FAST
 // V27 + CLOUDBET SERVICE BINDINGS
 // READ ONLY
 //
-// V5 PERFORMANCE:
-// 1. PRE-NORMALIZED TEAM CACHE
-// 2. PRE-BUILT TOKENS
-// 3. PRE-BUILT CATEGORIES
-// 4. FAST CANDIDATE GATE
-// 5. EARLY TOKEN MATCH EXIT
-// 6. FAST LEVENSHTEIN
-// 7. NO REPEATED NORMALIZATION DURING SCORING
-// 8. STRICT TWO-SIDED MATCH
-// 9. STRONG ALIAS MATCHING
-// 10. YOUTH / RESERVE / WOMEN PROTECTION
-// 11. HOME/AWAY DIRECTION CHECK
-// 12. COMPETITION / COUNTRY SIGNAL
-// 13. POSSIBLE / FALSE POSITIVE / UNMATCHED
-// 14. DIAGNOSTIC MODE
-// 15. READ ONLY
+// V27      -> Flashscore live matches
+// CLOUDBET -> /live
+//
+// NO CLOUDBET API KEY HERE
+//
+// V6 OPTIMIZATION:
+// 1. PRE-NORMALIZED V27 CACHE
+// 2. PRE-NORMALIZED CLOUDBET CACHE
+// 3. TOKEN INDEX FOR CLOUDBET
+// 4. FAST CANDIDATE LOOKUP
+// 5. CATEGORY PROTECTION BEFORE FUZZY
+// 6. STRONG TOKEN PRIORITY
+// 7. LEVENSHTEIN ONLY ON SMALL CANDIDATE SET
+// 8. HOME/AWAY DIRECTION CHECK
+// 9. REVERSED DIAGNOSTIC
+// 10. COMPETITION / COUNTRY SIGNAL
+// 11. COMMON TOKEN PROTECTION
+// 12. UNIQUE CLOUDBET MATCH USAGE
+// 13. SAME JSON OUTPUT STRUCTURE
+// 14. READ ONLY
 // ============================================================
 
 interface Env {
@@ -27,24 +31,6 @@ interface Env {
 }
 
 type AnyObj = Record<string, any>;
-
-type PreparedTeam = {
-  raw: string;
-  normalized: string;
-  tokens: string[];
-  tokenSet: Set<string>;
-  category: string;
-};
-
-type PreparedMatch = {
-  raw: AnyObj;
-  id: string;
-  home: PreparedTeam;
-  away: PreparedTeam;
-  competition: string;
-  country: string;
-  live: boolean;
-};
 
 
 // ============================================================
@@ -57,11 +43,16 @@ const STRONG_TEAM_SCORE = 0.78;
 const POSSIBLE_TEAM_SCORE = 0.60;
 const POSSIBLE_TOTAL_SCORE = 0.72;
 const CONFIDENT_TOTAL_SCORE = 0.80;
+const REVERSED_CONFIDENT_SCORE = 0.90;
 
 const WEAK_SIDE_LIMIT = 0.50;
 
 const COMPETITION_BONUS = 0.05;
 const COUNTRY_BONUS = 0.02;
+
+// Maximum number of indexed candidates sent
+// to the expensive scorer.
+const MAX_CANDIDATES_PER_MATCH = 18;
 
 
 // ============================================================
@@ -185,7 +176,7 @@ const TEAM_ALIASES: Record<string, string> = {
 };
 
 
-const SORTED_ALIASES =
+const ALIAS_KEYS =
   Object.keys(TEAM_ALIASES)
     .sort(
       (a, b) =>
@@ -257,7 +248,7 @@ const WEAK_TEAM_TOKENS =
 
 
 // ============================================================
-// CATEGORY NORMALIZATION
+// CATEGORY
 // ============================================================
 
 function normalizeCategory(
@@ -273,62 +264,22 @@ function normalizeCategory(
 
   s =
     s
-      .replace(
-        /\bu\s+(\d{2})\b/g,
-        "u$1"
-      )
-      .replace(
-        /\bu(\d{2})\b/g,
-        "u$1"
-      )
-      .replace(
-        /\bunder\s+(\d{2})\b/g,
-        "u$1"
-      )
-      .replace(
-        /\b(\d{2})\s*years?\b/g,
-        "u$1"
-      )
-      .replace(
-        /\bii\b/g,
-        "2"
-      )
-      .replace(
-        /\biii\b/g,
-        "3"
-      )
-      .replace(
-        /\biv\b/g,
-        "4"
-      )
-      .replace(
-        /\breserves?\b/g,
-        "reserve"
-      )
-      .replace(
-        /\bres\b/g,
-        "reserve"
-      )
-      .replace(
-        /\bwomen'?s\b/g,
-        "women"
-      )
-      .replace(
-        /\bwomen\b/g,
-        "women"
-      )
-      .replace(
-        /\bladies\b/g,
-        "women"
-      )
-      .replace(
-        /\bgirls\b/g,
-        "women"
-      );
+      .replace(/\bu\s+(\d{2})\b/g, "u$1")
+      .replace(/\bu(\d{2})\b/g, "u$1")
+      .replace(/\bunder\s+(\d{2})\b/g, "u$1")
+      .replace(/\b(\d{2})\s*years?\b/g, "u$1")
+      .replace(/\bii\b/g, "2")
+      .replace(/\biii\b/g, "3")
+      .replace(/\biv\b/g, "4")
+      .replace(/\breserves?\b/g, "reserve")
+      .replace(/\bres\b/g, "reserve")
+      .replace(/\bwomen'?s\b/g, "women")
+      .replace(/\bwomen\b/g, "women")
+      .replace(/\bladies\b/g, "women")
+      .replace(/\bgirls\b/g, "women");
 
   const tokens =
-    s.split(" ")
-      .filter(Boolean);
+    s.split(" ").filter(Boolean);
 
   const categories: string[] = [];
 
@@ -356,7 +307,7 @@ function normalizeCategory(
 
 
 // ============================================================
-// APPLY ALIASES
+// ALIAS APPLICATION
 // ============================================================
 
 function applyTeamAliases(
@@ -370,7 +321,7 @@ function applyTeamAliases(
     return "";
   }
 
-  for (const alias of SORTED_ALIASES) {
+  for (const alias of ALIAS_KEYS) {
 
     const canonical =
       TEAM_ALIASES[alias];
@@ -436,38 +387,19 @@ function normalizeTeam(
 
 
 // ============================================================
-// PREPARE TEAM
+// TOKENIZATION
 // ============================================================
 
-function prepareTeam(
-  value: any
-): PreparedTeam {
+function teamTokens(
+  normalized: string
+): string[] {
 
-  const raw =
-    String(value ?? "");
-
-  const normalized =
-    normalizeTeam(raw);
-
-  const category =
-    normalizeCategory(raw);
-
-  const tokens =
-    normalized
-      .split(" ")
-      .filter(
-        token =>
-          token.length >= 2
-      );
-
-  return {
-    raw,
-    normalized,
-    tokens,
-    tokenSet:
-      new Set(tokens),
-    category
-  };
+  return normalized
+    .split(" ")
+    .filter(
+      token =>
+        token.length >= 2
+    );
 }
 
 
@@ -475,34 +407,31 @@ function prepareTeam(
 // CATEGORY COMPATIBILITY
 // ============================================================
 
-function categoryCompatiblePrepared(
-  a: PreparedTeam,
-  b: PreparedTeam
+function categoryCompatible(
+  a: string,
+  b: string
 ): boolean {
 
-  if (
-    !a.category &&
-    !b.category
-  ) {
+  const A =
+    normalizeCategory(a);
+
+  const B =
+    normalizeCategory(b);
+
+  if (!A && !B) {
     return true;
   }
 
-  if (
-    !a.category ||
-    !b.category
-  ) {
+  if (!A || !B) {
     return true;
   }
 
-  return (
-    a.category ===
-    b.category
-  );
+  return A === B;
 }
 
 
 // ============================================================
-// FAST LEVENSHTEIN
+// LEVENSHTEIN
 // ============================================================
 
 function levenshtein(
@@ -522,23 +451,7 @@ function levenshtein(
     return a.length;
   }
 
-  if (
-    Math.abs(
-      a.length - b.length
-    ) > 5
-  ) {
-    return Math.max(
-      a.length,
-      b.length
-    );
-  }
-
-  let previous =
-    new Array<number>(
-      b.length + 1
-    );
-
-  let current =
+  let prev =
     new Array<number>(
       b.length + 1
     );
@@ -548,7 +461,7 @@ function levenshtein(
     j <= b.length;
     j++
   ) {
-    previous[j] = j;
+    prev[j] = j;
   }
 
   for (
@@ -557,9 +470,12 @@ function levenshtein(
     i++
   ) {
 
-    current[0] = i;
+    const curr =
+      new Array<number>(
+        b.length + 1
+      );
 
-    let rowMin = current[0];
+    curr[0] = i;
 
     for (
       let j = 1;
@@ -568,46 +484,22 @@ function levenshtein(
     ) {
 
       const cost =
-        a.charCodeAt(i - 1) ===
-        b.charCodeAt(j - 1)
+        a[i - 1] === b[j - 1]
           ? 0
           : 1;
 
-      const value =
+      curr[j] =
         Math.min(
-          current[j - 1] + 1,
-          previous[j] + 1,
-          previous[j - 1] + cost
+          curr[j - 1] + 1,
+          prev[j] + 1,
+          prev[j - 1] + cost
         );
-
-      current[j] = value;
-
-      if (value < rowMin) {
-        rowMin = value;
-      }
     }
 
-    if (
-      rowMin >
-      Math.max(
-        a.length,
-        b.length
-      )
-    ) {
-      return rowMin;
-    }
-
-    const temp =
-      previous;
-
-    previous =
-      current;
-
-    current =
-      temp;
+    prev = curr;
   }
 
-  return previous[b.length];
+  return prev[b.length];
 }
 
 
@@ -628,26 +520,6 @@ function tokenSimilarity(
     return 0;
   }
 
-  const lengthDiff =
-    Math.abs(
-      a.length - b.length
-    );
-
-  if (
-    lengthDiff >
-    Math.max(
-      3,
-      Math.floor(
-        Math.max(
-          a.length,
-          b.length
-        ) * 0.35
-      )
-    )
-  ) {
-    return 0;
-  }
-
   const distance =
     levenshtein(a, b);
 
@@ -657,54 +529,39 @@ function tokenSimilarity(
       b.length
     );
 
-  return (
-    1 -
-    distance / maxLength
+  return Math.max(
+    0,
+    1 - distance / maxLength
   );
 }
 
 
 // ============================================================
-// FAST TEAM SCORE
+// TEAM SCORE
 // ============================================================
 
-function teamScorePrepared(
-  a: PreparedTeam,
-  b: PreparedTeam
+function teamScore(
+  a: string,
+  b: string
 ): number {
 
-  if (
-    !a.normalized ||
-    !b.normalized
-  ) {
+  if (!a || !b) {
     return 0;
   }
 
-  if (
-    !categoryCompatiblePrepared(
-      a,
-      b
-    )
-  ) {
+  if (!categoryCompatible(a, b)) {
     return 0;
   }
 
-  // ----------------------------------------------------------
-  // Exact
-  // ----------------------------------------------------------
-
-  if (
-    a.normalized ===
-    b.normalized
-  ) {
+  if (a === b) {
     return 1;
   }
 
   const aTokens =
-    a.tokens;
+    teamTokens(a);
 
   const bTokens =
-    b.tokens;
+    teamTokens(b);
 
   if (
     !aTokens.length ||
@@ -713,87 +570,84 @@ function teamScorePrepared(
     return 0;
   }
 
-  // ----------------------------------------------------------
-  // Exact subset
-  // ----------------------------------------------------------
-
   const shorter =
-    aTokens.length <=
-    bTokens.length
+    aTokens.length <= bTokens.length
       ? aTokens
       : bTokens;
 
-  const longerSet =
-    aTokens.length <=
-    bTokens.length
-      ? b.tokenSet
-      : a.tokenSet;
+  const longer =
+    aTokens.length <= bTokens.length
+      ? bTokens
+      : aTokens;
+
+  const shorterAllExact =
+    shorter.every(
+      token =>
+        longer.includes(token)
+    );
 
   if (
+    shorterAllExact &&
     shorter.length >= 2
   ) {
 
-    let allExact = true;
+    const extra =
+      longer.filter(
+        token =>
+          !shorter.includes(token)
+      );
 
-    for (
-      const token of shorter
-    ) {
-
-      if (
-        !longerSet.has(token)
-      ) {
-        allExact = false;
-        break;
-      }
-    }
-
-    if (allExact) {
-
-      const longer =
-        aTokens.length <=
-        bTokens.length
-          ? bTokens
-          : aTokens;
-
-      let meaningfulExtra =
-        0;
-
-      for (
-        const token of longer
-      ) {
-
-        if (
-          !shorter.includes(token) &&
+    const meaningfulExtra =
+      extra.filter(
+        token =>
           !/^u\d{2}$/.test(token) &&
           token !== "reserve" &&
           token !== "women" &&
           !/^team[234]$/.test(token)
-        ) {
-          meaningfulExtra++;
-        }
-      }
+      );
 
-      if (
-        meaningfulExtra === 0
-      ) {
-        return 0.97;
-      }
+    if (
+      meaningfulExtra.length === 0
+    ) {
+      return 0.97;
     }
   }
 
-  // ----------------------------------------------------------
-  // Exact overlap
-  // ----------------------------------------------------------
-
+  let fuzzy = 0;
   let exact = 0;
 
-  for (
-    const token of aTokens
-  ) {
+  for (const aToken of aTokens) {
 
-    if (
-      b.tokenSet.has(token)
-    ) {
+    let best = 0;
+
+    for (const bToken of bTokens) {
+
+      if (aToken === bToken) {
+        best = 1;
+        break;
+      }
+
+      const sim =
+        tokenSimilarity(
+          aToken,
+          bToken
+        );
+
+      if (sim > best) {
+        best = sim;
+      }
+    }
+
+    if (best >= 0.90) {
+      fuzzy += best;
+    } else if (best >= 0.75) {
+      fuzzy += best * 0.65;
+    }
+  }
+
+  for (const token of aTokens) {
+
+    if (bTokens.includes(token)) {
       exact++;
     }
   }
@@ -804,140 +658,22 @@ function teamScorePrepared(
       bTokens.length
     );
 
-  const maxTokens =
-    Math.max(
-      aTokens.length,
-      bTokens.length
-    );
-
   const overlap =
     exact /
-    Math.max(
-      1,
-      minTokens
-    );
-
-  // ----------------------------------------------------------
-  // Fast rejection
-  //
-  // If there are multiple tokens and
-  // absolutely no exact overlap, do not
-  // spend CPU on fuzzy matching unless
-  // the names are very similar in length.
-  // ----------------------------------------------------------
-
-  if (
-    exact === 0 &&
-    minTokens >= 2
-  ) {
-
-    if (
-      Math.abs(
-        a.normalized.length -
-        b.normalized.length
-      ) >
-      Math.max(
-        8,
-        Math.floor(
-          Math.max(
-            a.normalized.length,
-            b.normalized.length
-          ) * 0.40
-        )
-      )
-    ) {
-      return 0;
-    }
-  }
-
-  // ----------------------------------------------------------
-  // Fuzzy
-  // ----------------------------------------------------------
-
-  let fuzzy = 0;
-
-  for (
-    const aToken of aTokens
-  ) {
-
-    let best = 0;
-
-    // Exact first
-    if (
-      b.tokenSet.has(aToken)
-    ) {
-      best = 1;
-    } else {
-
-      for (
-        const bToken of bTokens
-      ) {
-
-        // Cheap first-character gate
-        if (
-          aToken.charCodeAt(0) !==
-          bToken.charCodeAt(0)
-        ) {
-          continue;
-        }
-
-        const sim =
-          tokenSimilarity(
-            aToken,
-            bToken
-          );
-
-        if (
-          sim > best
-        ) {
-          best = sim;
-
-          if (
-            best >= 0.97
-          ) {
-            break;
-          }
-        }
-      }
-    }
-
-    if (
-      best >= 0.90
-    ) {
-
-      fuzzy += best;
-
-    } else if (
-      best >= 0.75
-    ) {
-
-      fuzzy +=
-        best * 0.65;
-    }
-  }
-
-  const precision =
-    fuzzy /
-    Math.max(
-      1,
-      aTokens.length
-    );
-
-  const recall =
-    fuzzy /
-    Math.max(
-      1,
-      bTokens.length
-    );
+    Math.max(1, minTokens);
 
   let score =
-    precision * 0.40 +
-    recall * 0.25 +
-    overlap * 0.35;
-
-  // ----------------------------------------------------------
-  // SINGLE TOKEN
-  // ----------------------------------------------------------
+    (
+      (fuzzy / Math.max(1, aTokens.length)) *
+      0.40
+    ) +
+    (
+      (fuzzy / Math.max(1, bTokens.length)) *
+      0.25
+    ) +
+    (
+      overlap * 0.35
+    );
 
   if (
     aTokens.length === 1 &&
@@ -950,9 +686,7 @@ function teamScorePrepared(
         bTokens[0]
       );
 
-    if (
-      sim >= 0.90
-    ) {
+    if (sim >= 0.90) {
       score =
         Math.max(
           score,
@@ -961,22 +695,13 @@ function teamScorePrepared(
     }
   }
 
-  // ----------------------------------------------------------
-  // ONE TOKEN VS LARGE CLUB
-  // ----------------------------------------------------------
-
   if (
     minTokens === 1 &&
-    maxTokens >= 3 &&
+    bTokens.length >= 3 &&
     overlap === 0
   ) {
-
     score *= 0.50;
   }
-
-  // ----------------------------------------------------------
-  // Weak token protection
-  // ----------------------------------------------------------
 
   if (
     minTokens === 1 &&
@@ -984,33 +709,20 @@ function teamScorePrepared(
       aTokens[0]
     )
   ) {
-
     score *= 0.35;
   }
 
-  // ----------------------------------------------------------
-  // Meaningful exact overlap
-  // ----------------------------------------------------------
-
-  let exactMeaningful = 0;
-
-  for (
-    const token of aTokens
-  ) {
-
-    if (
-      b.tokenSet.has(token) &&
-      !WEAK_TEAM_TOKENS.has(token)
-    ) {
-      exactMeaningful++;
-    }
-  }
+  const meaningfulExact =
+    aTokens.filter(
+      token =>
+        bTokens.includes(token) &&
+        !WEAK_TEAM_TOKENS.has(token)
+    ).length;
 
   if (
-    exactMeaningful === 0 &&
+    meaningfulExact === 0 &&
     overlap > 0
   ) {
-
     score =
       Math.min(
         score,
@@ -1034,40 +746,33 @@ function extractHome(
 ): string | null {
 
   if (
-    typeof match?.home ===
-    "string"
+    typeof match?.home === "string"
   ) {
     return match.home;
   }
 
   if (
-    typeof match?.homeTeam ===
-    "string"
+    typeof match?.homeTeam === "string"
   ) {
     return match.homeTeam;
   }
 
   if (
-    typeof match?.home_name ===
-    "string"
+    typeof match?.home_name === "string"
   ) {
     return match.home_name;
   }
 
   if (
-    typeof match?.home?.name ===
-    "string"
+    typeof match?.home?.name === "string"
   ) {
     return match.home.name;
   }
 
-  const text =
+  return splitMatchName(
     match?.match ??
     match?.name ??
-    "";
-
-  return splitMatchName(
-    text
+    ""
   ).home;
 }
 
@@ -1081,46 +786,39 @@ function extractAway(
 ): string | null {
 
   if (
-    typeof match?.away ===
-    "string"
+    typeof match?.away === "string"
   ) {
     return match.away;
   }
 
   if (
-    typeof match?.awayTeam ===
-    "string"
+    typeof match?.awayTeam === "string"
   ) {
     return match.awayTeam;
   }
 
   if (
-    typeof match?.away_name ===
-    "string"
+    typeof match?.away_name === "string"
   ) {
     return match.away_name;
   }
 
   if (
-    typeof match?.away?.name ===
-    "string"
+    typeof match?.away?.name === "string"
   ) {
     return match.away.name;
   }
 
-  const text =
+  return splitMatchName(
     match?.match ??
     match?.name ??
-    "";
-
-  return splitMatchName(
-    text
+    ""
   ).away;
 }
 
 
 // ============================================================
-// SPLIT MATCH NAME
+// SPLIT MATCH
 // ============================================================
 
 function splitMatchName(
@@ -1131,8 +829,7 @@ function splitMatchName(
 } {
 
   const text =
-    String(value ?? "")
-      .trim();
+    String(value ?? "").trim();
 
   if (!text) {
     return {
@@ -1149,17 +846,12 @@ function splitMatchName(
     " @ "
   ];
 
-  for (
-    const separator of
-    separators
-  ) {
+  for (const separator of separators) {
 
     const index =
       text.indexOf(separator);
 
-    if (
-      index >= 0
-    ) {
+    if (index >= 0) {
 
       return {
         home:
@@ -1170,8 +862,7 @@ function splitMatchName(
         away:
           text
             .slice(
-              index +
-              separator.length
+              index + separator.length
             )
             .trim()
       };
@@ -1193,51 +884,38 @@ function competitionText(
   match: AnyObj
 ): string {
 
-  const competition =
+  const c =
     match?.competition;
 
   if (
-    typeof competition ===
-    "string"
+    typeof c === "string"
   ) {
-    return normalizeText(
-      competition
-    );
+    return normalizeText(c);
   }
 
   if (
-    typeof competition?.name ===
-    "string"
+    typeof c?.name === "string"
   ) {
-    return normalizeText(
-      competition.name
-    );
+    return normalizeText(c.name);
   }
 
   if (
-    typeof competition?.key ===
-    "string"
+    typeof c?.key === "string"
   ) {
-    return normalizeText(
-      competition.key
-    );
+    return normalizeText(c.key);
   }
 
   const league =
     match?.league;
 
   if (
-    typeof league ===
-    "string"
+    typeof league === "string"
   ) {
-    return normalizeText(
-      league
-    );
+    return normalizeText(league);
   }
 
   if (
-    typeof league?.name ===
-    "string"
+    typeof league?.name === "string"
   ) {
     return normalizeText(
       league.name
@@ -1263,19 +941,13 @@ function countryText(
     match?.league?.country
   ];
 
-  for (
-    const value of fields
-  ) {
+  for (const value of fields) {
 
     if (
-      typeof value ===
-        "string" &&
+      typeof value === "string" &&
       value.trim()
     ) {
-
-      return normalizeText(
-        value
-      );
+      return normalizeText(value);
     }
   }
 
@@ -1284,75 +956,35 @@ function countryText(
 
 
 // ============================================================
-// PREPARE MATCH
-// ============================================================
-
-function prepareMatch(
-  match: AnyObj,
-  live = false
-): PreparedMatch {
-
-  return {
-    raw: match,
-
-    id:
-      String(
-        match?.id ??
-        match?.key ??
-        ""
-      ),
-
-    home:
-      prepareTeam(
-        extractHome(match)
-      ),
-
-    away:
-      prepareTeam(
-        extractAway(match)
-      ),
-
-    competition:
-      competitionText(match),
-
-    country:
-      countryText(match),
-
-    live
-  };
-}
-
-
-// ============================================================
 // COMPETITION SIMILARITY
 // ============================================================
 
-function competitionSimilarityPrepared(
-  a: PreparedMatch,
-  b: PreparedMatch
+function competitionSimilarity(
+  a: AnyObj,
+  b: AnyObj
 ): number {
 
-  const A = a.competition;
-  const B = b.competition;
+  const A =
+    competitionText(a);
 
-  if (
-    !A ||
-    !B
-  ) {
+  const B =
+    competitionText(b);
+
+  if (!A || !B) {
     return 0;
   }
 
-  if (
-    A === B
-  ) {
+  if (A === B) {
     return 1;
   }
 
   const aWords =
-    A.split(" ")
-      .filter(Boolean);
+    new Set(
+      A.split(" ")
+        .filter(Boolean)
+    );
 
-  const bSet =
+  const bWords =
     new Set(
       B.split(" ")
         .filter(Boolean)
@@ -1360,13 +992,9 @@ function competitionSimilarityPrepared(
 
   let overlap = 0;
 
-  for (
-    const word of aWords
-  ) {
+  for (const word of aWords) {
 
-    if (
-      bSet.has(word)
-    ) {
+    if (bWords.has(word)) {
       overlap++;
     }
   }
@@ -1376,8 +1004,8 @@ function competitionSimilarityPrepared(
     Math.max(
       1,
       Math.min(
-        aWords.length,
-        bSet.size
+        aWords.size,
+        bWords.size
       )
     )
   );
@@ -1388,219 +1016,427 @@ function competitionSimilarityPrepared(
 // COUNTRY SIMILARITY
 // ============================================================
 
-function countrySimilarityPrepared(
-  a: PreparedMatch,
-  b: PreparedMatch
+function countrySimilarity(
+  a: AnyObj,
+  b: AnyObj
 ): number {
 
-  if (
-    !a.country ||
-    !b.country
-  ) {
+  const A =
+    countryText(a);
+
+  const B =
+    countryText(b);
+
+  if (!A || !B) {
     return 0;
   }
 
-  return (
-    a.country ===
-    b.country
-      ? 1
-      : 0
-  );
+  return A === B ? 1 : 0;
 }
 
 
 // ============================================================
-// FAST CANDIDATE GATE
-//
-// This is deliberately conservative.
-// It only rejects obviously impossible
-// candidates. It must NOT remove legitimate
-// matches.
+// PREPARED MATCH
 // ============================================================
 
-function candidateGate(
+interface PreparedMatch {
+  raw: AnyObj;
+  id: string;
+  home: string;
+  away: string;
+  homeTokens: string[];
+  awayTokens: string[];
+  categoryHome: string;
+  categoryAway: string;
+  competition: string;
+  country: string;
+}
+
+
+// ============================================================
+// PREPARE
+// ============================================================
+
+function prepareMatch(
+  match: AnyObj
+): PreparedMatch {
+
+  const homeRaw =
+    extractHome(match) ?? "";
+
+  const awayRaw =
+    extractAway(match) ?? "";
+
+  const home =
+    normalizeTeam(homeRaw);
+
+  const away =
+    normalizeTeam(awayRaw);
+
+  return {
+
+    raw: match,
+
+    id:
+      String(
+        match?.id ??
+        match?.key ??
+        ""
+      ),
+
+    home,
+
+    away,
+
+    homeTokens:
+      teamTokens(home),
+
+    awayTokens:
+      teamTokens(away),
+
+    categoryHome:
+      normalizeCategory(homeRaw),
+
+    categoryAway:
+      normalizeCategory(awayRaw),
+
+    competition:
+      competitionText(match),
+
+    country:
+      countryText(match)
+  };
+}
+
+
+// ============================================================
+// TOKEN INDEX
+// ============================================================
+
+type CandidateSet = Set<number>;
+
+interface CloudbetIndex {
+  tokenIndex: Map<string, CandidateSet>;
+  exactIndex: Map<string, number[]>;
+}
+
+
+// ============================================================
+// BUILD INDEX
+// ============================================================
+
+function buildCloudbetIndex(
+  prepared: PreparedMatch[]
+): CloudbetIndex {
+
+  const tokenIndex =
+    new Map<string, CandidateSet>();
+
+  const exactIndex =
+    new Map<string, number[]>();
+
+  for (
+    let i = 0;
+    i < prepared.length;
+    i++
+  ) {
+
+    const m =
+      prepared[i];
+
+    const tokens =
+      new Set([
+        ...m.homeTokens,
+        ...m.awayTokens
+      ]);
+
+    for (const token of tokens) {
+
+      if (
+        token.length < 3
+      ) {
+        continue;
+      }
+
+      let set =
+        tokenIndex.get(token);
+
+      if (!set) {
+        set = new Set<number>();
+        tokenIndex.set(token, set);
+      }
+
+      set.add(i);
+    }
+
+    if (m.home && m.away) {
+
+      const exactKey =
+        `${m.home}||${m.away}`;
+
+      const arr =
+        exactIndex.get(exactKey);
+
+      if (arr) {
+        arr.push(i);
+      } else {
+        exactIndex.set(
+          exactKey,
+          [i]
+        );
+      }
+    }
+  }
+
+  return {
+    tokenIndex,
+    exactIndex
+  };
+}
+
+
+// ============================================================
+// FAST CANDIDATES
+// ============================================================
+
+function getFastCandidates(
   v27: PreparedMatch,
-  cb: PreparedMatch
-): boolean {
+  cloudbet: PreparedMatch[],
+  index: CloudbetIndex,
+  usedIds?: Set<string>,
+  ignoreUsed = false
+): {
+  indices: number[];
+  evaluations: number;
+} {
 
-  const vh =
-    v27.home;
+  const exactKey =
+    `${v27.home}||${v27.away}`;
 
-  const va =
-    v27.away;
+  const exact =
+    index.exactIndex.get(exactKey);
 
-  const ch =
-    cb.home;
+  if (exact?.length) {
 
-  const ca =
-    cb.away;
+    const result =
+      exact
+        .filter(
+          i =>
+            ignoreUsed ||
+            !usedIds?.has(
+              cloudbet[i].id
+            )
+        );
 
-  if (
-    !vh.normalized ||
-    !va.normalized ||
-    !ch.normalized ||
-    !ca.normalized
-  ) {
-    return false;
-  }
-
-  // Category protection
-  if (
-    !categoryCompatiblePrepared(
-      vh,
-      ch
-    ) &&
-    !categoryCompatiblePrepared(
-      vh,
-      ca
-    )
-  ) {
-    return false;
-  }
-
-  if (
-    !categoryCompatiblePrepared(
-      va,
-      ca
-    ) &&
-    !categoryCompatiblePrepared(
-      va,
-      ch
-    )
-  ) {
-    return false;
-  }
-
-  // Fast exact-token directional check
-  let normalPossible = false;
-  let reversePossible = false;
-
-  for (
-    const token of vh.tokens
-  ) {
-
-    if (
-      ch.tokenSet.has(token)
-    ) {
-      normalPossible = true;
-      break;
+    if (result.length) {
+      return {
+        indices: result,
+        evaluations: result.length
+      };
     }
   }
 
-  for (
-    const token of va.tokens
-  ) {
+  const scored =
+    new Map<number, number>();
 
-    if (
-      ca.tokenSet.has(token)
-    ) {
-      normalPossible = true;
-      break;
+  const sourceTokens =
+    new Set([
+      ...v27.homeTokens,
+      ...v27.awayTokens
+    ]);
+
+  for (const token of sourceTokens) {
+
+    const candidates =
+      index.tokenIndex.get(token);
+
+    if (!candidates) {
+      continue;
+    }
+
+    for (const i of candidates) {
+
+      if (
+        !ignoreUsed &&
+        usedIds &&
+        usedIds.has(
+          cloudbet[i].id
+        )
+      ) {
+        continue;
+      }
+
+      const cb =
+        cloudbet[i];
+
+      // Category rejection BEFORE
+      // expensive team scoring.
+      if (
+        v27.categoryHome &&
+        cb.categoryHome &&
+        v27.categoryHome !==
+        cb.categoryHome
+      ) {
+        continue;
+      }
+
+      if (
+        v27.categoryAway &&
+        cb.categoryAway &&
+        v27.categoryAway !==
+        cb.categoryAway
+      ) {
+        continue;
+      }
+
+      let priority =
+        scored.get(i) ?? 0;
+
+      if (
+        cb.homeTokens.includes(
+          token
+        )
+      ) {
+        priority += 3;
+      }
+
+      if (
+        cb.awayTokens.includes(
+          token
+        )
+      ) {
+        priority += 3;
+      }
+
+      if (
+        WEAK_TEAM_TOKENS.has(token)
+      ) {
+        priority -= 1;
+      }
+
+      scored.set(
+        i,
+        priority
+      );
     }
   }
 
-  for (
-    const token of vh.tokens
-  ) {
+  const sorted =
+    [...scored.entries()]
+      .sort(
+        (a, b) =>
+          b[1] - a[1]
+      )
+      .slice(
+        0,
+        MAX_CANDIDATES_PER_MATCH
+      )
+      .map(
+        ([i]) => i
+      );
 
-    if (
-      ca.tokenSet.has(token)
-    ) {
-      reversePossible = true;
-      break;
-    }
-  }
-
-  for (
-    const token of va.tokens
-  ) {
-
-    if (
-      ch.tokenSet.has(token)
-    ) {
-      reversePossible = true;
-      break;
-    }
-  }
-
-  if (
-    normalPossible ||
-    reversePossible
-  ) {
-    return true;
-  }
-
-  // No exact overlap.
-  // Permit only if normalized strings
-  // are reasonably short/close.
-  const homeLength =
-    Math.abs(
-      vh.normalized.length -
-      ch.normalized.length
-    );
-
-  const awayLength =
-    Math.abs(
-      va.normalized.length -
-      ca.normalized.length
-    );
-
-  if (
-    homeLength <= 4 &&
-    awayLength <= 4
-  ) {
-    return true;
-  }
-
-  // Also permit reverse length similarity.
-  const reverseHomeLength =
-    Math.abs(
-      vh.normalized.length -
-      ca.normalized.length
-    );
-
-  const reverseAwayLength =
-    Math.abs(
-      va.normalized.length -
-      ch.normalized.length
-    );
-
-  return (
-    reverseHomeLength <= 4 &&
-    reverseAwayLength <= 4
-  );
+  return {
+    indices: sorted,
+    evaluations: sorted.length
+  };
 }
 
 
 // ============================================================
-// DETAILED MATCH SCORE
+// DETAILED SCORE
 // ============================================================
 
-function detailedMatchScorePrepared(
+function detailedPreparedScore(
   v27: PreparedMatch,
   cb: PreparedMatch
 ) {
 
+  if (
+    !v27.home ||
+    !v27.away ||
+    !cb.home ||
+    !cb.away
+  ) {
+
+    return {
+
+      total: 0,
+      baseScore: 0,
+
+      homeScore: 0,
+      awayScore: 0,
+
+      reverseHomeScore: 0,
+      reverseAwayScore: 0,
+
+      direction: "NONE",
+
+      competitionScore: 0,
+      countryScore: 0
+
+    };
+  }
+
+  if (
+    v27.categoryHome &&
+    cb.categoryHome &&
+    v27.categoryHome !==
+    cb.categoryHome
+  ) {
+
+    return {
+      total: 0,
+      baseScore: 0,
+      homeScore: 0,
+      awayScore: 0,
+      reverseHomeScore: 0,
+      reverseAwayScore: 0,
+      direction: "NONE",
+      competitionScore: 0,
+      countryScore: 0
+    };
+  }
+
+  if (
+    v27.categoryAway &&
+    cb.categoryAway &&
+    v27.categoryAway !==
+    cb.categoryAway
+  ) {
+
+    return {
+      total: 0,
+      baseScore: 0,
+      homeScore: 0,
+      awayScore: 0,
+      reverseHomeScore: 0,
+      reverseAwayScore: 0,
+      direction: "NONE",
+      competitionScore: 0,
+      countryScore: 0
+    };
+  }
+
   const homeScore =
-    teamScorePrepared(
+    teamScore(
       v27.home,
       cb.home
     );
 
   const awayScore =
-    teamScorePrepared(
+    teamScore(
       v27.away,
       cb.away
     );
 
   const reverseHomeScore =
-    teamScorePrepared(
+    teamScore(
       v27.home,
       cb.away
     );
 
   const reverseAwayScore =
-    teamScorePrepared(
+    teamScore(
       v27.away,
       cb.home
     );
@@ -1637,15 +1473,15 @@ function detailedMatchScorePrepared(
   }
 
   const competitionScore =
-    competitionSimilarityPrepared(
-      v27,
-      cb
+    competitionSimilarity(
+      v27.raw,
+      cb.raw
     );
 
   const countryScore =
-    countrySimilarityPrepared(
-      v27,
-      cb
+    countrySimilarity(
+      v27.raw,
+      cb.raw
     );
 
   let total =
@@ -1666,24 +1502,23 @@ function detailedMatchScorePrepared(
   }
 
   return {
+
     total:
       Math.min(1, total),
 
     baseScore,
 
     homeScore,
-
     awayScore,
 
     reverseHomeScore,
-
     reverseAwayScore,
 
     direction,
 
     competitionScore,
-
     countryScore
+
   };
 }
 
@@ -1712,8 +1547,8 @@ function classifyMatch(
   ) {
 
     if (
-      home >= 0.90 &&
-      away >= 0.90
+      home >= REVERSED_CONFIDENT_SCORE &&
+      away >= REVERSED_CONFIDENT_SCORE
     ) {
 
       return {
@@ -1816,55 +1651,44 @@ function classifyMatch(
 
 
 // ============================================================
-// FIND BEST MATCH V5
+// FIND BEST MATCH — FAST
 // ============================================================
 
-function findBestMatchPrepared(
+function findBestPreparedMatch(
   v27: PreparedMatch,
-  cloudbetMatches: PreparedMatch[],
+  cloudbet: PreparedMatch[],
+  index: CloudbetIndex,
   threshold: number,
   usedIds?: Set<string>,
   ignoreUsed = false
 ) {
 
-  let best:
-    PreparedMatch | null = null;
+  const candidateResult =
+    getFastCandidates(
+      v27,
+      cloudbet,
+      index,
+      usedIds,
+      ignoreUsed
+    );
+
+  let bestIndex =
+    -1;
+
+  let bestScore = 0;
 
   let bestDetail:
     AnyObj | null = null;
 
-  let bestScore = 0;
-
-  let candidateEvaluations = 0;
-
   for (
-    const cb of cloudbetMatches
+    const i of
+    candidateResult.indices
   ) {
 
-    if (
-      !ignoreUsed &&
-      usedIds &&
-      cb.id &&
-      usedIds.has(cb.id)
-    ) {
-      continue;
-    }
-
-    if (
-      !candidateGate(
-        v27,
-        cb
-      )
-    ) {
-      continue;
-    }
-
-    candidateEvaluations++;
-
     const detail =
-      detailedMatchScorePrepared(
+      detailedPreparedScore(
         v27,
-        cb
+        cloudbet[i]
       );
 
     if (
@@ -1875,8 +1699,8 @@ function findBestMatchPrepared(
       bestScore =
         detail.total;
 
-      best =
-        cb;
+      bestIndex =
+        i;
 
       bestDetail =
         detail;
@@ -1884,20 +1708,31 @@ function findBestMatchPrepared(
   }
 
   if (
-    !best ||
+    bestIndex < 0 ||
     !bestDetail
   ) {
 
     return {
+
       matched: false,
+
       best: null,
+
+      bestPrepared: null,
+
       score: 0,
+
       detail: null,
+
       classification:
         "TRUE_UNMATCHED",
+
       reason:
         "NO_VALID_CLOUDBET_CANDIDATE",
-      candidateEvaluations
+
+      candidateEvaluations:
+        candidateResult.evaluations
+
     };
   }
 
@@ -1908,11 +1743,20 @@ function findBestMatchPrepared(
     );
 
   return {
+
     matched:
       classification.classification ===
       "CONFIDENT_MATCH",
 
-    best,
+    best:
+      cloudbet[
+        bestIndex
+      ].raw,
+
+    bestPrepared:
+      cloudbet[
+        bestIndex
+      ],
 
     score:
       bestDetail.total,
@@ -1926,7 +1770,8 @@ function findBestMatchPrepared(
     reason:
       classification.reason,
 
-    candidateEvaluations
+    candidateEvaluations:
+      candidateResult.evaluations
   };
 }
 
@@ -2070,6 +1915,7 @@ async function fetchServiceJSON(
         `https://service${path}`,
         {
           method: "GET",
+
           headers: {
             "accept":
               "application/json"
@@ -2081,9 +1927,7 @@ async function fetchServiceJSON(
   const text =
     await response.text();
 
-  if (
-    !response.ok
-  ) {
+  if (!response.ok) {
 
     throw new Error(
       `HTTP ${response.status}: ${text.slice(
@@ -2111,103 +1955,107 @@ async function fetchServiceJSON(
 // ============================================================
 
 function buildMatchRecord(
-  v27: PreparedMatch,
-  cb: PreparedMatch,
+  v27: AnyObj,
+  cb: AnyObj,
   detail: AnyObj
 ) {
-
-  const v =
-    v27.raw;
-
-  const c =
-    cb.raw;
 
   return {
 
     match:
-      matchDisplayName(v),
+      matchDisplayName(v27),
 
     v27: {
 
       id:
-        v?.id ??
-        null,
+        v27?.id ?? null,
 
       home:
-        extractHome(v),
+        extractHome(v27),
 
       away:
-        extractAway(v),
+        extractAway(v27),
 
       normalized_home:
-        v27.home.normalized,
+        normalizeTeam(
+          extractHome(v27)
+        ),
 
       normalized_away:
-        v27.away.normalized,
+        normalizeTeam(
+          extractAway(v27)
+        ),
 
       category_home:
-        v27.home.category,
+        normalizeCategory(
+          extractHome(v27)
+        ),
 
       category_away:
-        v27.away.category,
+        normalizeCategory(
+          extractAway(v27)
+        ),
 
       minute:
-        v?.minute ??
-        v?.minute_display ??
+        v27?.minute ??
+        v27?.minute_display ??
         null,
 
       score:
-        v?.score ??
+        v27?.score ??
         null
     },
 
     cloudbet: {
 
       id:
-        c?.id ??
-        null,
+        cb?.id ?? null,
 
       key:
-        c?.key ??
-        null,
+        cb?.key ?? null,
 
       match:
-        matchDisplayName(c),
+        matchDisplayName(cb),
 
       home:
-        extractHome(c),
+        extractHome(cb),
 
       away:
-        extractAway(c),
+        extractAway(cb),
 
       normalized_home:
-        cb.home.normalized,
+        normalizeTeam(
+          extractHome(cb)
+        ),
 
       normalized_away:
-        cb.away.normalized,
+        normalizeTeam(
+          extractAway(cb)
+        ),
 
       category_home:
-        cb.home.category,
+        normalizeCategory(
+          extractHome(cb)
+        ),
 
       category_away:
-        cb.away.category,
+        normalizeCategory(
+          extractAway(cb)
+        ),
 
       status:
-        c?.status ??
-        null,
+        cb?.status ?? null,
 
       minute:
-        c?.minute ??
-        c?.minute_display ??
+        cb?.minute ??
+        cb?.minute_display ??
         null,
 
       score:
-        c?.score ??
-        null,
+        cb?.score ?? null,
 
       competition:
-        c?.competition ??
-        null
+        cb?.competition ?? null
     },
 
     scoring: {
@@ -2260,25 +2108,15 @@ function buildMatchRecord(
 
 
 // ============================================================
-// BUILD UNMATCHED
+// UNMATCHED
 // ============================================================
 
 function buildUnmatchedRecord(
   index: number,
-  v27: PreparedMatch,
+  v27: AnyObj,
   result: AnyObj,
   threshold: number
 ) {
-
-  const v =
-    v27.raw;
-
-  const best =
-    result.best as
-    PreparedMatch | null;
-
-  const c =
-    best?.raw;
 
   return {
 
@@ -2287,69 +2125,87 @@ function buildUnmatchedRecord(
     v27: {
 
       id:
-        v?.id ??
-        null,
+        v27?.id ?? null,
 
       match:
-        matchDisplayName(v),
+        matchDisplayName(v27),
 
       home:
-        extractHome(v),
+        extractHome(v27),
 
       away:
-        extractAway(v),
+        extractAway(v27),
 
       normalized_home:
-        v27.home.normalized,
+        normalizeTeam(
+          extractHome(v27)
+        ),
 
       normalized_away:
-        v27.away.normalized,
+        normalizeTeam(
+          extractAway(v27)
+        ),
 
       category_home:
-        v27.home.category,
+        normalizeCategory(
+          extractHome(v27)
+        ),
 
       category_away:
-        v27.away.category,
+        normalizeCategory(
+          extractAway(v27)
+        ),
 
       minute:
-        v?.minute ??
-        v?.minute_display ??
+        v27?.minute ??
+        v27?.minute_display ??
         null,
 
       score:
-        v?.score ??
-        null
+        v27?.score ?? null
     },
 
     best_cloudbet:
-      best
+      result.best
         ? {
 
             id:
-              c?.id ??
-              null,
+              result.best?.id ?? null,
 
             key:
-              c?.key ??
-              null,
+              result.best?.key ?? null,
 
             match:
-              matchDisplayName(c),
+              matchDisplayName(
+                result.best
+              ),
 
             home:
-              extractHome(c),
+              extractHome(
+                result.best
+              ),
 
             away:
-              extractAway(c),
+              extractAway(
+                result.best
+              ),
 
             normalized_home:
-              best.home.normalized,
+              normalizeTeam(
+                extractHome(
+                  result.best
+                )
+              ),
 
             normalized_away:
-              best.away.normalized,
+              normalizeTeam(
+                extractAway(
+                  result.best
+                )
+              ),
 
             competition:
-              c?.competition ??
+              result.best?.competition ??
               null
           }
         : null,
@@ -2386,8 +2242,7 @@ function buildUnmatchedRecord(
           0,
           threshold -
           Number(
-            result.detail?.total ??
-            0
+            result.detail?.total ?? 0
           )
         ).toFixed(3)
       ),
@@ -2398,34 +2253,6 @@ function buildUnmatchedRecord(
     reason:
       result.reason
   };
-}
-
-
-// ============================================================
-// PREPARE ALL
-// ============================================================
-
-function prepareAll(
-  matches: AnyObj[],
-  live = false
-): PreparedMatch[] {
-
-  const result:
-    PreparedMatch[] = [];
-
-  for (
-    const match of matches
-  ) {
-
-    result.push(
-      prepareMatch(
-        match,
-        live
-      )
-    );
-  }
-
-  return result;
 }
 
 
@@ -2442,24 +2269,18 @@ async function runMatcher(
     Date.now();
 
   const url =
-    new URL(
-      request.url
-    );
+    new URL(request.url);
 
   let threshold =
     Number(
       url.searchParams.get(
         "threshold"
       ) ??
-      String(
-        DEFAULT_THRESHOLD
-      )
+      String(DEFAULT_THRESHOLD)
     );
 
   if (
-    !Number.isFinite(
-      threshold
-    )
+    !Number.isFinite(threshold)
   ) {
     threshold =
       DEFAULT_THRESHOLD;
@@ -2475,7 +2296,7 @@ async function runMatcher(
     );
 
   // ----------------------------------------------------------
-  // FETCH IN PARALLEL
+  // FETCH BOTH SERVICES IN PARALLEL
   // ----------------------------------------------------------
 
   const [
@@ -2496,59 +2317,52 @@ async function runMatcher(
 
     ]);
 
-  // ----------------------------------------------------------
-  // EXTRACT
-  // ----------------------------------------------------------
-
-  const v27Raw =
+  const v27Matches =
     extractV27Matches(
       v27Data
     );
 
-  const cloudbetRaw =
+  const rawCloudbetMatches =
     extractCloudbetMatches(
       cloudbetData
     );
 
-  const cloudbetLiveRaw =
-    cloudbetRaw.filter(
-      isCloudbetLive
-    );
-
-  // ----------------------------------------------------------
-  // PREPARE
-  // ----------------------------------------------------------
-
-  const v27Matches =
-    prepareAll(
-      v27Raw,
-      false
-    );
-
   const cloudbetMatches =
-    prepareAll(
-      cloudbetLiveRaw,
-      true
+    rawCloudbetMatches
+      .filter(isCloudbetLive);
+
+  // ----------------------------------------------------------
+  // PREPARE ONCE
+  // ----------------------------------------------------------
+
+  const preparedV27 =
+    v27Matches.map(
+      prepareMatch
+    );
+
+  const preparedCloudbet =
+    cloudbetMatches.map(
+      prepareMatch
     );
 
   // ----------------------------------------------------------
-  // ARRAYS
+  // BUILD CLOUDbet INDEX
   // ----------------------------------------------------------
 
-  const matches:
-    AnyObj[] = [];
+  const cloudbetIndex =
+    buildCloudbetIndex(
+      preparedCloudbet
+    );
 
-  const possibleMatches:
-    AnyObj[] = [];
+  // ----------------------------------------------------------
+  // RESULT ARRAYS
+  // ----------------------------------------------------------
 
-  const reversedCandidates:
-    AnyObj[] = [];
-
-  const falsePositiveRisks:
-    AnyObj[] = [];
-
-  const unmatched:
-    AnyObj[] = [];
+  const matches: AnyObj[] = [];
+  const possibleMatches: AnyObj[] = [];
+  const reversedCandidates: AnyObj[] = [];
+  const falsePositiveRisks: AnyObj[] = [];
+  const unmatched: AnyObj[] = [];
 
   const usedCloudbetIds =
     new Set<string>();
@@ -2560,14 +2374,19 @@ async function runMatcher(
   // ----------------------------------------------------------
 
   for (
-    const v27 of
-    v27Matches
+    let i = 0;
+    i < preparedV27.length;
+    i++
   ) {
 
+    const v27 =
+      preparedV27[i];
+
     const result =
-      findBestMatchPrepared(
+      findBestPreparedMatch(
         v27,
-        cloudbetMatches,
+        preparedCloudbet,
+        cloudbetIndex,
         threshold,
         usedCloudbetIds,
         false
@@ -2576,29 +2395,33 @@ async function runMatcher(
     candidateEvaluations +=
       result.candidateEvaluations;
 
+    // --------------------------------------------------------
+    // CONFIDENT
+    // --------------------------------------------------------
+
     if (
       result.matched &&
       result.best
     ) {
 
-      const cb =
-        result.best as
-        PreparedMatch;
+      const cbId =
+        String(
+          result.best?.id ??
+          result.best?.key ??
+          ""
+        );
 
-      if (
-        cb.id
-      ) {
-
+      if (cbId) {
         usedCloudbetIds.add(
-          cb.id
+          cbId
         );
       }
 
       matches.push({
 
         ...buildMatchRecord(
-          v27,
-          cb,
+          v27.raw,
+          result.best,
           result.detail
         ),
 
@@ -2612,19 +2435,19 @@ async function runMatcher(
       continue;
     }
 
+    // --------------------------------------------------------
+    // DIAGNOSTIC
+    // --------------------------------------------------------
+
     if (
       result.best &&
       result.detail
     ) {
 
-      const cb =
-        result.best as
-        PreparedMatch;
-
       const item =
         buildMatchRecord(
-          v27,
-          cb,
+          v27.raw,
+          result.best,
           result.detail
         );
 
@@ -2688,7 +2511,7 @@ async function runMatcher(
       unmatched.push(
         buildUnmatchedRecord(
           unmatched.length,
-          v27,
+          v27.raw,
           result,
           threshold
         )
@@ -2700,7 +2523,7 @@ async function runMatcher(
     unmatched.push(
       buildUnmatchedRecord(
         unmatched.length,
-        v27,
+        v27.raw,
         result,
         threshold
       )
@@ -2720,7 +2543,7 @@ async function runMatcher(
       "cloudbet-match-matcher",
 
     version:
-      "V5",
+      "V6",
 
     mode:
       "READ ONLY",
@@ -2752,25 +2575,25 @@ async function runMatcher(
         CONFIDENT_TOTAL_SCORE,
 
       reversed_confident_score:
-        0.90,
+        REVERSED_CONFIDENT_SCORE,
 
       matcher:
         "STRICT TWO-SIDED TEAM NORMALIZATION + ALIAS + TOKEN FUZZY + CATEGORY PROTECTION + COMPETITION/COUNTRY SIGNAL",
 
       optimization:
-        "PRE-NORMALIZED TEAMS + PRE-BUILT TOKENS + FAST CANDIDATE GATE + EARLY FUZZY EXIT"
+        "PRE-NORMALIZED TEAMS + TOKEN INDEX + FAST CANDIDATE LOOKUP + LIMITED FUZZY EVALUATION"
     },
 
     stats: {
 
       v27_matches:
-        v27Raw.length,
+        v27Matches.length,
 
       cloudbet_raw_matches:
-        cloudbetRaw.length,
+        rawCloudbetMatches.length,
 
       cloudbet_live_matches:
-        cloudbetLiveRaw.length,
+        cloudbetMatches.length,
 
       confident_matched:
         matches.length,
@@ -2791,7 +2614,10 @@ async function runMatcher(
         usedCloudbetIds.size,
 
       prepared_v27:
-        v27Matches.length,
+        preparedV27.length,
+
+      prepared_cloudbet:
+        preparedCloudbet.length,
 
       candidate_evaluations:
         candidateEvaluations,
@@ -2837,24 +2663,18 @@ async function runDiagnostic(
     Date.now();
 
   const url =
-    new URL(
-      request.url
-    );
+    new URL(request.url);
 
   let threshold =
     Number(
       url.searchParams.get(
         "threshold"
       ) ??
-      String(
-        DEFAULT_THRESHOLD
-      )
+      String(DEFAULT_THRESHOLD)
     );
 
   if (
-    !Number.isFinite(
-      threshold
-    )
+    !Number.isFinite(threshold)
   ) {
     threshold =
       DEFAULT_THRESHOLD;
@@ -2887,41 +2707,43 @@ async function runDiagnostic(
 
     ]);
 
-  const v27Raw =
+  const v27Matches =
     extractV27Matches(
       v27Data
     );
 
-  const cloudbetRaw =
+  const rawCloudbetMatches =
     extractCloudbetMatches(
       cloudbetData
     );
 
-  const cloudbetLiveRaw =
-    cloudbetRaw.filter(
-      isCloudbetLive
-    );
-
-  const v27Matches =
-    prepareAll(
-      v27Raw,
-      false
-    );
-
   const cloudbetMatches =
-    prepareAll(
-      cloudbetLiveRaw,
-      true
+    rawCloudbetMatches
+      .filter(isCloudbetLive);
+
+  const preparedV27 =
+    v27Matches.map(
+      prepareMatch
+    );
+
+  const preparedCloudbet =
+    cloudbetMatches.map(
+      prepareMatch
+    );
+
+  const cloudbetIndex =
+    buildCloudbetIndex(
+      preparedCloudbet
     );
 
   const usedCloudbetIds =
     new Set<string>();
 
   const normalMatched:
-    PreparedMatch[] = [];
+    AnyObj[] = [];
 
   const normalUnmatched:
-    PreparedMatch[] = [];
+    AnyObj[] = [];
 
   let candidateEvaluations = 0;
 
@@ -2930,14 +2752,14 @@ async function runDiagnostic(
   // ----------------------------------------------------------
 
   for (
-    const v27 of
-    v27Matches
+    const v27 of preparedV27
   ) {
 
     const result =
-      findBestMatchPrepared(
+      findBestPreparedMatch(
         v27,
-        cloudbetMatches,
+        preparedCloudbet,
+        cloudbetIndex,
         threshold,
         usedCloudbetIds,
         false
@@ -2951,20 +2773,21 @@ async function runDiagnostic(
       result.best
     ) {
 
-      const cb =
-        result.best as
-        PreparedMatch;
+      const cbId =
+        String(
+          result.best?.id ??
+          result.best?.key ??
+          ""
+        );
 
-      if (
-        cb.id
-      ) {
+      if (cbId) {
         usedCloudbetIds.add(
-          cb.id
+          cbId
         );
       }
 
       normalMatched.push(
-        v27
+        v27.raw
       );
 
     } else {
@@ -2976,7 +2799,7 @@ async function runDiagnostic(
   }
 
   // ----------------------------------------------------------
-  // DIAGNOSTIC
+  // DIAGNOSTIC AGAINST ALL CLOUDBET
   // ----------------------------------------------------------
 
   const diagnostics:
@@ -2985,13 +2808,12 @@ async function runDiagnostic(
   let potentialMatches = 0;
   let closeBelowThreshold = 0;
   let reversedCandidates = 0;
-  let trueUnmatched = 0;
   let falsePositiveRisk = 0;
+  let trueUnmatched = 0;
 
   for (
     let i = 0;
-    i <
-    normalUnmatched.length;
+    i < normalUnmatched.length;
     i++
   ) {
 
@@ -2999,9 +2821,10 @@ async function runDiagnostic(
       normalUnmatched[i];
 
     const result =
-      findBestMatchPrepared(
+      findBestPreparedMatch(
         v27,
-        cloudbetMatches,
+        preparedCloudbet,
+        cloudbetIndex,
         threshold,
         undefined,
         true
@@ -3056,10 +2879,6 @@ async function runDiagnostic(
         trueUnmatched++;
       }
 
-      const cb =
-        result.best as
-        PreparedMatch;
-
       diagnostics.push({
 
         index: i,
@@ -3076,26 +2895,22 @@ async function runDiagnostic(
             ),
 
           home:
-            extractHome(
-              v27.raw
-            ),
+            extractHome(v27.raw),
 
           away:
-            extractAway(
-              v27.raw
-            ),
+            extractAway(v27.raw),
 
           normalized_home:
-            v27.home.normalized,
+            v27.home,
 
           normalized_away:
-            v27.away.normalized,
+            v27.away,
 
           category_home:
-            v27.home.category,
+            v27.categoryHome,
 
           category_away:
-            v27.away.category,
+            v27.categoryAway,
 
           minute:
             v27.raw?.minute ??
@@ -3110,46 +2925,50 @@ async function runDiagnostic(
         best_cloudbet: {
 
           id:
-            cb.raw?.id ??
+            result.best?.id ??
             null,
 
           key:
-            cb.raw?.key ??
+            result.best?.key ??
             null,
 
           match:
             matchDisplayName(
-              cb.raw
+              result.best
             ),
 
           home:
             extractHome(
-              cb.raw
+              result.best
             ),
 
           away:
             extractAway(
-              cb.raw
+              result.best
             ),
 
           normalized_home:
-            cb.home.normalized,
+            result.bestPrepared?.home ??
+            null,
 
           normalized_away:
-            cb.away.normalized,
+            result.bestPrepared?.away ??
+            null,
 
           category_home:
-            cb.home.category,
+            result.bestPrepared?.categoryHome ??
+            "",
 
           category_away:
-            cb.away.category,
+            result.bestPrepared?.categoryAway ??
+            "",
 
           status:
-            cb.raw?.status ??
+            result.best?.status ??
             null,
 
           competition:
-            cb.raw?.competition ??
+            result.best?.competition ??
             null
         },
 
@@ -3237,26 +3056,22 @@ async function runDiagnostic(
             ),
 
           home:
-            extractHome(
-              v27.raw
-            ),
+            extractHome(v27.raw),
 
           away:
-            extractAway(
-              v27.raw
-            ),
+            extractAway(v27.raw),
 
           normalized_home:
-            v27.home.normalized,
+            v27.home,
 
           normalized_away:
-            v27.away.normalized,
+            v27.away,
 
           category_home:
-            v27.home.category,
+            v27.categoryHome,
 
           category_away:
-            v27.away.category,
+            v27.categoryAway,
 
           minute:
             v27.raw?.minute ??
@@ -3293,12 +3108,10 @@ async function runDiagnostic(
   diagnostics.sort(
     (a, b) =>
       Number(
-        b?.scoring?.total ??
-        0
+        b?.scoring?.total ?? 0
       ) -
       Number(
-        a?.scoring?.total ??
-        0
+        a?.scoring?.total ?? 0
       )
   );
 
@@ -3311,7 +3124,7 @@ async function runDiagnostic(
       "cloudbet-match-matcher",
 
     version:
-      "V5",
+      "V6",
 
     mode:
       "READ ONLY",
@@ -3333,26 +3146,41 @@ async function runDiagnostic(
       match_threshold:
         threshold,
 
+      strong_team_score:
+        STRONG_TEAM_SCORE,
+
+      possible_team_score:
+        POSSIBLE_TEAM_SCORE,
+
+      possible_total_score:
+        POSSIBLE_TOTAL_SCORE,
+
+      confident_total_score:
+        CONFIDENT_TOTAL_SCORE,
+
+      reversed_confident_score:
+        REVERSED_CONFIDENT_SCORE,
+
       matcher:
         "STRICT TWO-SIDED TEAM NORMALIZATION + ALIAS + TOKEN FUZZY + CATEGORY PROTECTION + COMPETITION/COUNTRY SIGNAL",
 
-      diagnostic_note:
-        "Diagnostic ignores used Cloudbet IDs so every unmatched V27 match is compared against every live Cloudbet event.",
-
       optimization:
-        "PRE-NORMALIZED TEAMS + PRE-BUILT TOKENS + FAST CANDIDATE GATE + EARLY FUZZY EXIT"
+        "PRE-NORMALIZED TEAMS + TOKEN INDEX + FAST CANDIDATE LOOKUP + LIMITED FUZZY EVALUATION",
+
+      diagnostic_note:
+        "Diagnostic ignores used Cloudbet IDs so every unmatched V27 match is compared against every live Cloudbet event."
     },
 
     stats: {
 
       v27_matches:
-        v27Raw.length,
+        v27Matches.length,
 
       cloudbet_raw_matches:
-        cloudbetRaw.length,
+        rawCloudbetMatches.length,
 
       cloudbet_live_matches:
-        cloudbetLiveRaw.length,
+        cloudbetMatches.length,
 
       normal_matched:
         normalMatched.length,
@@ -3379,7 +3207,10 @@ async function runDiagnostic(
         diagnostics.length,
 
       prepared_v27:
-        v27Matches.length,
+        preparedV27.length,
+
+      prepared_cloudbet:
+        preparedCloudbet.length,
 
       candidate_evaluations:
         candidateEvaluations,
@@ -3416,7 +3247,7 @@ function health(): Response {
       "cloudbet-match-matcher",
 
     version:
-      "V5",
+      "V6",
 
     mode:
       "READ ONLY",
@@ -3431,7 +3262,7 @@ function health(): Response {
     },
 
     matcher:
-      "V5 STRICT TWO-SIDED MATCH",
+      "V6 FAST STRICT TWO-SIDED MATCH",
 
     rules: {
 
@@ -3457,11 +3288,11 @@ function health(): Response {
         "Generic/common club tokens cannot create a strong match alone",
 
       optimization:
-        "Prepared teams + cached tokens + fast candidate gate + early fuzzy exit"
+        "Cloudbet token index limits expensive fuzzy comparisons"
     },
 
     message:
-      "Matcher uses V27 and CLOUDBET Service Bindings. No API key is required here.",
+      "V6 FAST matcher uses V27 and CLOUDBET Service Bindings. No API key is required here.",
 
     timestamp:
       new Date().toISOString()
@@ -3481,22 +3312,14 @@ export default {
   ): Promise<Response> {
 
     const url =
-      new URL(
-        request.url
-      );
+      new URL(request.url);
 
     const path =
       url.pathname
-        .replace(
-          /\/+$/,
-          ""
-        ) || "/";
+        .replace(/\/+$/, "") ||
+      "/";
 
     try {
-
-      // ------------------------------------------------------
-      // HEALTH
-      // ------------------------------------------------------
 
       if (
         path === "/" ||
@@ -3505,10 +3328,6 @@ export default {
 
         return health();
       }
-
-      // ------------------------------------------------------
-      // NORMAL MATCH
-      // ------------------------------------------------------
 
       if (
         path === "/match" ||
@@ -3521,10 +3340,6 @@ export default {
         );
       }
 
-      // ------------------------------------------------------
-      // DIAGNOSTIC
-      // ------------------------------------------------------
-
       if (
         path === "/diagnostic" ||
         path === "/diagnostics"
@@ -3535,10 +3350,6 @@ export default {
           request
         );
       }
-
-      // ------------------------------------------------------
-      // 404
-      // ------------------------------------------------------
 
       return json(
 
@@ -3589,7 +3400,7 @@ export default {
             "cloudbet-match-matcher",
 
           version:
-            "V5",
+            "V6",
 
           mode:
             "READ ONLY",
