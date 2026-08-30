@@ -1,6 +1,7 @@
 {
   "compatibility_date": "2026-08-29",
-  "main": ,
+  "main": "src/worker.ts",
+  "name": "cloudbet-match-matcher",
   "observability": {
     "enabled": true
   }
