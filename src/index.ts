@@ -32,17 +32,10 @@ const API_KEY_NAME =
 // JSON
 // ============================================================
 
-function json(
-  data,
-  status = 200
-) {
+function json(data, status = 200) {
 
   return new Response(
-    JSON.stringify(
-      data,
-      null,
-      2
-    ),
+    JSON.stringify(data, null, 2),
     {
       status,
 
@@ -95,7 +88,7 @@ function getApiKey(env) {
 
 
 // ============================================================
-// CLOUDBET REQUEST
+// CLOUDBET FETCH
 // ============================================================
 
 async function cloudbetFetch(
@@ -106,13 +99,11 @@ async function cloudbetFetch(
   const apiKey =
     getApiKey(env);
 
-
   const response =
     await fetch(
       `${API_BASE}${path}`,
       {
-        method:
-          "GET",
+        method: "GET",
 
         headers: {
           "accept":
@@ -127,13 +118,10 @@ async function cloudbetFetch(
       }
     );
 
-
   const text =
     await response.text();
 
-
   let data;
-
 
   try {
 
@@ -150,10 +138,7 @@ async function cloudbetFetch(
 
   }
 
-
-  if (
-    !response.ok
-  ) {
+  if (!response.ok) {
 
     throw new Error(
       `Cloudbet HTTP ${response.status}: ${
@@ -165,7 +150,6 @@ async function cloudbetFetch(
 
   }
 
-
   return data;
 
 }
@@ -175,22 +159,35 @@ async function cloudbetFetch(
 // GET LIVE EVENTS
 // ============================================================
 //
-// Cloudbet official Feed API:
-// GET /v2/odds/events
+// Cloudbet requires from/to for public events API.
 //
-// We request soccer directly.
+// We request a 2-hour window starting now.
 // ============================================================
 
-async function getLiveEvents(
-  env
-) {
+async function getLiveEvents(env) {
+
+  const now =
+    new Date();
+
+  const from =
+    now.toISOString();
+
+  const to =
+    new Date(
+      now.getTime() +
+      2 * 60 * 60 * 1000
+    ).toISOString();
+
+  const path =
+    `/events?sport=soccer` +
+    `&from=${encodeURIComponent(from)}` +
+    `&to=${encodeURIComponent(to)}`;
 
   const data =
     await cloudbetFetch(
-      "/events?sport=soccer",
+      path,
       env
     );
-
 
   if (
     Array.isArray(
@@ -202,7 +199,6 @@ async function getLiveEvents(
 
   }
 
-
   if (
     Array.isArray(data)
   ) {
@@ -210,7 +206,6 @@ async function getLiveEvents(
     return data;
 
   }
-
 
   return [];
 
@@ -221,9 +216,7 @@ async function getLiveEvents(
 // LIVE CHECK
 // ============================================================
 
-function isLive(
-  event
-) {
+function isLive(event) {
 
   const status =
     String(
@@ -232,7 +225,6 @@ function isLive(
     )
     .toUpperCase()
     .trim();
-
 
   return (
     status === "TRADING_LIVE" ||
@@ -247,9 +239,7 @@ function isLive(
 // MINUTE
 // ============================================================
 
-function getMinute(
-  event
-) {
+function getMinute(event) {
 
   const values = [
 
@@ -275,17 +265,13 @@ function getMinute(
 
   ];
 
-
   for (
     const value
     of values
   ) {
 
     const minute =
-      parseMinute(
-        value
-      );
-
+      parseMinute(value);
 
     if (
       minute !== null
@@ -297,7 +283,6 @@ function getMinute(
 
   }
 
-
   return null;
 
 }
@@ -307,9 +292,7 @@ function getMinute(
 // PARSE MINUTE
 // ============================================================
 
-function parseMinute(
-  value
-) {
+function parseMinute(value) {
 
   if (
     value === null ||
@@ -320,7 +303,6 @@ function parseMinute(
 
   }
 
-
   if (
     typeof value === "number"
   ) {
@@ -330,7 +312,6 @@ function parseMinute(
       : null;
 
   }
-
 
   if (
     typeof value === "object"
@@ -348,17 +329,13 @@ function parseMinute(
 
     ];
 
-
     for (
       const item
       of nested
     ) {
 
       const result =
-        parseMinute(
-          item
-        );
-
+        parseMinute(item);
 
       if (
         result !== null
@@ -370,18 +347,13 @@ function parseMinute(
 
     }
 
-
     return null;
 
   }
 
-
   const text =
-    String(
-      value
-    )
-    .trim();
-
+    String(value)
+      .trim();
 
   if (!text)
     return null;
@@ -394,10 +366,7 @@ function parseMinute(
       /^(\d{1,3}):/
     );
 
-
-  if (
-    clock
-  ) {
+  if (clock) {
 
     return Number(
       clock[1]
@@ -413,10 +382,7 @@ function parseMinute(
       /^(\d{1,3})\s*['′]/
     );
 
-
-  if (
-    apostrophe
-  ) {
+  if (apostrophe) {
 
     return Number(
       apostrophe[1]
@@ -432,18 +398,11 @@ function parseMinute(
       /^(\d{1,3})\s*\+\s*(\d{1,2})/
     );
 
-
-  if (
-    added
-  ) {
+  if (added) {
 
     return (
-      Number(
-        added[1]
-      ) +
-      Number(
-        added[2]
-      )
+      Number(added[1]) +
+      Number(added[2])
     );
 
   }
@@ -456,17 +415,13 @@ function parseMinute(
       /^(\d{1,3})$/
     );
 
-
-  if (
-    plain
-  ) {
+  if (plain) {
 
     return Number(
       plain[1]
     );
 
   }
-
 
   return null;
 
@@ -477,9 +432,7 @@ function parseMinute(
 // SCORE
 // ============================================================
 
-function getScore(
-  event
-) {
+function getScore(event) {
 
   const home =
     Number(
@@ -489,7 +442,6 @@ function getScore(
       0
     );
 
-
   const away =
     Number(
       event?.score?.away ??
@@ -497,7 +449,6 @@ function getScore(
       event?.away_score ??
       0
     );
-
 
   return {
 
@@ -520,13 +471,10 @@ function getScore(
 // FIND EXACT HT OVER 0.5
 // ============================================================
 
-function findHTOver05(
-  event
-) {
+function findHTOver05(event) {
 
   const markets =
     event?.markets;
-
 
   if (
     !markets ||
@@ -537,25 +485,19 @@ function findHTOver05(
 
   }
 
-
   const totalGoals =
     markets[
       "soccer.total_goals"
     ];
 
-
-  if (
-    !totalGoals
-  ) {
+  if (!totalGoals) {
 
     return null;
 
   }
 
-
   const submarkets =
     totalGoals?.submarkets;
-
 
   if (
     !submarkets ||
@@ -566,15 +508,12 @@ function findHTOver05(
 
   }
 
-
   for (
     const [
       submarketKey,
       submarket
     ]
-    of Object.entries(
-      submarkets
-    )
+    of Object.entries(submarkets)
   ) {
 
     const key =
@@ -584,7 +523,6 @@ function findHTOver05(
       .toLowerCase()
       .trim();
 
-
     if (
       key !== "period=ht"
     ) {
@@ -593,14 +531,12 @@ function findHTOver05(
 
     }
 
-
     const selections =
       Array.isArray(
         submarket?.selections
       )
         ? submarket.selections
         : [];
-
 
     for (
       const selection
@@ -615,7 +551,6 @@ function findHTOver05(
         .toLowerCase()
         .trim();
 
-
       const params =
         String(
           selection?.params ||
@@ -623,7 +558,6 @@ function findHTOver05(
         )
         .toLowerCase()
         .trim();
-
 
       const status =
         String(
@@ -633,7 +567,6 @@ function findHTOver05(
         .toUpperCase()
         .trim();
 
-
       if (
         outcome !== "over"
       ) {
@@ -641,7 +574,6 @@ function findHTOver05(
         continue;
 
       }
-
 
       if (
         params !== "total=0.5"
@@ -651,7 +583,6 @@ function findHTOver05(
 
       }
 
-
       if (
         status !== "SELECTION_ENABLED"
       ) {
@@ -660,13 +591,11 @@ function findHTOver05(
 
       }
 
-
       const price =
         Number(
           selection?.price ||
           0
         );
-
 
       if (
         !Number.isFinite(price) ||
@@ -676,7 +605,6 @@ function findHTOver05(
         continue;
 
       }
-
 
       return {
 
@@ -717,14 +645,13 @@ function findHTOver05(
 
   }
 
-
   return null;
 
 }
 
 
 // ============================================================
-// NORMALIZE
+// NORMALIZE MATCH
 // ============================================================
 
 function normalizeMatch(
@@ -738,19 +665,14 @@ function normalizeMatch(
     event?.home ||
     null;
 
-
   const away =
     event?.away?.name ||
     event?.away?.key ||
     event?.away ||
     null;
 
-
   const score =
-    getScore(
-      event
-    );
-
+    getScore(event);
 
   return {
 
@@ -838,21 +760,15 @@ function normalizeMatch(
 
 
 // ============================================================
-// LIVE FILTER
+// LIVE
 // ============================================================
 
-async function getLive(
-  env
-) {
+async function getLive(env) {
 
   const events =
-    await getLiveEvents(
-      env
-    );
-
+    await getLiveEvents(env);
 
   const matches = [];
-
 
   for (
     const event
@@ -873,36 +789,11 @@ async function getLive(
 
 
     // --------------------------------------------------------
-    // ONLY SOCCER
-    // --------------------------------------------------------
-
-    const sport =
-      String(
-        event?.sport?.key ||
-        event?.sportKey ||
-        "soccer"
-      )
-      .toLowerCase();
-
-
-    if (
-      sport !== "soccer"
-    ) {
-
-      continue;
-
-    }
-
-
-    // --------------------------------------------------------
-    // EXACT BET
+    // EXACT HT OVER 0.5
     // --------------------------------------------------------
 
     const bet =
-      findHTOver05(
-        event
-      );
-
+      findHTOver05(event);
 
     if (
       !bet
@@ -914,16 +805,13 @@ async function getLive(
 
 
     matches.push(
-
       normalizeMatch(
         event,
         bet
       )
-
     );
 
   }
-
 
   return {
 
@@ -940,6 +828,9 @@ async function getLive(
       "soccer",
 
     filter: {
+
+      live:
+        true,
 
       market:
         "soccer.total_goals",
@@ -978,9 +869,7 @@ async function getLive(
 // HEALTH
 // ============================================================
 
-async function health(
-  env
-) {
+async function health(env) {
 
   let exists =
     false;
@@ -988,18 +877,13 @@ async function health(
   let length =
     0;
 
-
   try {
 
     const key =
-      getApiKey(
-        env
-      );
-
+      getApiKey(env);
 
     exists =
       true;
-
 
     length =
       key.length;
@@ -1010,7 +894,6 @@ async function health(
       false;
 
   }
-
 
   return {
 
@@ -1024,7 +907,10 @@ async function health(
       "READ ONLY",
 
     endpoint:
-      "/events?sport=soccer",
+      "/events",
+
+    request_window:
+      "now → +2 hours",
 
     filter: {
 
@@ -1087,6 +973,7 @@ export default {
         null,
         {
           status: 204,
+
           headers: {
             "access-control-allow-origin":
               "*",
@@ -1107,7 +994,6 @@ export default {
       new URL(
         request.url
       );
-
 
     const path =
       url.pathname.replace(
@@ -1178,9 +1064,7 @@ export default {
       );
 
 
-    } catch (
-      error
-    ) {
+    } catch (error) {
 
       return json(
         {
