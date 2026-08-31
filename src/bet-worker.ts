@@ -2,7 +2,7 @@
 // CLOUDBET BET WORKER V4
 // SECURE SIGNAL -> MATCHER -> CLOUDBET PIPELINE
 //
-// V4 SECURE CONNECTION FIX
+// V4.1 MATCHER CONTRACT FIX
 //
 // FLOW:
 //
@@ -28,9 +28,20 @@
 // - BETTING DISABLED
 // - NO BET IS PLACED
 // - EXACT_ID ALONE IS NOT ENOUGH
-// - score_only_match IS NEVER ACCEPTED
-// - MATCHER CONFIDENT_MATCH IS REQUIRED
+// - EXACT_ID + SCORE 0 IS REJECTED
+// - POSSIBLE_MATCH IS REJECTED
+// - FALSE_POSITIVE_RISK IS REJECTED
+// - CONFIDENT_MATCH IS REQUIRED
 // - TWO-SIDED TEAM VALIDATION IS REQUIRED
+// - CLOUDBET SECOND VERIFICATION IS REQUIRED
+//
+// FIX:
+// V7-FH does not have to return security.secure_match=true
+// inside every matched item.
+//
+// CONFIDENT_MATCH + valid two-sided teams + positive matcher
+// score is accepted as secure matcher evidence.
+//
 // ============================================================
 
 interface Env {
@@ -46,7 +57,7 @@ type AnyObj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V4";
+const VERSION = "V4.1";
 
 const MODE = "READ_ONLY";
 
@@ -59,8 +70,7 @@ const TOKEN_TEAM_MIN_SCORE = 0.45;
 const REQUIRED_MATCH_CLASSIFICATION =
   "CONFIDENT_MATCH";
 
-const REQUIRED_SECURE_MATCH =
-  true;
+const REQUIRED_SECURE_MATCH = true;
 
 const ALLOWED_SIGNAL_TYPE =
   "HUNTER_ENTRY";
@@ -152,7 +162,6 @@ async function fetchServiceJSON(
   }
 
   if (!text.trim()) {
-
     return {};
   }
 
@@ -296,7 +305,6 @@ function extractHome(
     typeof match?.home ===
     "string"
   ) {
-
     return match.home.trim();
   }
 
@@ -304,7 +312,6 @@ function extractHome(
     typeof match?.homeTeam ===
     "string"
   ) {
-
     return match.homeTeam.trim();
   }
 
@@ -312,7 +319,6 @@ function extractHome(
     typeof match?.home_name ===
     "string"
   ) {
-
     return match.home_name.trim();
   }
 
@@ -320,7 +326,6 @@ function extractHome(
     typeof match?.home?.name ===
     "string"
   ) {
-
     return match.home.name.trim();
   }
 
@@ -342,7 +347,6 @@ function extractAway(
     typeof match?.away ===
     "string"
   ) {
-
     return match.away.trim();
   }
 
@@ -350,7 +354,6 @@ function extractAway(
     typeof match?.awayTeam ===
     "string"
   ) {
-
     return match.awayTeam.trim();
   }
 
@@ -358,7 +361,6 @@ function extractAway(
     typeof match?.away_name ===
     "string"
   ) {
-
     return match.away_name.trim();
   }
 
@@ -366,7 +368,6 @@ function extractAway(
     typeof match?.away?.name ===
     "string"
   ) {
-
     return match.away.name.trim();
   }
 
@@ -661,7 +662,6 @@ function extractSignals(
       data?.signals
     )
   ) {
-
     return data.signals;
   }
 
@@ -670,7 +670,6 @@ function extractSignals(
       data?.entries
     )
   ) {
-
     return data.entries;
   }
 
@@ -679,7 +678,6 @@ function extractSignals(
       data?.hunter_entries
     )
   ) {
-
     return data.hunter_entries;
   }
 
@@ -688,7 +686,6 @@ function extractSignals(
       data?.data
     )
   ) {
-
     return data.data;
   }
 
@@ -719,7 +716,7 @@ function isHunterEntry(
 
 
 // ============================================================
-// SIGNAL MATCH
+// SIGNAL
 // ============================================================
 
 function signalMatchId(
@@ -778,7 +775,6 @@ function extractMatcherMatches(
       data?.matches
     )
   ) {
-
     return data.matches;
   }
 
@@ -787,7 +783,6 @@ function extractMatcherMatches(
       data?.results
     )
   ) {
-
     return data.results;
   }
 
@@ -796,7 +791,6 @@ function extractMatcherMatches(
       data?.matched
     )
   ) {
-
     return data.matched;
   }
 
@@ -807,23 +801,31 @@ function extractMatcherMatches(
 // ============================================================
 // SECURE MATCH VALIDATION
 //
-// THIS IS THE IMPORTANT V4 FIX.
+// V4.1 FIX
 //
-// EXACT_ID IS NOT AUTOMATICALLY SECURE.
+// V7-FH classification is authoritative for match quality.
 //
-// Required:
+// ACCEPT:
 //
-// 1. matcher success
-// 2. CONFIDENT_MATCH
-// 3. secure_match=true OR equivalent secure evidence
-// 4. score_only_match=false
-// 5. valid matcher match
-// 6. both teams present
-// 7. signal teams must be compatible
-// 8. Cloudbet candidate must exist
+// CONFIDENT_MATCH
+// + valid V27 teams
+// + valid Cloudbet teams
+// + two-sided signal -> V27 validation
+// + positive matcher evidence
 //
-// matcher_score=0 is NOT accepted merely because
-// match_method=EXACT_ID.
+// REJECT:
+//
+// POSSIBLE_MATCH
+// FALSE_POSITIVE_RISK
+// REVERSED
+// score_only_match
+// zero matcher score
+// invalid teams
+// wrong signal direction
+//
+// secure_match=true is OPTIONAL because V7-FH itself already
+// exposes classification and scoring.
+//
 // ============================================================
 
 function validateSecureMatcherResult(
@@ -849,7 +851,9 @@ function validateSecureMatcherResult(
   if (!rootSuccess) {
 
     return {
-      secure: false,
+
+      secure:
+        false,
 
       reason:
         "MATCHER_NOT_SUCCESSFUL"
@@ -887,7 +891,8 @@ function validateSecureMatcherResult(
     const classification =
       safeString(
         item?.classification ??
-        item?.match_classification
+        item?.match_classification ??
+        item?.classification_type
       ).toUpperCase();
 
     const reason =
@@ -920,10 +925,6 @@ function validateSecureMatcherResult(
         security?.match_method
       ).toUpperCase();
 
-    const secureFlag =
-      security?.secure_match === true ||
-      item?.secure_match === true;
-
     const scoreOnly =
       security?.score_only_match === true ||
       item?.score_only_match === true;
@@ -944,6 +945,10 @@ function validateSecureMatcherResult(
         ? extractAway(cloudbet)
         : "";
 
+    // --------------------------------------------------------
+    // ONLY CONFIDENT_MATCH IS ALLOWED
+    // --------------------------------------------------------
+
     if (
       classification !==
       REQUIRED_MATCH_CLASSIFICATION
@@ -951,17 +956,19 @@ function validateSecureMatcherResult(
       continue;
     }
 
+    // --------------------------------------------------------
+    // SCORE ONLY IS NEVER ACCEPTED
+    // --------------------------------------------------------
+
     if (
       scoreOnly
     ) {
       continue;
     }
 
-    if (
-      !secureFlag
-    ) {
-      continue;
-    }
+    // --------------------------------------------------------
+    // BOTH V27 TEAMS REQUIRED
+    // --------------------------------------------------------
 
     if (
       !teamsPresent(
@@ -971,6 +978,10 @@ function validateSecureMatcherResult(
     ) {
       continue;
     }
+
+    // --------------------------------------------------------
+    // CLOUDBET MATCH MUST EXIST
+    // --------------------------------------------------------
 
     if (
       !cloudbet ||
@@ -983,8 +994,22 @@ function validateSecureMatcherResult(
     }
 
     // --------------------------------------------------------
-    // CRITICAL:
-    // EXACT_ID with score 0 is not accepted.
+    // POSITIVE MATCHER EVIDENCE REQUIRED
+    //
+    // This prevents EXACT_ID + score 0.
+    // --------------------------------------------------------
+
+    if (
+      !Number.isFinite(
+        matcherScore
+      ) ||
+      matcherScore <= 0
+    ) {
+      continue;
+    }
+
+    // --------------------------------------------------------
+    // EXACT_ID + SCORE 0 IS ALWAYS REJECTED
     // --------------------------------------------------------
 
     if (
@@ -996,7 +1021,7 @@ function validateSecureMatcherResult(
     }
 
     // --------------------------------------------------------
-    // Signal -> V27 team direction check
+    // SIGNAL -> V27 TWO-SIDED VALIDATION
     // --------------------------------------------------------
 
     const sHome =
@@ -1027,6 +1052,15 @@ function validateSecureMatcherResult(
       }
     }
 
+    // --------------------------------------------------------
+    // CONFIDENT MATCH IS NOW SECURE
+    //
+    // IMPORTANT:
+    // secure_match flag from V7 is NOT mandatory.
+    // classification + scoring + two-sided validation
+    // provide the required security evidence.
+    // --------------------------------------------------------
+
     selected = {
 
       item,
@@ -1044,9 +1078,12 @@ function validateSecureMatcherResult(
       score_only_match:
         false,
 
-      reason,
+      reason:
+        reason ||
+        "CONFIDENT_MATCH_TWO_SIDED_VALIDATED",
 
       v27: {
+
         id:
           extractMatchId(v27),
 
@@ -1061,6 +1098,7 @@ function validateSecureMatcherResult(
       },
 
       cloudbet: {
+
         id:
           extractMatchId(cloudbet),
 
@@ -1084,7 +1122,8 @@ function validateSecureMatcherResult(
 
     return {
 
-      secure: false,
+      secure:
+        false,
 
       reason:
         "NO_SECURE_CONFIDENT_TWO_SIDED_MATCH",
@@ -1096,7 +1135,8 @@ function validateSecureMatcherResult(
 
   return {
 
-    secure: true,
+    secure:
+      true,
 
     reason:
       "SECURE_CONFIDENT_MATCH",
@@ -1119,7 +1159,6 @@ function extractCloudbetMatches(
       data?.matches
     )
   ) {
-
     return data.matches;
   }
 
@@ -1128,7 +1167,6 @@ function extractCloudbetMatches(
       data?.live_matches
     )
   ) {
-
     return data.live_matches;
   }
 
@@ -1137,7 +1175,6 @@ function extractCloudbetMatches(
       data?.events
     )
   ) {
-
     return data.events;
   }
 
@@ -1187,7 +1224,8 @@ function verifyCloudbetMatch(
 
     return {
 
-      verified: false,
+      verified:
+        false,
 
       reason:
         "MATCHER_DID_NOT_RETURN_CLOUDBET_MATCH"
@@ -1216,7 +1254,8 @@ function verifyCloudbetMatch(
 
     return {
 
-      verified: false,
+      verified:
+        false,
 
       reason:
         "MATCHER_CLOUDBET_TEAMS_EMPTY"
@@ -1224,7 +1263,7 @@ function verifyCloudbetMatch(
   }
 
   // ----------------------------------------------------------
-  // FIRST: EXACT CLOUD BET ID
+  // EXACT CLOUD BET ID + TEAMS
   // ----------------------------------------------------------
 
   if (
@@ -1261,12 +1300,14 @@ function verifyCloudbetMatch(
 
           return {
 
-            verified: true,
+            verified:
+              true,
 
             method:
               "CLOUDBET_ID_AND_TEAMS",
 
-            match: cb
+            match:
+              cb
           };
         }
       }
@@ -1274,7 +1315,7 @@ function verifyCloudbetMatch(
   }
 
   // ----------------------------------------------------------
-  // SECOND: TEAM VALIDATION
+  // EXACT TWO-SIDED TEAM VALIDATION
   // ----------------------------------------------------------
 
   for (
@@ -1299,19 +1340,22 @@ function verifyCloudbetMatch(
 
       return {
 
-        verified: true,
+        verified:
+          true,
 
         method:
           "CLOUDBET_EXACT_TEAMS",
 
-        match: cb
+        match:
+          cb
       };
     }
   }
 
   return {
 
-    verified: false,
+    verified:
+      false,
 
     reason:
       "CLOUDBET_MATCH_NOT_CONFIRMED"
@@ -1461,10 +1505,16 @@ function buildPreparedBet(
       score_only_match:
         false,
 
+      exact_id_alone_is_not_secure:
+        true,
+
       exact_id_requires_positive_matcher_score:
         true,
 
       matcher_confident:
+        true,
+
+      two_sided_team_validation:
         true,
 
       cloudbet_verified:
@@ -1516,10 +1566,7 @@ async function runV4(
     );
 
   // ----------------------------------------------------------
-  // IMPORTANT:
-  // NO ACTIVE SIGNALS = NO MATCHER CALL
-  // NO CLOUDBET CALL
-  // NO BET
+  // NO ACTIVE SIGNALS
   // ----------------------------------------------------------
 
   if (
@@ -1814,7 +1861,6 @@ async function runV4(
       rawCloudbet.filter(
         isCloudbetLive
       );
-
 
     const cloudbetVerification =
       verifyCloudbetMatch(
@@ -2196,10 +2242,16 @@ function health(): Response {
       matcher:
         "CONFIDENT_MATCH required",
 
+      possible_match:
+        "POSSIBLE_MATCH is rejected",
+
+      false_positive:
+        "FALSE_POSITIVE_RISK is rejected",
+
       exact_id:
         "EXACT_ID alone is not sufficient",
 
-      matcher_score:
+      exact_id_score_zero:
         "EXACT_ID with matcher score 0 is rejected",
 
       score_only:
@@ -2207,6 +2259,9 @@ function health(): Response {
 
       teams:
         "Both home and away must be present and compatible",
+
+      signal_direction:
+        "Signal home/away must match V27 home/away direction",
 
       cloudbet:
         "Cloudbet live event must be independently verified",
@@ -2216,7 +2271,7 @@ function health(): Response {
     },
 
     message:
-      "V4 secure signal-to-matcher-to-Cloudbet preparation worker is healthy.",
+      "V4.1 secure signal-to-matcher-to-Cloudbet preparation worker is healthy.",
 
     timestamp:
       new Date().toISOString()
@@ -2264,7 +2319,7 @@ export default {
 
 
       // --------------------------------------------------------
-      // V4 MATCH / PREPARE
+      // MATCH / PREPARE
       // --------------------------------------------------------
 
       if (
