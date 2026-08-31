@@ -7,8 +7,12 @@
   },
   "services": [
     {
-      "binding": "V27",
-      "service": "goal-watch-proxy"
+      "binding": "TRACKER",
+      "service": "goal-watch-tracker"
+    },
+    {
+      "binding": "MATCHER",
+      "service": "cloudbet-match-matcher"
     },
     {
       "binding": "CLOUDBET",
