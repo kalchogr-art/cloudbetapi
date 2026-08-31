@@ -1,36 +1,29 @@
 // ============================================================
-// CLOUDBET BET WORKER V5.1
+// CLOUDBET BET WORKER V5.2
 // READ ONLY — TEST MODE
 // BETTING DISABLED
 //
 // PURPOSE:
-// SECURE MATCHING — PREVENT FALSE MATCHES
+// SECURE MATCHING + PERFORMANCE DIAGNOSTICS
+//
+// V5.2 CHANGES:
+// 1. TRACKER = 1 CALL
+// 2. MATCHER + CLOUDBET /live RUN IN PARALLEL
+// 3. EXACT TIMING FOR TRACKER / MATCHER / CLOUDBET
+// 4. LOCAL PROCESSING TIMING
+// 5. TOTAL EXECUTION TIMING
+// 6. V5.1 SECURITY LOGIC PRESERVED
+// 7. BETTING REMAINS DISABLED
 //
 // FLOW:
-// TRACKER -> MATCHER -> CLOUDBET
-//              \----> DIRECT CLOUDBET FALLBACK
 //
-// V5.1 FIXES:
-// 1. MATCHER DISCOVERY THRESHOLD = 0.20
-// 2. MATCHER ACCEPT MIN SCORE = 0.20
-// 3. MATCHER SCORE ALONE IS NEVER TEAM VALIDATION
-// 4. STRICT TWO-SIDED TEAM VALIDATION
-// 5. EXACT / ALIAS NORMALIZATION = 1.00
-// 6. CONTAINMENT >= 0.75
-// 7. TOKEN MATCH REQUIRES STRONG TOKEN EVIDENCE
-// 8. CHARACTER SIMILARITY >= 0.70
-// 9. BOTH HOME + AWAY MUST PASS >= 0.70
-// 10. WEAK TEAM MATCHES ARE REJECTED
-// 11. NORMAL + REVERSED HOME/AWAY ALLOWED
-// 12. SCORE-ONLY MATCHES REJECTED
-// 13. EXACT_ID ALONE REJECTED
-// 14. EXACT_ID + ZERO MATCHER SCORE REJECTED
-// 15. CLOUD BET SECOND VERIFICATION REQUIRED
-// 16. DIRECT CLOUDBET FALLBACK ENABLED
-// 17. DIRECT FALLBACK USES SAME STRICT TEAM RULES
-// 18. CLOUDBET /live CALLED ONLY ONCE
-// 19. DETAILED SIGNAL FLOW DIAGNOSTICS
-// 20. BETTING DISABLED
+// TRACKER
+//    |
+//    +------ MATCHER
+//    |
+//    +------ CLOUDBET /live
+//
+// MATCHER + CLOUDBET RUN CONCURRENTLY
 //
 // IMPORTANT:
 // NO BETS ARE PLACED.
@@ -51,7 +44,7 @@ type AnyObj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V5.1";
+const VERSION = "V5.2";
 
 const MODE = "READ_ONLY_TEST";
 
@@ -62,27 +55,11 @@ const BETTING_ENABLED = false;
 // MATCHER
 // ============================================================
 
-// IMPORTANT:
-//
-// This is ONLY the discovery threshold.
-//
-// It does NOT mean that a 0.20 team match is accepted.
-//
-// Actual acceptance additionally requires:
-//
-// HOME TEAM >= 0.70
-// AWAY TEAM >= 0.70
-//
-// plus all other security checks.
+const MATCHER_THRESHOLD = 0.20;
 
-const MATCHER_DISCOVERY_THRESHOLD = 0.20;
+const STRONG_MATCHER_SCORE = 0.20;
 
-
-// Minimum positive Matcher score.
-//
-// Matcher score is NOT team validation.
-
-const MATCHER_ACCEPT_MIN_SCORE = 0.20;
+const MIN_MATCHER_SCORE = 0.20;
 
 
 // ============================================================
@@ -91,29 +68,13 @@ const MATCHER_ACCEPT_MIN_SCORE = 0.20;
 
 const TEAM_MATCH_MIN_SCORE = 0.70;
 
-
-// Character similarity minimum.
-
 const CHARACTER_SIMILARITY_MIN_SCORE = 0.70;
-
-
-// Containment is naturally stronger than
-// ordinary character similarity.
 
 const CONTAINMENT_MIN_SCORE = 0.75;
 
-
-// Exact / alias normalization.
-
 const EXACT_TEAM_SCORE = 1.00;
 
-
-// Token matching needs strong evidence.
-
 const TOKEN_MATCH_MIN_SCORE = 0.75;
-
-
-// Minimum number of meaningful common tokens.
 
 const TOKEN_MIN_COMMON = 1;
 
@@ -125,10 +86,8 @@ const TOKEN_MIN_COMMON = 1;
 const DIRECT_CLOUDBET_MIN_SCORE =
   TEAM_MATCH_MIN_SCORE;
 
-
 const DIRECT_CLOUDBET_STRONG_TEAM_SCORE =
   0.85;
-
 
 const DIRECT_CLOUDBET_EXACT_TEAM_SCORE =
   1.00;
@@ -140,11 +99,6 @@ const DIRECT_CLOUDBET_EXACT_TEAM_SCORE =
 
 const REQUIRED_MATCH_CLASSIFICATION =
   "CONFIDENT_MATCH";
-
-
-// secure_match=false is not automatically rejected.
-//
-// Team validation is the real protection.
 
 const REQUIRED_SECURE_MATCH = false;
 
@@ -1043,10 +997,6 @@ function teamMatchScore(
   }
 
 
-  // ==========================================================
-  // EXACT
-  // ==========================================================
-
   if (A === B) {
 
     return {
@@ -1065,10 +1015,6 @@ function teamMatchScore(
     };
   }
 
-
-  // ==========================================================
-  // CONTAINMENT
-  // ==========================================================
 
   if (
     A.includes(B) ||
@@ -1095,7 +1041,7 @@ function teamMatchScore(
 
     const score =
       Math.max(
-        CONTAINMENT_MIN_SCORE,
+        0.75,
         containmentScore
       );
 
@@ -1116,10 +1062,6 @@ function teamMatchScore(
     };
   }
 
-
-  // ==========================================================
-  // TOKEN
-  // ==========================================================
 
   const tokensA =
     teamTokens(A);
@@ -1186,10 +1128,6 @@ function teamMatchScore(
     }
   }
 
-
-  // ==========================================================
-  // CHARACTER SIMILARITY
-  // ==========================================================
 
   const characterScore =
     characterSimilarity(
@@ -1285,10 +1223,6 @@ function twoSidedTeamScore(
     );
 
 
-  // ==========================================================
-  // NORMAL
-  // ==========================================================
-
   if (
     normalValid &&
     normalScore >=
@@ -1330,10 +1264,6 @@ function twoSidedTeamScore(
   }
 
 
-  // ==========================================================
-  // REVERSED
-  // ==========================================================
-
   if (reversedValid) {
 
     return {
@@ -1370,10 +1300,6 @@ function twoSidedTeamScore(
     };
   }
 
-
-  // ==========================================================
-  // FAILURE
-  // ==========================================================
 
   const bestDirection =
     normalScore >=
@@ -1843,10 +1769,6 @@ function validateMatcherCandidate(
     signalAway(signal);
 
 
-  // ==========================================================
-  // SCORE ONLY NEVER ACCEPTED
-  // ==========================================================
-
   if (scoreOnly) {
 
     return {
@@ -1869,10 +1791,6 @@ function validateMatcherCandidate(
     };
   }
 
-
-  // ==========================================================
-  // V27 TEAMS REQUIRED
-  // ==========================================================
 
   if (
     !teamsPresent(
@@ -1902,10 +1820,6 @@ function validateMatcherCandidate(
   }
 
 
-  // ==========================================================
-  // SIGNAL TEAMS REQUIRED
-  // ==========================================================
-
   if (
     !teamsPresent(
       sHome,
@@ -1933,10 +1847,6 @@ function validateMatcherCandidate(
     };
   }
 
-
-  // ==========================================================
-  // STRICT TWO-SIDED VALIDATION
-  // ==========================================================
 
   const teamScore =
     twoSidedTeamScore(
@@ -2005,10 +1915,6 @@ function validateMatcherCandidate(
   }
 
 
-  // ==========================================================
-  // EXACT ID WITH ZERO SCORE
-  // ==========================================================
-
   if (
     method ===
       "EXACT_ID" &&
@@ -2039,21 +1945,9 @@ function validateMatcherCandidate(
   }
 
 
-  // ==========================================================
-  // MATCHER SCORE TOO LOW
-  //
-  // IMPORTANT:
-  //
-  // 0.20 is the minimum positive Matcher result.
-  // It is NOT team validation.
-  //
-  // Team validation has already independently
-  // required BOTH teams >= 0.70.
-  // ==========================================================
-
   if (
     matcherScore <
-    MATCHER_ACCEPT_MIN_SCORE
+    MIN_MATCHER_SCORE
   ) {
 
     return {
@@ -2080,20 +1974,43 @@ function validateMatcherCandidate(
   }
 
 
-  // ==========================================================
-  // ACCEPT
-  //
-  // Team validation is strict.
-  //
-  // CONFIDENT_MATCH is NOT mandatory.
-  //
-  // Matcher score >= 0.20 is only a positive
-  // discovery/association signal.
-  // ==========================================================
-
   const confident =
     classification ===
     REQUIRED_MATCH_CLASSIFICATION;
+
+
+  const strongScore =
+    matcherScore >=
+    STRONG_MATCHER_SCORE;
+
+
+  if (
+    !confident &&
+    !strongScore
+  ) {
+
+    return {
+
+      accepted:
+        false,
+
+      reason:
+        "NOT_CONFIDENT_AND_SCORE_NOT_STRONG",
+
+      classification,
+
+      method,
+
+      matcher_score:
+        matcherScore,
+
+      secure_flag:
+        secureFlag,
+
+      team_scores:
+        teamScore
+    };
+  }
 
 
   return {
@@ -2513,10 +2430,6 @@ function findDirectCloudbetFallback(
     }
 
 
-    // ========================================================
-    // BOTH TEAMS MUST PASS
-    // ========================================================
-
     if (
       scored.home_score <
       DIRECT_CLOUDBET_MIN_SCORE ||
@@ -2744,10 +2657,6 @@ function verifyCloudbetMatch(
   }
 
 
-  // ==========================================================
-  // EXACT ID + STRICT TEAMS
-  // ==========================================================
-
   if (targetId) {
 
     for (
@@ -2809,10 +2718,6 @@ function verifyCloudbetMatch(
     }
   }
 
-
-  // ==========================================================
-  // STRICT TWO-SIDED TEAM VERIFICATION
-  // ==========================================================
 
   let best:
     AnyObj | null = null;
@@ -3075,11 +2980,17 @@ function buildPreparedBet(
         secureMatcher.classification ===
         REQUIRED_MATCH_CLASSIFICATION,
 
+      strong_matcher_score:
+        secureMatcher.matcher_score != null
+          ? secureMatcher.matcher_score >=
+            STRONG_MATCHER_SCORE
+          : false,
+
       matcher_discovery_threshold:
-        MATCHER_DISCOVERY_THRESHOLD,
+        MATCHER_THRESHOLD,
 
       matcher_accept_min_score:
-        MATCHER_ACCEPT_MIN_SCORE,
+        MIN_MATCHER_SCORE,
 
       matcher_score_is_team_validation:
         false,
@@ -3122,7 +3033,7 @@ function buildPreparedBet(
 
 
     action:
-      "NO_BET_V5_1_TEST"
+      "NO_BET_V5_2_TEST"
   };
 }
 
@@ -3225,22 +3136,13 @@ function buildNoMatch(
       team_minimum_score:
         TEAM_MATCH_MIN_SCORE,
 
-      matcher_discovery_threshold:
-        MATCHER_DISCOVERY_THRESHOLD,
-
-      matcher_accept_min_score:
-        MATCHER_ACCEPT_MIN_SCORE,
-
-      matcher_score_is_team_validation:
-        false,
-
       test_mode:
         true
     },
 
 
     action:
-      "NO_BET_V5_1_TEST",
+      "NO_BET_V5_2_TEST",
 
     reason
   };
@@ -3253,8 +3155,14 @@ function buildNoMatch(
 
 function emptyResponse(
   allSignals: AnyObj[],
-  started: number
+  started: number,
+  trackerMs: number
 ): Response {
+
+  const totalMs =
+    Date.now() -
+    started;
+
 
   return json({
 
@@ -3309,10 +3217,10 @@ function emptyResponse(
         true,
 
       matcher_discovery_threshold:
-        MATCHER_DISCOVERY_THRESHOLD,
+        MATCHER_THRESHOLD,
 
       matcher_accept_min_score:
-        MATCHER_ACCEPT_MIN_SCORE,
+        MIN_MATCHER_SCORE,
 
       matcher_score_is_team_validation:
         false,
@@ -3344,6 +3252,9 @@ function emptyResponse(
       two_sided_team_validation:
         true,
 
+      strict_team_validation:
+        true,
+
       reversed_direction_allowed:
         true,
 
@@ -3351,7 +3262,10 @@ function emptyResponse(
         true,
 
       direct_cloudbet_fallback:
-        true
+        true,
+
+      secure_flag_false_hard_rejection:
+        false
     },
 
 
@@ -3388,6 +3302,28 @@ function emptyResponse(
     },
 
 
+    timing: {
+
+      tracker_ms:
+        trackerMs,
+
+      matcher_ms:
+        0,
+
+      cloudbet_ms:
+        0,
+
+      parallel_external_ms:
+        0,
+
+      local_processing_ms:
+        0,
+
+      total_ms:
+        totalMs
+    },
+
+
     stats: {
 
       signals_received:
@@ -3412,8 +3348,7 @@ function emptyResponse(
         0,
 
       processing_ms:
-        Date.now() -
-        started
+        totalMs
     },
 
 
@@ -3425,7 +3360,7 @@ function emptyResponse(
 
 
     message:
-      "V5.1 TEST READ ONLY. No active Hunter entries.",
+      "V5.2 TEST READ ONLY. No active Hunter entries.",
 
     timestamp:
       new Date().toISOString()
@@ -3434,10 +3369,10 @@ function emptyResponse(
 
 
 // ============================================================
-// RUN V5.1
+// RUN V5.2
 // ============================================================
 
-async function runV51(
+async function runV52(
   env: Env,
   request: Request
 ): Promise<Response> {
@@ -3450,11 +3385,20 @@ async function runV51(
   // TRACKER — ONE CALL
   // ==========================================================
 
+  const trackerStarted =
+    Date.now();
+
+
   const trackerData =
     await fetchServiceJSON(
       env.TRACKER,
       "/entries"
     );
+
+
+  const trackerMs =
+    Date.now() -
+    trackerStarted;
 
 
   const allSignals =
@@ -3475,36 +3419,90 @@ async function runV51(
 
     return emptyResponse(
       allSignals,
-      started
+      started,
+      trackerMs
     );
   }
 
 
   // ==========================================================
-  // MATCHER — ONE CALL
+  // MATCHER + CLOUDBET
+  //
+  // IMPORTANT:
+  // THESE TWO CALLS ARE NOW PARALLEL.
   // ==========================================================
 
-  const matcherData =
-    await fetchServiceJSON(
+  const parallelStarted =
+    Date.now();
+
+
+  const matcherStarted =
+    Date.now();
+
+  const cloudbetStarted =
+    Date.now();
+
+
+  const matcherPromise =
+    fetchServiceJSON(
       env.MATCHER,
-      `/match?threshold=${MATCHER_DISCOVERY_THRESHOLD}`
+      `/match?threshold=${MATCHER_THRESHOLD}`
+    ).then(
+      data => ({
+        data,
+        ms:
+          Date.now() -
+          matcherStarted
+      })
     );
+
+
+  const cloudbetPromise =
+    fetchServiceJSON(
+      env.CLOUDBET,
+      "/live"
+    ).then(
+      data => ({
+        data,
+        ms:
+          Date.now() -
+          cloudbetStarted
+      })
+    );
+
+
+  const [
+    matcherResultData,
+    cloudbetResultData
+  ] =
+    await Promise.all([
+      matcherPromise,
+      cloudbetPromise
+    ]);
+
+
+  const parallelExternalMs =
+    Date.now() -
+    parallelStarted;
+
+
+  const matcherData =
+    matcherResultData.data;
+
+  const matcherMs =
+    matcherResultData.ms;
+
+
+  const cloudbetData =
+    cloudbetResultData.data;
+
+  const cloudbetMs =
+    cloudbetResultData.ms;
 
 
   const matcherMatches =
     extractMatcherMatches(
       matcherData
-    );
-
-
-  // ==========================================================
-  // CLOUDBET — ONE CALL
-  // ==========================================================
-
-  const cloudbetData =
-    await fetchServiceJSON(
-      env.CLOUDBET,
-      "/live"
     );
 
 
@@ -3523,6 +3521,10 @@ async function runV51(
   // ==========================================================
   // RESULT ARRAYS
   // ==========================================================
+
+  const localProcessingStarted =
+    Date.now();
+
 
   const preparedBets:
     AnyObj[] = [];
@@ -4160,6 +4162,20 @@ async function runV51(
 
 
   // ==========================================================
+  // LOCAL PROCESSING TIMING
+  // ==========================================================
+
+  const localProcessingMs =
+    Date.now() -
+    localProcessingStarted;
+
+
+  const totalMs =
+    Date.now() -
+    started;
+
+
+  // ==========================================================
   // FINAL RESPONSE
   // ==========================================================
 
@@ -4216,10 +4232,10 @@ async function runV51(
         true,
 
       matcher_discovery_threshold:
-        MATCHER_DISCOVERY_THRESHOLD,
+        MATCHER_THRESHOLD,
 
       matcher_accept_min_score:
-        MATCHER_ACCEPT_MIN_SCORE,
+        MIN_MATCHER_SCORE,
 
       matcher_score_is_team_validation:
         false,
@@ -4321,6 +4337,51 @@ async function runV51(
     },
 
 
+    // ========================================================
+    // V5.2 TIMING
+    // ========================================================
+
+    timing: {
+
+      tracker_ms:
+        trackerMs,
+
+      matcher_ms:
+        matcherMs,
+
+      cloudbet_ms:
+        cloudbetMs,
+
+      parallel_external_ms:
+        parallelExternalMs,
+
+      local_processing_ms:
+        localProcessingMs,
+
+      total_ms:
+        totalMs,
+
+      sequential_estimate_ms:
+        trackerMs +
+        matcherMs +
+        cloudbetMs,
+
+      parallel_saving_estimate_ms:
+        Math.max(
+          0,
+          (
+            trackerMs +
+            matcherMs +
+            cloudbetMs
+          ) -
+          totalMs
+        ),
+
+      matcher_cloudbet_overlap:
+        true
+    },
+
+
     stats: {
 
       signals_received:
@@ -4348,8 +4409,7 @@ async function runV51(
         matcherMatches.length,
 
       processing_ms:
-        Date.now() -
-        started
+        totalMs
     },
 
 
@@ -4374,7 +4434,7 @@ async function runV51(
         signalDiagnostics,
 
 
-      v51_rules: {
+      v52_rules: {
 
         mode:
           "TEST",
@@ -4383,13 +4443,16 @@ async function runV51(
           "PRIMARY MATCH SOURCE",
 
         matcher_discovery_threshold:
-          MATCHER_DISCOVERY_THRESHOLD,
+          MATCHER_THRESHOLD,
 
         matcher_accept_min_score:
-          MATCHER_ACCEPT_MIN_SCORE,
+          MIN_MATCHER_SCORE,
 
         matcher_confident:
           "NOT REQUIRED",
+
+        matcher_score:
+          "DISCOVERY / ASSOCIATION ONLY",
 
         matcher_score_is_team_validation:
           false,
@@ -4442,8 +4505,11 @@ async function runV51(
         cloudbet_fetch:
           "ONE /live CALL PER EXECUTION",
 
-        matcher_score:
-          "DISCOVERY / ASSOCIATION ONLY",
+        matcher_cloudbet_execution:
+          "PARALLEL",
+
+        timing:
+          "TRACKER + MATCHER + CLOUDBET TIMED",
 
         betting:
           "DISABLED"
@@ -4465,6 +4531,9 @@ async function runV51(
       cloudbet_live_calls:
         1,
 
+      matcher_cloudbet_parallel:
+        true,
+
       cloudbet_reused_for_all_signals:
         true,
 
@@ -4484,7 +4553,7 @@ async function runV51(
 
 
     message:
-      "V5.1 TEST READ ONLY. Matcher discovery is 0.20, but Matcher score alone can never validate teams. Both signal teams must independently match V27 teams at >= 0.70, followed by independent Cloudbet strict verification. Weak matches such as 0.40/0.29 are rejected. Betting remains DISABLED.",
+      "V5.2 TEST READ ONLY. Matcher and Cloudbet /live now execute in parallel after the single Tracker call. Exact timing is reported for Tracker, Matcher, Cloudbet, parallel external work, local processing and total execution. Security rules remain unchanged.",
 
 
     timestamp:
@@ -4536,13 +4605,10 @@ function health(): Response {
         true,
 
       matcher_discovery_threshold:
-        MATCHER_DISCOVERY_THRESHOLD,
+        MATCHER_THRESHOLD,
 
       matcher_accept_min_score:
-        MATCHER_ACCEPT_MIN_SCORE,
-
-      matcher_score_is_team_validation:
-        false,
+        MIN_MATCHER_SCORE,
 
       matcher_team_minimum:
         TEAM_MATCH_MIN_SCORE,
@@ -4557,6 +4623,9 @@ function health(): Response {
         TOKEN_MATCH_MIN_SCORE,
 
       confident_match_required:
+        false,
+
+      matcher_score_is_team_validation:
         false,
 
       secure_flag_false_hard_rejection:
@@ -4581,22 +4650,28 @@ function health(): Response {
         true,
 
       cloudbet_second_verification:
-        true
+        true,
+
+      direct_cloudbet_fallback:
+        true,
+
+      strong_matcher_score:
+        STRONG_MATCHER_SCORE
     },
 
 
-    v51: {
+    v52: {
 
       mode:
         "TEST",
 
-      matcher_discovery_threshold:
-        MATCHER_DISCOVERY_THRESHOLD,
+      matcher_threshold:
+        MATCHER_THRESHOLD,
 
       matcher_accept_min_score:
-        MATCHER_ACCEPT_MIN_SCORE,
+        MIN_MATCHER_SCORE,
 
-      matcher_confident_required:
+      confident_match_required:
         false,
 
       matcher_score_is_team_validation:
@@ -4660,12 +4735,20 @@ function health(): Response {
       cloudbet_live_calls:
         1,
 
+      matcher_cloudbet_parallel:
+        true,
+
       cloudbet_reused_for_all_signals:
         true,
 
       direct_fallback_uses_existing_live_data:
         true
     },
+
+
+    timing:
+
+      "V5.2 reports tracker_ms, matcher_ms, cloudbet_ms, parallel_external_ms, local_processing_ms and total_ms.",
 
 
     endpoints: {
@@ -4689,14 +4772,11 @@ function health(): Response {
       matcher:
         "PRIMARY MATCH SOURCE",
 
-      matcher_discovery:
-        `DISCOVERY SCORE >= ${MATCHER_DISCOVERY_THRESHOLD}`,
-
-      matcher_accept:
-        `POSITIVE MATCHER SCORE >= ${MATCHER_ACCEPT_MIN_SCORE}`,
-
       matcher_confident:
-        "NOT REQUIRED IN V5.1 TEST",
+        "NOT REQUIRED IN V5.2 TEST",
+
+      matcher_score:
+        `DISCOVERY SCORE >= ${STRONG_MATCHER_SCORE}`,
 
       matcher_score_alone:
         "NEVER SUFFICIENT",
@@ -4720,7 +4800,7 @@ function health(): Response {
         `BOTH TEAMS >= ${TEAM_MATCH_MIN_SCORE}`,
 
       weak_team_match:
-        "TEAM SCORES BELOW 0.70 ARE REJECTED",
+        "0.20-0.69 IS REJECTED",
 
       direct_fallback:
         "If Matcher fails, search Cloudbet /live directly",
@@ -4740,13 +4820,19 @@ function health(): Response {
       cloudbet_fetch:
         "Cloudbet /live is called once per worker execution",
 
+      matcher_cloudbet:
+        "RUN IN PARALLEL",
+
+      timing:
+        "ENABLED",
+
       betting:
         "DISABLED"
     },
 
 
     message:
-      "V5.1 TEST worker is healthy. Matcher score is discovery only; strict two-sided team validation and independent Cloudbet verification are active. Betting remains disabled.",
+      "V5.2 TEST worker is healthy. Matcher and Cloudbet now run in parallel and execution timing is measured.",
 
 
     timestamp:
@@ -4806,7 +4892,7 @@ export default {
         path === "/bet"
       ) {
 
-        return runV51(
+        return runV52(
           env,
           request
         );
@@ -4822,7 +4908,7 @@ export default {
         path === "/diagnostics"
       ) {
 
-        return runV51(
+        return runV52(
           env,
           request
         );
