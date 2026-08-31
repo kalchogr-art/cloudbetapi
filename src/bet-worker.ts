@@ -1,36 +1,41 @@
 // ============================================================
-// CLOUDBET BET WORKER V4.4
+// CLOUDBET BET WORKER V4.5
 // READ ONLY — SECURE SIGNAL -> MATCHER -> CLOUDBET
 //
-// V4.4 MATCHER ACCEPTANCE FIX
+// V4.5 TEAM MATCHING FIX
 //
-// CHANGES FROM V4.3:
+// CHANGES FROM V4.4:
 //
-// 1. SECURE_MATCH=false NO LONGER AUTOMATICALLY REJECTS
-//    A STRONG VALID MATCHER CANDIDATE.
+// 1. SECURE_MATCH=false НЕ Е автоматичен отказ.
 //
-// 2. CONFIDENT_MATCH IS STILL PREFERRED.
-//    If classification is missing but matcher score is strong,
-//    the candidate can be accepted.
+// 2. CONFIDENT_MATCH се приема.
 //
-// 3. SCORE_ONLY_MATCH IS STILL ALWAYS REJECTED.
+// 3. Силен положителен matcher score >= 0.45 се приема,
+//    ако двустранната проверка на отборите е валидна.
 //
-// 4. EXACT_ID ALONE IS STILL NOT ENOUGH.
+// 4. SCORE_ONLY_MATCH остава винаги BLOCKED.
 //
-// 5. EXACT_ID WITH POSITIVE MATCHER SCORE IS ALLOWED.
+// 5. EXACT_ID с matcher score 0 остава BLOCKED.
 //
-// 6. SIGNAL <-> V27 TEAM VALIDATION now accepts BOTH:
-//       HOME -> HOME / AWAY -> AWAY
-//    OR
-//       HOME -> AWAY / AWAY -> HOME
+// 6. EXACT_ID с положителен matcher score е разрешен.
 //
-// 7. CLOUDBET IS STILL VERIFIED INDEPENDENTLY.
+// 7. SIGNAL <-> V27 TEAM VALIDATION:
+//      - normal direction
+//      - reversed direction
+//      - exact normalized names
+//      - token containment
+//      - token similarity
+//      - abbreviation / alias support
 //
-// 8. CLOUDBET /live IS CALLED ONLY ONCE.
+// 8. TWO-SIDED TEAM VALIDATION остава задължителна.
 //
-// 9. TWO-SIDED TEAM VALIDATION REMAINS REQUIRED.
+// 9. НЕ се приема само един отбор.
 //
-// 10. DETAILED REJECTION REASONS ARE RETURNED.
+// 10. CLOUDBET /live се извиква САМО ВЕДНЪЖ.
+//
+// 11. Cloudbet се проверява независимо след Matcher.
+//
+// 12. Добавена е подробна диагностика за team matching.
 //
 // IMPORTANT:
 // - READ ONLY
@@ -53,7 +58,7 @@ type AnyObj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V4.4";
+const VERSION = "V4.5";
 
 const MODE = "READ_ONLY";
 
@@ -79,14 +84,25 @@ const TARGET_LINE = 0.5;
 
 
 // ============================================================
-// V4.4 ACCEPTANCE SETTINGS
+// V4.5 MATCH ACCEPTANCE
 // ============================================================
 
-// Strong matcher score can compensate for missing secure flag.
 const STRONG_MATCHER_SCORE = 0.45;
 
-// Score below this is never enough by itself.
 const MIN_MATCHER_SCORE = 0.45;
+
+
+// ============================================================
+// V4.5 TEAM MATCH SETTINGS
+// ============================================================
+
+const TEAM_EXACT_SCORE = 1.0;
+
+const TEAM_TOKEN_SCORE = 0.85;
+
+const TEAM_PARTIAL_SCORE = 0.75;
+
+const TEAM_MIN_ACCEPT_SCORE = 0.75;
 
 
 // ============================================================
@@ -106,7 +122,6 @@ function json(
     ),
     {
       status,
-
       headers: {
         "content-type":
           "application/json; charset=UTF-8",
@@ -348,6 +363,15 @@ function extractHome(
 
 
   if (
+    typeof match?.home_team ===
+    "string"
+  ) {
+
+    return match.home_team.trim();
+  }
+
+
+  if (
     typeof match?.home?.name ===
     "string"
   ) {
@@ -356,10 +380,20 @@ function extractHome(
   }
 
 
+  if (
+    typeof match?.teams?.home?.name ===
+    "string"
+  ) {
+
+    return match.teams.home.name.trim();
+  }
+
+
   return (
     splitMatchName(
       match?.match ??
       match?.name ??
+      match?.event ??
       ""
     ).home ?? ""
   );
@@ -402,6 +436,15 @@ function extractAway(
 
 
   if (
+    typeof match?.away_team ===
+    "string"
+  ) {
+
+    return match.away_team.trim();
+  }
+
+
+  if (
     typeof match?.away?.name ===
     "string"
   ) {
@@ -410,10 +453,20 @@ function extractAway(
   }
 
 
+  if (
+    typeof match?.teams?.away?.name ===
+    "string"
+  ) {
+
+    return match.teams.away.name.trim();
+  }
+
+
   return (
     splitMatchName(
       match?.match ??
       match?.name ??
+      match?.event ??
       ""
     ).away ?? ""
   );
@@ -431,7 +484,8 @@ function displayMatch(
   const direct =
     safeString(
       match?.match ??
-      match?.name
+      match?.name ??
+      match?.event
     );
 
 
@@ -464,13 +518,15 @@ function extractMatchId(
     match?.id ??
     match?.match_id ??
     match?.matchId ??
+    match?.event_id ??
+    match?.eventId ??
     match?.key
   );
 }
 
 
 // ============================================================
-// TEAM NORMALIZATION
+// GENERIC TEAM WORDS
 // ============================================================
 
 const GENERIC_WORDS =
@@ -501,9 +557,24 @@ const GENERIC_WORDS =
     "spa",
     "srl",
     "football",
-    "soccer"
+    "soccer",
+    "team",
+    "women",
+    "woman",
+    "men",
+    "u18",
+    "u19",
+    "u20",
+    "u21",
+    "u23",
+    "reserves",
+    "reserve"
   ]);
 
+
+// ============================================================
+// TEAM ALIASES
+// ============================================================
 
 const TEAM_ALIASES:
   Record<string, string> = {
@@ -565,6 +636,9 @@ const TEAM_ALIASES:
   "bayern munchen":
     "bayern munich",
 
+  "bayern munchen fc":
+    "bayern munich",
+
   "utd":
     "united",
 
@@ -575,7 +649,49 @@ const TEAM_ALIASES:
     "deportivo",
 
   "depor":
-    "deportivo"
+    "deportivo",
+
+  "sparta":
+    "sparta prague",
+
+  "sparta praha":
+    "sparta prague",
+
+  "cska moscow":
+    "cska moskva",
+
+  "cska sofia":
+    "cska",
+
+  "lokomotiv moskva":
+    "lokomotiv moscow",
+
+  "lokomotiv sofia":
+    "lokomotiv",
+
+  "rapid wien":
+    "rapid vienna",
+
+  "dinamo zagreb":
+    "dinamo",
+
+  "fc porto":
+    "porto",
+
+  "benfica lisbon":
+    "benfica",
+
+  "sport lisboa e benfica":
+    "benfica",
+
+  "real madrid cf":
+    "real madrid",
+
+  "barcelona fc":
+    "barcelona",
+
+  "barca":
+    "barcelona"
 };
 
 
@@ -678,7 +794,655 @@ function normalizeTeam(
 
 
 // ============================================================
-// TEAM VALIDATION
+// TEAM TOKENS
+// ============================================================
+
+function teamTokens(
+  value: any
+): string[] {
+
+  const normalized =
+    normalizeTeam(value);
+
+
+  if (!normalized) {
+    return [];
+  }
+
+
+  return normalized
+    .split(" ")
+    .filter(Boolean);
+}
+
+
+// ============================================================
+// JACCARD TOKEN SCORE
+// ============================================================
+
+function tokenSimilarity(
+  a: any,
+  b: any
+): number {
+
+  const A =
+    new Set(
+      teamTokens(a)
+    );
+
+
+  const B =
+    new Set(
+      teamTokens(b)
+    );
+
+
+  if (
+    A.size === 0 ||
+    B.size === 0
+  ) {
+
+    return 0;
+  }
+
+
+  let intersection =
+    0;
+
+
+  for (
+    const token
+    of A
+  ) {
+
+    if (
+      B.has(token)
+    ) {
+
+      intersection++;
+    }
+  }
+
+
+  const union =
+    new Set([
+      ...A,
+      ...B
+    ]).size;
+
+
+  if (!union) {
+    return 0;
+  }
+
+
+  return (
+    intersection /
+    union
+  );
+}
+
+
+// ============================================================
+// CHARACTER SIMILARITY
+// ============================================================
+
+function characterSimilarity(
+  a: any,
+  b: any
+): number {
+
+  const A =
+    normalizeTeam(a)
+      .replace(/\s/g, "");
+
+
+  const B =
+    normalizeTeam(b)
+      .replace(/\s/g, "");
+
+
+  if (
+    !A ||
+    !B
+  ) {
+
+    return 0;
+  }
+
+
+  if (A === B) {
+    return 1;
+  }
+
+
+  const maxLength =
+    Math.max(
+      A.length,
+      B.length
+    );
+
+
+  const distance =
+    levenshtein(
+      A,
+      B
+    );
+
+
+  if (!maxLength) {
+    return 0;
+  }
+
+
+  return (
+    1 -
+    distance /
+    maxLength
+  );
+}
+
+
+// ============================================================
+// LEVENSHTEIN
+// ============================================================
+
+function levenshtein(
+  a: string,
+  b: string
+): number {
+
+  if (a === b) {
+    return 0;
+  }
+
+
+  if (!a.length) {
+    return b.length;
+  }
+
+
+  if (!b.length) {
+    return a.length;
+  }
+
+
+  let previous =
+    new Array(
+      b.length + 1
+    );
+
+
+  let current =
+    new Array(
+      b.length + 1
+    );
+
+
+  for (
+    let j = 0;
+    j <= b.length;
+    j++
+  ) {
+
+    previous[j] = j;
+  }
+
+
+  for (
+    let i = 1;
+    i <= a.length;
+    i++
+  ) {
+
+    current[0] = i;
+
+
+    for (
+      let j = 1;
+      j <= b.length;
+      j++
+    ) {
+
+      const cost =
+        a[i - 1] ===
+        b[j - 1]
+          ? 0
+          : 1;
+
+
+      current[j] =
+        Math.min(
+          current[j - 1] + 1,
+          previous[j] + 1,
+          previous[j - 1] + cost
+        );
+    }
+
+
+    const temp =
+      previous;
+
+
+    previous =
+      current;
+
+
+    current =
+      temp;
+  }
+
+
+  return previous[b.length];
+}
+
+
+// ============================================================
+// ONE TEAM MATCH
+//
+// IMPORTANT:
+// This is NOT score-only matching.
+//
+// We still require the actual team identity to be compatible.
+// ============================================================
+
+function compareTeams(
+  a: any,
+  b: any
+): AnyObj {
+
+  const rawA =
+    safeString(a);
+
+
+  const rawB =
+    safeString(b);
+
+
+  const A =
+    normalizeTeam(rawA);
+
+
+  const B =
+    normalizeTeam(rawB);
+
+
+  if (
+    !A ||
+    !B
+  ) {
+
+    return {
+
+      matched:
+        false,
+
+      score:
+        0,
+
+      method:
+        "EMPTY_TEAM",
+
+      a:
+        rawA,
+
+      b:
+        rawB
+    };
+  }
+
+
+  // ----------------------------------------------------------
+  // EXACT NORMALIZED
+  // ----------------------------------------------------------
+
+  if (A === B) {
+
+    return {
+
+      matched:
+        true,
+
+      score:
+        TEAM_EXACT_SCORE,
+
+      method:
+        "EXACT_NORMALIZED",
+
+      a:
+        rawA,
+
+      b:
+        rawB,
+
+      normalized_a:
+        A,
+
+      normalized_b:
+        B
+    };
+  }
+
+
+  // ----------------------------------------------------------
+  // TOKEN SET
+  // ----------------------------------------------------------
+
+  const tokenScore =
+    tokenSimilarity(
+      A,
+      B
+    );
+
+
+  if (
+    tokenScore >=
+    TEAM_TOKEN_SCORE
+  ) {
+
+    return {
+
+      matched:
+        true,
+
+      score:
+        tokenScore,
+
+      method:
+        "TOKEN_SIMILARITY",
+
+      a:
+        rawA,
+
+      b:
+        rawB,
+
+      normalized_a:
+        A,
+
+      normalized_b:
+        B
+    };
+  }
+
+
+  // ----------------------------------------------------------
+  // CONTAINMENT
+  // ----------------------------------------------------------
+
+  const compactA =
+    A.replace(
+      /\s/g,
+      ""
+    );
+
+
+  const compactB =
+    B.replace(
+      /\s/g,
+      ""
+    );
+
+
+  if (
+    compactA.length >= 4 &&
+    compactB.length >= 4 &&
+    (
+      compactA.includes(compactB) ||
+      compactB.includes(compactA)
+    )
+  ) {
+
+    return {
+
+      matched:
+        true,
+
+      score:
+        TEAM_PARTIAL_SCORE,
+
+      method:
+        "TOKEN_CONTAINMENT",
+
+      a:
+        rawA,
+
+      b:
+        rawB,
+
+      normalized_a:
+        A,
+
+      normalized_b:
+        B
+    };
+  }
+
+
+  // ----------------------------------------------------------
+  // CHARACTER SIMILARITY
+  // ----------------------------------------------------------
+
+  const charScore =
+    characterSimilarity(
+      A,
+      B
+    );
+
+
+  if (
+    charScore >=
+    0.90
+  ) {
+
+    return {
+
+      matched:
+        true,
+
+      score:
+        charScore,
+
+      method:
+        "CHARACTER_SIMILARITY",
+
+      a:
+        rawA,
+
+      b:
+        rawB,
+
+      normalized_a:
+        A,
+
+      normalized_b:
+        B
+    };
+  }
+
+
+  return {
+
+    matched:
+      false,
+
+    score:
+      Math.max(
+        tokenScore,
+        charScore
+      ),
+
+    method:
+      "TEAM_MISMATCH",
+
+    a:
+      rawA,
+
+    b:
+      rawB,
+
+    normalized_a:
+      A,
+
+    normalized_b:
+      B
+  };
+}
+
+
+// ============================================================
+// TWO-SIDED TEAM MATCH
+//
+// NORMAL:
+//   signal home -> candidate home
+//   signal away -> candidate away
+//
+// REVERSED:
+//   signal home -> candidate away
+//   signal away -> candidate home
+//
+// BOTH SIDES MUST MATCH.
+// ============================================================
+
+function teamsMatchEitherDirection(
+  homeA: any,
+  awayA: any,
+  homeB: any,
+  awayB: any
+): AnyObj {
+
+  const normalHome =
+    compareTeams(
+      homeA,
+      homeB
+    );
+
+
+  const normalAway =
+    compareTeams(
+      awayA,
+      awayB
+    );
+
+
+  const normal =
+    normalHome.matched &&
+    normalAway.matched;
+
+
+  if (normal) {
+
+    return {
+
+      matched:
+        true,
+
+      direction:
+        "NORMAL",
+
+      score:
+        (
+          normalHome.score +
+          normalAway.score
+        ) / 2,
+
+      home:
+        normalHome,
+
+      away:
+        normalAway
+    };
+  }
+
+
+  const reversedHome =
+    compareTeams(
+      homeA,
+      awayB
+    );
+
+
+  const reversedAway =
+    compareTeams(
+      awayA,
+      homeB
+    );
+
+
+  const reversed =
+    reversedHome.matched &&
+    reversedAway.matched;
+
+
+  if (reversed) {
+
+    return {
+
+      matched:
+        true,
+
+      direction:
+        "REVERSED",
+
+      score:
+        (
+          reversedHome.score +
+          reversedAway.score
+        ) / 2,
+
+      home:
+        reversedHome,
+
+      away:
+        reversedAway
+    };
+  }
+
+
+  return {
+
+    matched:
+      false,
+
+    direction:
+      null,
+
+    score:
+      Math.max(
+        (
+          normalHome.score +
+          normalAway.score
+        ) / 2,
+
+        (
+          reversedHome.score +
+          reversedAway.score
+        ) / 2
+      ),
+
+    normal: {
+
+      home:
+        normalHome,
+
+      away:
+        normalAway
+    },
+
+    reversed: {
+
+      home:
+        reversedHome,
+
+      away:
+        reversedAway
+    }
+  };
+}
+
+
+// ============================================================
+// TEAMS PRESENT
 // ============================================================
 
 function teamsPresent(
@@ -690,76 +1454,6 @@ function teamsPresent(
     normalizeTeam(home).length > 0 &&
     normalizeTeam(away).length > 0
   );
-}
-
-
-function sameNormalizedTeam(
-  a: any,
-  b: any
-): boolean {
-
-  const A =
-    normalizeTeam(a);
-
-
-  const B =
-    normalizeTeam(b);
-
-
-  if (!A || !B) {
-    return false;
-  }
-
-
-  return A === B;
-}
-
-
-// ============================================================
-// TWO-SIDED TEAM MATCH
-//
-// V4.4:
-// NORMAL direction OR REVERSED direction.
-//
-// This fixes cases where one source presents the fixture
-// in the opposite home/away direction.
-// ============================================================
-
-function teamsMatchEitherDirection(
-  homeA: any,
-  awayA: any,
-  homeB: any,
-  awayB: any
-): boolean {
-
-  const normal =
-    sameNormalizedTeam(
-      homeA,
-      homeB
-    ) &&
-    sameNormalizedTeam(
-      awayA,
-      awayB
-    );
-
-
-  if (normal) {
-    return true;
-  }
-
-
-  const reversed =
-    sameNormalizedTeam(
-      homeA,
-      awayB
-    ) &&
-    sameNormalizedTeam(
-      awayA,
-      homeB
-    );
-
-
-  return reversed;
 }
 
 
@@ -945,6 +1639,16 @@ function extractMatcherMatches(
   }
 
 
+  if (
+    Array.isArray(
+      data?.data
+    )
+  ) {
+
+    return data.data;
+  }
+
+
   return [];
 }
 
@@ -963,14 +1667,18 @@ function getMatcherScore(
     {};
 
 
+  const rawScore =
+    scoring?.total ??
+    scoring?.score ??
+    item?.matcher_score ??
+    item?.match_score ??
+    item?.score ??
+    0;
+
+
   const score =
     Number(
-      scoring?.total ??
-      scoring?.score ??
-      item?.matcher_score ??
-      item?.match_score ??
-      item?.score ??
-      0
+      rawScore
     );
 
 
@@ -1043,7 +1751,7 @@ function getScoreOnlyFlag(
 
 
 // ============================================================
-// EXTRACT V27 FROM MATCHER CANDIDATE
+// V27 EXTRACTION
 // ============================================================
 
 function extractV27FromMatcher(
@@ -1053,50 +1761,69 @@ function extractV27FromMatcher(
   return (
     item?.v27 ??
     item?.source ??
+    item?.v27_match ??
+    item?.source_match ??
     item
   );
 }
 
 
 // ============================================================
-// EXTRACT CLOUDBET FROM MATCHER CANDIDATE
+// CLOUDBET EXTRACTION
 // ============================================================
 
 function extractCloudbetFromMatcher(
   item: AnyObj
 ): AnyObj | null {
 
-  return (
-    item?.cloudbet ??
-    item?.matched ??
-    item?.target ??
-    null
-  );
+  const candidates = [
+    item?.cloudbet,
+    item?.cloudbet_match,
+    item?.cloudbet_event,
+    item?.matched_cloudbet,
+    item?.target,
+    item?.matched
+  ];
+
+
+  for (
+    const candidate
+    of candidates
+  ) {
+
+    if (
+      candidate &&
+      typeof candidate ===
+      "object"
+    ) {
+
+      const home =
+        extractHome(candidate);
+
+
+      const away =
+        extractAway(candidate);
+
+
+      if (
+        teamsPresent(
+          home,
+          away
+        )
+      ) {
+
+        return candidate;
+      }
+    }
+  }
+
+
+  return null;
 }
 
 
 // ============================================================
 // VALIDATE MATCHER CANDIDATE
-//
-// V4.4:
-//
-// HARD REJECTIONS:
-// - score_only
-// - no teams
-// - no Cloudbet target
-// - signal teams incompatible
-// - weak matcher score
-//
-// SOFT REJECTION:
-// - secure_match=false
-// - classification missing
-//
-// ACCEPT:
-// - CONFIDENT_MATCH + valid teams
-// - OR strong positive matcher score + valid teams
-//
-// EXACT_ID:
-// - requires positive matcher score
 // ============================================================
 
 function validateMatcherCandidate(
@@ -1161,24 +1888,34 @@ function validateMatcherCandidate(
 
 
   // ----------------------------------------------------------
-  // SCORE ONLY
+  // SCORE ONLY — HARD REJECT
   // ----------------------------------------------------------
 
   if (scoreOnly) {
 
     return {
-      accepted: false,
-      reason: "SCORE_ONLY_MATCH_REJECTED",
+
+      accepted:
+        false,
+
+      reason:
+        "SCORE_ONLY_MATCH_REJECTED",
+
       classification,
+
       method,
-      matcher_score: matcherScore,
-      secure_flag: secureFlag
+
+      matcher_score:
+        matcherScore,
+
+      secure_flag:
+        secureFlag
     };
   }
 
 
   // ----------------------------------------------------------
-  // TEAMS
+  // V27 TEAMS
   // ----------------------------------------------------------
 
   if (
@@ -1189,12 +1926,22 @@ function validateMatcherCandidate(
   ) {
 
     return {
-      accepted: false,
-      reason: "V27_TEAMS_EMPTY",
+
+      accepted:
+        false,
+
+      reason:
+        "V27_TEAMS_EMPTY",
+
       classification,
+
       method,
-      matcher_score: matcherScore,
-      secure_flag: secureFlag
+
+      matcher_score:
+        matcherScore,
+
+      secure_flag:
+        secureFlag
     };
   }
 
@@ -1212,26 +1959,40 @@ function validateMatcherCandidate(
   ) {
 
     return {
-      accepted: false,
-      reason: "MATCHER_CLOUDBET_TARGET_EMPTY",
+
+      accepted:
+        false,
+
+      reason:
+        "MATCHER_CLOUDBET_TARGET_EMPTY",
+
       classification,
+
       method,
-      matcher_score: matcherScore,
-      secure_flag: secureFlag
+
+      matcher_score:
+        matcherScore,
+
+      secure_flag:
+        secureFlag
     };
   }
 
 
   // ----------------------------------------------------------
-  // SIGNAL TEAM VALIDATION
+  // SIGNAL <-> V27 TWO-SIDED VALIDATION
   // ----------------------------------------------------------
+
+  let teamValidation:
+    AnyObj | null = null;
+
 
   if (
     sHome &&
     sAway
   ) {
 
-    const compatible =
+    teamValidation =
       teamsMatchEitherDirection(
         sHome,
         sAway,
@@ -1240,32 +2001,55 @@ function validateMatcherCandidate(
       );
 
 
-    if (!compatible) {
+    if (
+      !teamValidation.matched
+    ) {
 
       return {
-        accepted: false,
-        reason: "SIGNAL_TEAMS_MISMATCH",
+
+        accepted:
+          false,
+
+        reason:
+          "SIGNAL_TEAMS_MISMATCH",
+
         classification,
+
         method,
-        matcher_score: matcherScore,
-        secure_flag: secureFlag,
+
+        matcher_score:
+          matcherScore,
+
+        secure_flag:
+          secureFlag,
 
         signal: {
-          home: sHome,
-          away: sAway
+
+          home:
+            sHome,
+
+          away:
+            sAway
         },
 
         v27: {
-          home: vHome,
-          away: vAway
-        }
+
+          home:
+            vHome,
+
+          away:
+            vAway
+        },
+
+        team_validation:
+          teamValidation
       };
     }
   }
 
 
   // ----------------------------------------------------------
-  // EXACT ID SECURITY
+  // EXACT ID
   // ----------------------------------------------------------
 
   if (
@@ -1275,18 +2059,28 @@ function validateMatcherCandidate(
   ) {
 
     return {
-      accepted: false,
-      reason: "EXACT_ID_WITH_ZERO_SCORE_REJECTED",
+
+      accepted:
+        false,
+
+      reason:
+        "EXACT_ID_WITH_ZERO_SCORE_REJECTED",
+
       classification,
+
       method,
-      matcher_score: matcherScore,
-      secure_flag: secureFlag
+
+      matcher_score:
+        matcherScore,
+
+      secure_flag:
+        secureFlag
     };
   }
 
 
   // ----------------------------------------------------------
-  // SCORE
+  // MATCHER SCORE
   // ----------------------------------------------------------
 
   if (
@@ -1295,12 +2089,25 @@ function validateMatcherCandidate(
   ) {
 
     return {
-      accepted: false,
-      reason: "MATCHER_SCORE_TOO_LOW",
+
+      accepted:
+        false,
+
+      reason:
+        "MATCHER_SCORE_TOO_LOW",
+
       classification,
+
       method,
-      matcher_score: matcherScore,
-      secure_flag: secureFlag
+
+      matcher_score:
+        matcherScore,
+
+      secure_flag:
+        secureFlag,
+
+      team_validation:
+        teamValidation
     };
   }
 
@@ -1325,12 +2132,25 @@ function validateMatcherCandidate(
   ) {
 
     return {
-      accepted: false,
-      reason: "NOT_CONFIDENT_AND_SCORE_NOT_STRONG",
+
+      accepted:
+        false,
+
+      reason:
+        "NOT_CONFIDENT_AND_SCORE_NOT_STRONG",
+
       classification,
+
       method,
-      matcher_score: matcherScore,
-      secure_flag: secureFlag
+
+      matcher_score:
+        matcherScore,
+
+      secure_flag:
+        secureFlag,
+
+      team_validation:
+        teamValidation
     };
   }
 
@@ -1338,8 +2158,13 @@ function validateMatcherCandidate(
   // ----------------------------------------------------------
   // ACCEPT
   //
-  // secure_match=false is no longer a hard rejection.
-  // Team validation + matcher score + non-score-only remain.
+  // secure_match=false is NOT a hard rejection.
+  //
+  // BUT:
+  // - score_only is blocked
+  // - teams must match both sides
+  // - matcher score must be >= 0.45
+  // - Cloudbet target must exist
   // ----------------------------------------------------------
 
   return {
@@ -1368,6 +2193,9 @@ function validateMatcherCandidate(
 
     score_only_match:
       false,
+
+    team_validation:
+      teamValidation,
 
     v27: {
 
@@ -1405,7 +2233,7 @@ function validateMatcherCandidate(
 
 
 // ============================================================
-// FIND BEST MATCHER CANDIDATE FOR SIGNAL
+// FIND BEST MATCHER CANDIDATE
 // ============================================================
 
 function findBestMatcherCandidate(
@@ -1421,10 +2249,6 @@ function findBestMatcherCandidate(
 
   const rejectionReasons:
     Record<string, number> = {};
-
-
-  const rejectedCandidates:
-    AnyObj[] = [];
 
 
   let best:
@@ -1472,17 +2296,6 @@ function findBestMatcherCandidate(
         rejectionReasons[reason] ??
         0
       ) + 1;
-
-
-    rejectedCandidates.push({
-      reason,
-      matcher_score:
-        result.matcher_score,
-      classification:
-        result.classification,
-      method:
-        result.method
-    });
   }
 
 
@@ -1565,6 +2378,16 @@ function extractCloudbetMatches(
   }
 
 
+  if (
+    Array.isArray(
+      data?.data
+    )
+  ) {
+
+    return data.data;
+  }
+
+
   return [];
 }
 
@@ -1593,6 +2416,15 @@ function isCloudbetLive(
 
 
   if (
+    status ===
+    "LIVE"
+  ) {
+
+    return true;
+  }
+
+
+  if (
     match?.live === true
   ) {
 
@@ -1606,6 +2438,9 @@ function isCloudbetLive(
 
 // ============================================================
 // CLOUDBET SECURE VERIFICATION
+//
+// Cloudbet is checked independently.
+// No additional network request.
 // ============================================================
 
 function verifyCloudbetMatch(
@@ -1631,20 +2466,20 @@ function verifyCloudbetMatch(
 
 
   const targetId =
-    safeString(
-      target?.id
+    extractMatchId(
+      target
     );
 
 
   const targetHome =
     normalizeTeam(
-      target?.home
+      extractHome(target)
     );
 
 
   const targetAway =
     normalizeTeam(
-      target?.away
+      extractAway(target)
     );
 
 
@@ -1664,10 +2499,9 @@ function verifyCloudbetMatch(
   }
 
 
-  // ==========================================================
-  // FIRST:
-  // EXACT CLOUDBET ID + TWO-SIDED TEAMS
-  // ==========================================================
+  // ----------------------------------------------------------
+  // EXACT CLOUDBET ID + TWO-SIDED TEAM VALIDATION
+  // ----------------------------------------------------------
 
   if (targetId) {
 
@@ -1686,24 +2520,24 @@ function verifyCloudbetMatch(
       ) {
 
         const cbHome =
-          normalizeTeam(
-            extractHome(cb)
-          );
+          extractHome(cb);
 
 
         const cbAway =
-          normalizeTeam(
-            extractAway(cb)
-          );
+          extractAway(cb);
 
 
-        if (
+        const validation =
           teamsMatchEitherDirection(
             targetHome,
             targetAway,
             cbHome,
             cbAway
-          )
+          );
+
+
+        if (
+          validation.matched
         ) {
 
           return {
@@ -1712,7 +2546,16 @@ function verifyCloudbetMatch(
               true,
 
             method:
-              "CLOUDBET_ID_AND_TEAMS",
+              "CLOUDBET_ID_AND_TWO_SIDED_TEAMS",
+
+            direction:
+              validation.direction,
+
+            team_score:
+              validation.score,
+
+            team_validation:
+              validation,
 
             match:
               cb
@@ -1723,10 +2566,9 @@ function verifyCloudbetMatch(
   }
 
 
-  // ==========================================================
-  // SECOND:
-  // EXACT TWO-SIDED TEAMS
-  // ==========================================================
+  // ----------------------------------------------------------
+  // EXACT TWO-SIDED TEAM VERIFICATION
+  // ----------------------------------------------------------
 
   for (
     const cb
@@ -1734,24 +2576,24 @@ function verifyCloudbetMatch(
   ) {
 
     const cbHome =
-      normalizeTeam(
-        extractHome(cb)
-      );
+      extractHome(cb);
 
 
     const cbAway =
-      normalizeTeam(
-        extractAway(cb)
-      );
+      extractAway(cb);
 
 
-    if (
+    const validation =
       teamsMatchEitherDirection(
         targetHome,
         targetAway,
         cbHome,
         cbAway
-      )
+      );
+
+
+    if (
+      validation.matched
     ) {
 
       return {
@@ -1761,6 +2603,15 @@ function verifyCloudbetMatch(
 
         method:
           "CLOUDBET_TWO_SIDED_TEAMS",
+
+        direction:
+          validation.direction,
+
+        team_score:
+          validation.score,
+
+        team_validation:
+          validation,
 
         match:
           cb
@@ -1775,7 +2626,19 @@ function verifyCloudbetMatch(
       false,
 
     reason:
-      "CLOUDBET_MATCH_NOT_CONFIRMED"
+      "CLOUDBET_MATCH_NOT_CONFIRMED",
+
+    target: {
+
+      id:
+        targetId,
+
+      home:
+        targetHome,
+
+      away:
+        targetAway
+    }
   };
 }
 
@@ -1792,10 +2655,6 @@ function buildPreparedBet(
 
   const cb =
     cloudbetVerification.match;
-
-
-  const signalId =
-    signalMatchId(signal);
 
 
   return {
@@ -1833,7 +2692,7 @@ function buildPreparedBet(
         signalMatchName(signal),
 
       match_id:
-        signalId ||
+        signalMatchId(signal) ||
         null,
 
       home:
@@ -1914,7 +2773,10 @@ function buildPreparedBet(
         secureMatcher.matcher_score,
 
       reason:
-        secureMatcher.reason
+        secureMatcher.reason,
+
+      team_validation:
+        secureMatcher.team_validation
     },
 
 
@@ -1955,7 +2817,7 @@ function buildPreparedBet(
 
 
     action:
-      "NO_BET_IN_V4_READY"
+      "NO_BET_IN_V45_READY"
   };
 }
 
@@ -2052,8 +2914,7 @@ function buildNoMatch(
 
 
     action:
-      "NO_BET_IN_V4_4",
-
+      "NO_BET_IN_V4_5",
 
     reason
   };
@@ -2061,10 +2922,10 @@ function buildNoMatch(
 
 
 // ============================================================
-// PROCESS
+// PROCESS V4.5
 // ============================================================
 
-async function runV44(
+async function runV45(
   env: Env,
   request: Request
 ): Promise<Response> {
@@ -2181,6 +3042,12 @@ async function runV44(
           true,
 
         cloudbet_second_verification:
+          true,
+
+        v45_team_matching:
+          true,
+
+        v45_secure_flag_not_hard_rejection:
           true
       },
 
@@ -2263,7 +3130,10 @@ async function runV44(
           0,
 
         cloudbet_live_calls:
-          0
+          0,
+
+        cloudbet_reused_for_all_signals:
+          false
       },
 
 
@@ -2345,10 +3215,6 @@ async function runV44(
     const signal
     of hunterEntries
   ) {
-
-    // --------------------------------------------------------
-    // FIND BEST MATCHER CANDIDATE
-    // --------------------------------------------------------
 
     const matcherResult =
       findBestMatcherCandidate(
@@ -2464,9 +3330,14 @@ async function runV44(
               matcherResult.v27,
 
             cloudbet_target:
-              matcherResult.cloudbet
-          }
-        ),
+              matcherResult.cloudbet,
+
+            team_validation:
+              matcherResult.team_validation,
+
+            cloudbet_diagnostics:
+              cloudbetVerification
+        }),
 
         security: {
 
@@ -2593,10 +3464,10 @@ async function runV44(
       cloudbet_second_verification:
         true,
 
-      v44_strong_score_acceptance:
+      v45_team_matching:
         true,
 
-      v44_secure_flag_not_hard_rejection:
+      v45_secure_flag_not_hard_rejection:
         true
     },
 
@@ -2701,7 +3572,7 @@ async function runV44(
         matcherSecureMatches -
         cloudbetVerifiedMatches,
 
-      v44_rules: {
+      v45_rules: {
 
         confident_match:
           "ACCEPT",
@@ -2721,11 +3592,17 @@ async function runV44(
         team_validation:
           "TWO SIDED",
 
+        team_matching:
+          "EXACT + TOKEN + CONTAINMENT + CHARACTER SIMILARITY",
+
         direction:
           "NORMAL OR REVERSED",
 
         cloudbet:
-          "INDEPENDENT TWO SIDED VERIFICATION"
+          "INDEPENDENT TWO SIDED VERIFICATION",
+
+        cloudbet_fetch:
+          "ONE /live CALL PER EXECUTION"
       }
     },
 
@@ -2761,7 +3638,7 @@ async function runV44(
 
 
     message:
-      "V4.4 READ ONLY matcher acceptance fix. Strong valid matcher candidates are accepted even when secure_match is false. Score-only matches and zero-score EXACT_ID matches remain blocked. Cloudbet is independently verified once.",
+      "V4.5 READ ONLY. Improved two-sided team matching with exact, token, containment and character similarity. Score-only and zero-score EXACT_ID matches remain blocked. Cloudbet is independently verified once.",
 
 
     timestamp:
@@ -2837,7 +3714,29 @@ function health(): Response {
         STRONG_MATCHER_SCORE,
 
       secure_flag_false_hard_rejection:
-        false
+        false,
+
+      v45_team_matching:
+        true
+    },
+
+
+    team_matching: {
+
+      exact_normalized:
+        TEAM_EXACT_SCORE,
+
+      token_similarity:
+        TEAM_TOKEN_SCORE,
+
+      containment:
+        TEAM_PARTIAL_SCORE,
+
+      character_similarity:
+        0.90,
+
+      minimum_team_match:
+        TEAM_MIN_ACCEPT_SCORE
     },
 
 
@@ -2893,11 +3792,14 @@ function health(): Response {
       teams:
         "Both home and away must be present and compatible",
 
+      team_matching:
+        "Exact normalized, token similarity, containment or character similarity",
+
       direction:
         "Normal or reversed home/away direction accepted",
 
       secure_flag:
-        "secure_match=false is not an automatic rejection in V4.4",
+        "secure_match=false is not an automatic rejection in V4.5",
 
       cloudbet:
         "Cloudbet live event must be independently verified",
@@ -2911,7 +3813,7 @@ function health(): Response {
 
 
     message:
-      "V4.4 optimized READ ONLY secure preparation worker is healthy.",
+      "V4.5 optimized READ ONLY secure preparation worker is healthy.",
 
 
     timestamp:
@@ -2971,7 +3873,7 @@ export default {
         path === "/bet"
       ) {
 
-        return runV44(
+        return runV45(
           env,
           request
         );
@@ -2987,7 +3889,7 @@ export default {
         path === "/diagnostics"
       ) {
 
-        return runV44(
+        return runV45(
           env,
           request
         );
