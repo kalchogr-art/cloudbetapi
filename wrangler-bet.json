@@ -1,0 +1,18 @@
+{
+  "compatibility_date": "2026-08-29",
+  "main": "src/worker.ts",
+  "name": "cloudbet-bet-worker",
+  "observability": {
+    "enabled": true
+  },
+  "services": [
+    {
+      "binding": "V27",
+      "service": "goal-watch-proxy"
+    },
+    {
+      "binding": "CLOUDBET",
+      "service": "cloudbetapi"
+    }
+  ]
+}
