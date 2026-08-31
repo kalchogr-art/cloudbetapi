@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET BET WORKER V5.0
+// CLOUDBET BET WORKER V5.1
 // READ ONLY — TEST MODE
 // BETTING DISABLED
 //
@@ -10,26 +10,27 @@
 // TRACKER -> MATCHER -> CLOUDBET
 //              \----> DIRECT CLOUDBET FALLBACK
 //
-// V5.0 FIX:
-// 1. MATCHER THRESHOLD = 0.20
-// 2. MATCHER SCORE ALONE IS NOT TEAM VALIDATION
-// 3. STRICT TWO-SIDED TEAM VALIDATION
-// 4. EXACT / ALIAS MATCH = 1.00
-// 5. CONTAINMENT MATCH >= 0.75
-// 6. TOKEN MATCH REQUIRES STRONG TOKEN EVIDENCE
-// 7. CHARACTER SIMILARITY >= 0.70
-// 8. BOTH HOME + AWAY MUST PASS
-// 9. WEAK 0.20-0.69 TEAM SIMILARITY REJECTED
-// 10. NORMAL + REVERSED HOME/AWAY ALLOWED
-// 11. SCORE-ONLY MATCHES REJECTED
-// 12. EXACT_ID ALONE REJECTED
-// 13. EXACT_ID + ZERO MATCHER SCORE REJECTED
-// 14. CLOUD BET SECOND VERIFICATION REQUIRED
-// 15. DIRECT CLOUDBET FALLBACK ENABLED
-// 16. DIRECT FALLBACK USES SAME STRICT TEAM RULES
-// 17. CLOUDBET /live CALLED ONLY ONCE
-// 18. DETAILED SIGNAL FLOW DIAGNOSTICS
-// 19. BETTING DISABLED
+// V5.1 FIXES:
+// 1. MATCHER DISCOVERY THRESHOLD = 0.20
+// 2. MATCHER ACCEPT MIN SCORE = 0.20
+// 3. MATCHER SCORE ALONE IS NEVER TEAM VALIDATION
+// 4. STRICT TWO-SIDED TEAM VALIDATION
+// 5. EXACT / ALIAS NORMALIZATION = 1.00
+// 6. CONTAINMENT >= 0.75
+// 7. TOKEN MATCH REQUIRES STRONG TOKEN EVIDENCE
+// 8. CHARACTER SIMILARITY >= 0.70
+// 9. BOTH HOME + AWAY MUST PASS >= 0.70
+// 10. WEAK TEAM MATCHES ARE REJECTED
+// 11. NORMAL + REVERSED HOME/AWAY ALLOWED
+// 12. SCORE-ONLY MATCHES REJECTED
+// 13. EXACT_ID ALONE REJECTED
+// 14. EXACT_ID + ZERO MATCHER SCORE REJECTED
+// 15. CLOUD BET SECOND VERIFICATION REQUIRED
+// 16. DIRECT CLOUDBET FALLBACK ENABLED
+// 17. DIRECT FALLBACK USES SAME STRICT TEAM RULES
+// 18. CLOUDBET /live CALLED ONLY ONCE
+// 19. DETAILED SIGNAL FLOW DIAGNOSTICS
+// 20. BETTING DISABLED
 //
 // IMPORTANT:
 // NO BETS ARE PLACED.
@@ -50,7 +51,7 @@ type AnyObj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V5.0";
+const VERSION = "V5.1";
 
 const MODE = "READ_ONLY_TEST";
 
@@ -61,37 +62,32 @@ const BETTING_ENABLED = false;
 // MATCHER
 // ============================================================
 
-// Matcher discovery threshold.
-// This is intentionally low so we do not lose candidates.
-//
 // IMPORTANT:
-// This threshold DOES NOT decide whether the teams match.
-// Strict team validation below decides that.
+//
+// This is ONLY the discovery threshold.
+//
+// It does NOT mean that a 0.20 team match is accepted.
+//
+// Actual acceptance additionally requires:
+//
+// HOME TEAM >= 0.70
+// AWAY TEAM >= 0.70
+//
+// plus all other security checks.
 
-const MATCHER_THRESHOLD = 0.20;
+const MATCHER_DISCOVERY_THRESHOLD = 0.20;
 
-const STRONG_MATCHER_SCORE = 0.20;
 
-const MIN_MATCHER_SCORE = 0.20;
+// Minimum positive Matcher score.
+//
+// Matcher score is NOT team validation.
+
+const MATCHER_ACCEPT_MIN_SCORE = 0.20;
 
 
 // ============================================================
 // STRICT TEAM MATCHING
 // ============================================================
-
-// IMPORTANT:
-//
-// MATCHER_THRESHOLD and TEAM_MATCH_MIN_SCORE are separate.
-//
-// Example:
-//
-// Arda -> Leones de Rosario = 0.40
-// Botev Vratsa -> Atlas      = 0.294
-//
-// These values are NOT enough.
-//
-// Both teams must independently pass
-// the strict validation rules.
 
 const TEAM_MATCH_MIN_SCORE = 0.70;
 
@@ -101,7 +97,8 @@ const TEAM_MATCH_MIN_SCORE = 0.70;
 const CHARACTER_SIMILARITY_MIN_SCORE = 0.70;
 
 
-// Containment is naturally stronger than character similarity.
+// Containment is naturally stronger than
+// ordinary character similarity.
 
 const CONTAINMENT_MIN_SCORE = 0.75;
 
@@ -111,14 +108,12 @@ const CONTAINMENT_MIN_SCORE = 0.75;
 const EXACT_TEAM_SCORE = 1.00;
 
 
-// Token matching needs stronger evidence than
-// simply sharing one generic/common word.
+// Token matching needs strong evidence.
 
 const TOKEN_MATCH_MIN_SCORE = 0.75;
 
 
-// Minimum number of meaningful tokens required
-// for token-based acceptance.
+// Minimum number of meaningful common tokens.
 
 const TOKEN_MIN_COMMON = 1;
 
@@ -127,20 +122,13 @@ const TOKEN_MIN_COMMON = 1;
 // DIRECT CLOUDBET
 // ============================================================
 
-// Direct Cloudbet fallback uses the SAME strict
-// team validation rules.
-
 const DIRECT_CLOUDBET_MIN_SCORE =
   TEAM_MATCH_MIN_SCORE;
 
 
-// Strong direct team score.
-
 const DIRECT_CLOUDBET_STRONG_TEAM_SCORE =
   0.85;
 
-
-// Exact team score.
 
 const DIRECT_CLOUDBET_EXACT_TEAM_SCORE =
   1.00;
@@ -154,7 +142,6 @@ const REQUIRED_MATCH_CLASSIFICATION =
   "CONFIDENT_MATCH";
 
 
-// V5.0:
 // secure_match=false is not automatically rejected.
 //
 // Team validation is the real protection.
@@ -1108,7 +1095,7 @@ function teamMatchScore(
 
     const score =
       Math.max(
-        0.75,
+        CONTAINMENT_MIN_SCORE,
         containmentScore
       );
 
@@ -2054,11 +2041,19 @@ function validateMatcherCandidate(
 
   // ==========================================================
   // MATCHER SCORE TOO LOW
+  //
+  // IMPORTANT:
+  //
+  // 0.20 is the minimum positive Matcher result.
+  // It is NOT team validation.
+  //
+  // Team validation has already independently
+  // required BOTH teams >= 0.70.
   // ==========================================================
 
   if (
     matcherScore <
-    MIN_MATCHER_SCORE
+    MATCHER_ACCEPT_MIN_SCORE
   ) {
 
     return {
@@ -2086,50 +2081,19 @@ function validateMatcherCandidate(
 
 
   // ==========================================================
-  // V5.0 ACCEPT
+  // ACCEPT
   //
-  // Team validation is already strict.
+  // Team validation is strict.
   //
-  // CONFIDENT_MATCH is NOT required.
+  // CONFIDENT_MATCH is NOT mandatory.
+  //
+  // Matcher score >= 0.20 is only a positive
+  // discovery/association signal.
   // ==========================================================
 
   const confident =
     classification ===
     REQUIRED_MATCH_CLASSIFICATION;
-
-
-  const strongScore =
-    matcherScore >=
-    STRONG_MATCHER_SCORE;
-
-
-  if (
-    !confident &&
-    !strongScore
-  ) {
-
-    return {
-
-      accepted:
-        false,
-
-      reason:
-        "NOT_CONFIDENT_AND_SCORE_NOT_STRONG",
-
-      classification,
-
-      method,
-
-      matcher_score:
-        matcherScore,
-
-      secure_flag:
-        secureFlag,
-
-      team_scores:
-        teamScore
-    };
-  }
 
 
   return {
@@ -2140,7 +2104,7 @@ function validateMatcherCandidate(
     reason:
       confident
         ? "CONFIDENT_MATCH_ACCEPTED"
-        : "V50_STRICT_TWO_SIDED_MATCH_ACCEPTED",
+        : "V51_STRICT_TWO_SIDED_MATCH_ACCEPTED",
 
     classification:
       classification ||
@@ -2550,7 +2514,7 @@ function findDirectCloudbetFallback(
 
 
     // ========================================================
-    // BOTH TEAMS MUST PASS STRICT THRESHOLD
+    // BOTH TEAMS MUST PASS
     // ========================================================
 
     if (
@@ -3111,11 +3075,14 @@ function buildPreparedBet(
         secureMatcher.classification ===
         REQUIRED_MATCH_CLASSIFICATION,
 
-      strong_matcher_score:
-        secureMatcher.matcher_score != null
-          ? secureMatcher.matcher_score >=
-            STRONG_MATCHER_SCORE
-          : false,
+      matcher_discovery_threshold:
+        MATCHER_DISCOVERY_THRESHOLD,
+
+      matcher_accept_min_score:
+        MATCHER_ACCEPT_MIN_SCORE,
+
+      matcher_score_is_team_validation:
+        false,
 
       strict_two_sided_team_validation:
         true,
@@ -3155,7 +3122,7 @@ function buildPreparedBet(
 
 
     action:
-      "NO_BET_V5_0_TEST"
+      "NO_BET_V5_1_TEST"
   };
 }
 
@@ -3258,13 +3225,22 @@ function buildNoMatch(
       team_minimum_score:
         TEAM_MATCH_MIN_SCORE,
 
+      matcher_discovery_threshold:
+        MATCHER_DISCOVERY_THRESHOLD,
+
+      matcher_accept_min_score:
+        MATCHER_ACCEPT_MIN_SCORE,
+
+      matcher_score_is_team_validation:
+        false,
+
       test_mode:
         true
     },
 
 
     action:
-      "NO_BET_V5_0_TEST",
+      "NO_BET_V5_1_TEST",
 
     reason
   };
@@ -3332,8 +3308,14 @@ function emptyResponse(
       test_mode:
         true,
 
-      matcher_threshold:
-        MATCHER_THRESHOLD,
+      matcher_discovery_threshold:
+        MATCHER_DISCOVERY_THRESHOLD,
+
+      matcher_accept_min_score:
+        MATCHER_ACCEPT_MIN_SCORE,
+
+      matcher_score_is_team_validation:
+        false,
 
       matcher_team_minimum:
         TEAM_MATCH_MIN_SCORE,
@@ -3443,7 +3425,7 @@ function emptyResponse(
 
 
     message:
-      "V5.0 TEST READ ONLY. No active Hunter entries.",
+      "V5.1 TEST READ ONLY. No active Hunter entries.",
 
     timestamp:
       new Date().toISOString()
@@ -3452,10 +3434,10 @@ function emptyResponse(
 
 
 // ============================================================
-// RUN V5.0
+// RUN V5.1
 // ============================================================
 
-async function runV50(
+async function runV51(
   env: Env,
   request: Request
 ): Promise<Response> {
@@ -3505,7 +3487,7 @@ async function runV50(
   const matcherData =
     await fetchServiceJSON(
       env.MATCHER,
-      `/match?threshold=${MATCHER_THRESHOLD}`
+      `/match?threshold=${MATCHER_DISCOVERY_THRESHOLD}`
     );
 
 
@@ -4233,8 +4215,14 @@ async function runV50(
       test_mode:
         true,
 
-      matcher_threshold:
-        MATCHER_THRESHOLD,
+      matcher_discovery_threshold:
+        MATCHER_DISCOVERY_THRESHOLD,
+
+      matcher_accept_min_score:
+        MATCHER_ACCEPT_MIN_SCORE,
+
+      matcher_score_is_team_validation:
+        false,
 
       matcher_team_minimum:
         TEAM_MATCH_MIN_SCORE,
@@ -4386,7 +4374,7 @@ async function runV50(
         signalDiagnostics,
 
 
-      v50_rules: {
+      v51_rules: {
 
         mode:
           "TEST",
@@ -4394,14 +4382,14 @@ async function runV50(
         matcher:
           "PRIMARY MATCH SOURCE",
 
-        matcher_threshold:
-          MATCHER_THRESHOLD,
+        matcher_discovery_threshold:
+          MATCHER_DISCOVERY_THRESHOLD,
+
+        matcher_accept_min_score:
+          MATCHER_ACCEPT_MIN_SCORE,
 
         matcher_confident:
           "NOT REQUIRED",
-
-        matcher_score:
-          `ACCEPT >= ${STRONG_MATCHER_SCORE}`,
 
         matcher_score_is_team_validation:
           false,
@@ -4454,6 +4442,9 @@ async function runV50(
         cloudbet_fetch:
           "ONE /live CALL PER EXECUTION",
 
+        matcher_score:
+          "DISCOVERY / ASSOCIATION ONLY",
+
         betting:
           "DISABLED"
       }
@@ -4493,7 +4484,7 @@ async function runV50(
 
 
     message:
-      "V5.0 TEST READ ONLY. Matcher discovery remains at 0.20, but team matching now requires strict two-sided validation with a minimum team score of 0.70. Weak matches such as 0.40/0.29 are rejected. Cloudbet is independently verified and betting remains DISABLED.",
+      "V5.1 TEST READ ONLY. Matcher discovery is 0.20, but Matcher score alone can never validate teams. Both signal teams must independently match V27 teams at >= 0.70, followed by independent Cloudbet strict verification. Weak matches such as 0.40/0.29 are rejected. Betting remains DISABLED.",
 
 
     timestamp:
@@ -4544,8 +4535,14 @@ function health(): Response {
       test_mode:
         true,
 
-      matcher_threshold:
-        MATCHER_THRESHOLD,
+      matcher_discovery_threshold:
+        MATCHER_DISCOVERY_THRESHOLD,
+
+      matcher_accept_min_score:
+        MATCHER_ACCEPT_MIN_SCORE,
+
+      matcher_score_is_team_validation:
+        false,
 
       matcher_team_minimum:
         TEAM_MATCH_MIN_SCORE,
@@ -4584,22 +4581,22 @@ function health(): Response {
         true,
 
       cloudbet_second_verification:
-        true,
-
-      strong_matcher_score:
-        STRONG_MATCHER_SCORE
+        true
     },
 
 
-    v50: {
+    v51: {
 
       mode:
         "TEST",
 
-      matcher_threshold:
-        MATCHER_THRESHOLD,
+      matcher_discovery_threshold:
+        MATCHER_DISCOVERY_THRESHOLD,
 
-      confident_match_required:
+      matcher_accept_min_score:
+        MATCHER_ACCEPT_MIN_SCORE,
+
+      matcher_confident_required:
         false,
 
       matcher_score_is_team_validation:
@@ -4692,11 +4689,14 @@ function health(): Response {
       matcher:
         "PRIMARY MATCH SOURCE",
 
-      matcher_confident:
-        "NOT REQUIRED IN V5.0 TEST",
+      matcher_discovery:
+        `DISCOVERY SCORE >= ${MATCHER_DISCOVERY_THRESHOLD}`,
 
-      matcher_score:
-        `DISCOVERY SCORE >= ${STRONG_MATCHER_SCORE}`,
+      matcher_accept:
+        `POSITIVE MATCHER SCORE >= ${MATCHER_ACCEPT_MIN_SCORE}`,
+
+      matcher_confident:
+        "NOT REQUIRED IN V5.1 TEST",
 
       matcher_score_alone:
         "NEVER SUFFICIENT",
@@ -4720,7 +4720,7 @@ function health(): Response {
         `BOTH TEAMS >= ${TEAM_MATCH_MIN_SCORE}`,
 
       weak_team_match:
-        "0.20-0.69 IS REJECTED",
+        "TEAM SCORES BELOW 0.70 ARE REJECTED",
 
       direct_fallback:
         "If Matcher fails, search Cloudbet /live directly",
@@ -4746,7 +4746,7 @@ function health(): Response {
 
 
     message:
-      "V5.0 TEST worker is healthy. Strict two-sided team validation is active. Betting remains disabled.",
+      "V5.1 TEST worker is healthy. Matcher score is discovery only; strict two-sided team validation and independent Cloudbet verification are active. Betting remains disabled.",
 
 
     timestamp:
@@ -4806,7 +4806,7 @@ export default {
         path === "/bet"
       ) {
 
-        return runV50(
+        return runV51(
           env,
           request
         );
@@ -4822,7 +4822,7 @@ export default {
         path === "/diagnostics"
       ) {
 
-        return runV50(
+        return runV51(
           env,
           request
         );
