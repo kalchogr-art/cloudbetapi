@@ -1,58 +1,31 @@
 // ============================================================
-// CLOUDBET BET WORKER V1
+// CLOUDBET BET WORKER V2
 // HUNTER TRACKER -> MATCHER -> CLOUDBET
 //
-// V1:
+// V2:
 // - READ ONLY
 // - NO REAL BET
-// - Takes Hunter Tracker signal
-// - Sends signal match to Matcher
-// - Prepares FIRST_HALF OVER 0.5
-// - Cloudbet API binding is present but NOT USED for betting
-//
-// FLOW:
-//
-// HUNTER TRACKER
-//       ↓
-//   HUNTER ENTRY
-//       ↓
-//    BET WORKER
-//       ↓
-//     MATCHER
-//       ↓
-//   CLOUDBET MATCH
-//       ↓
-// FIRST HALF OVER 0.5
-//       ↓
-//     READ ONLY
+// - REAL HUNTER ENTRY EXTRACTION
+// - SUPPORTS NESTED TRACKER RESPONSES
+// - SUPPORTS /signals AND /entries FALLBACK
+// - MATCHER V7-FH
+// - PREPARES FIRST_HALF OVER 0.5
+// - DOES NOT PLACE BETS
 // ============================================================
-
 
 interface Env {
   TRACKER: Fetcher;
   MATCHER: Fetcher;
-
-  // Present for the future real-bet version.
-  // V1 NEVER sends a betting request.
   CLOUDBET: Fetcher;
 }
 
-
 type AnyObj = Record<string, any>;
 
-
-// ============================================================
-// CONSTANTS
-// ============================================================
-
-const VERSION = "V1";
+const VERSION = "V2";
 
 const SPORT = "SOCCER";
-
 const PERIOD = "FIRST_HALF";
-
 const OUTCOME = "OVER";
-
 const LINE = 0.5;
 
 
@@ -66,14 +39,9 @@ function json(
 ): Response {
 
   return new Response(
-    JSON.stringify(
-      data,
-      null,
-      2
-    ),
+    JSON.stringify(data, null, 2),
     {
       status,
-
       headers: {
         "content-type":
           "application/json; charset=UTF-8",
@@ -134,64 +102,295 @@ async function fetchServiceJSON(
 
 
 // ============================================================
-// TRACKER SIGNAL EXTRACTION
+// SAFE FETCH
 // ============================================================
 //
-// Tracker implementations can expose signals in different
-// arrays. V1 accepts the common forms without changing the
-// tracker itself.
+// Used for optional Tracker endpoints.
+// 404 does NOT crash the worker.
+// ============================================================
+
+async function tryFetchServiceJSON(
+  service: Fetcher,
+  path: string
+): Promise<any | null> {
+
+  try {
+
+    return await fetchServiceJSON(
+      service,
+      path
+    );
+
+  } catch {
+
+    return null;
+  }
+}
+
+
+// ============================================================
+// ARRAY EXTRACTION
+// ============================================================
+
+function collectArrays(
+  data: any,
+  output: AnyObj[][] = [],
+  depth = 0
+): AnyObj[][] {
+
+  if (
+    depth > 5 ||
+    data === null ||
+    data === undefined
+  ) {
+    return output;
+  }
+
+  if (
+    Array.isArray(data)
+  ) {
+
+    if (
+      data.length > 0 &&
+      data.every(
+        item =>
+          item &&
+          typeof item === "object" &&
+          !Array.isArray(item)
+      )
+    ) {
+
+      output.push(data);
+    }
+
+    for (
+      const item of data
+    ) {
+
+      collectArrays(
+        item,
+        output,
+        depth + 1
+      );
+    }
+
+    return output;
+  }
+
+
+  if (
+    typeof data === "object"
+  ) {
+
+    for (
+      const value of Object.values(data)
+    ) {
+
+      collectArrays(
+        value,
+        output,
+        depth + 1
+      );
+    }
+  }
+
+
+  return output;
+}
+
+
+// ============================================================
+// SIGNAL LIKENESS
+// ============================================================
+
+function looksLikeSignal(
+  item: AnyObj
+): boolean {
+
+  if (!item || typeof item !== "object") {
+    return false;
+  }
+
+  const values = [
+
+    item?.type,
+    item?.signal,
+    item?.action,
+    item?.status,
+    item?.event,
+    item?.result
+
+  ]
+    .filter(
+      value =>
+        value !== undefined &&
+        value !== null
+    )
+    .map(
+      value =>
+        String(value).toUpperCase()
+    );
+
+
+  if (
+    values.some(
+      value =>
+        value.includes("ENTRY") ||
+        value.includes("HUNTER")
+    )
+  ) {
+    return true;
+  }
+
+
+  return Boolean(
+
+    item?.match ||
+    item?.match_name ||
+    item?.matchName ||
+    item?.fixture ||
+    item?.event_name
+
+  );
+}
+
+
+// ============================================================
+// SIGNAL EXTRACTION
 // ============================================================
 
 function extractSignals(
   data: AnyObj
 ): AnyObj[] {
 
-  if (
-    Array.isArray(
-      data?.signals
-    )
+  const directKeys = [
+
+    "signals",
+    "entries",
+    "hunter_entries",
+    "hunter_signals",
+    "candidates",
+
+    "data",
+    "tracker",
+    "result"
+
+  ];
+
+
+  const found: AnyObj[] = [];
+
+
+  // ----------------------------------------------------------
+  // DIRECT ARRAYS
+  // ----------------------------------------------------------
+
+  for (
+    const key of directKeys
   ) {
-    return data.signals;
+
+    const value =
+      data?.[key];
+
+
+    if (
+      Array.isArray(value)
+    ) {
+
+      for (
+        const item of value
+      ) {
+
+        if (
+          item &&
+          typeof item === "object"
+        ) {
+
+          found.push(item);
+        }
+      }
+    }
   }
 
-  if (
-    Array.isArray(
-      data?.entries
-    )
+
+  // ----------------------------------------------------------
+  // NESTED ARRAYS
+  // ----------------------------------------------------------
+
+  const arrays =
+    collectArrays(data);
+
+
+  for (
+    const array of arrays
   ) {
-    return data.entries;
+
+    for (
+      const item of array
+    ) {
+
+      if (
+        looksLikeSignal(item)
+      ) {
+
+        found.push(item);
+      }
+    }
   }
 
-  if (
-    Array.isArray(
-      data?.hunter_entries
-    )
+
+  // ----------------------------------------------------------
+  // DEDUPLICATE
+  // ----------------------------------------------------------
+
+  const unique =
+    new Map<string, AnyObj>();
+
+
+  for (
+    const signal of found
   ) {
-    return data.hunter_entries;
+
+    const id =
+      signalMatchId(signal);
+
+
+    const name =
+      signalMatchName(signal);
+
+
+    const minute =
+      signalMinute(signal);
+
+
+    const key =
+
+      id
+        ? `id:${id}`
+
+        : `name:${name}|minute:${minute}`;
+    
+
+    if (
+      !unique.has(key)
+    ) {
+
+      unique.set(
+        key,
+        signal
+      );
+    }
   }
 
-  if (
-    Array.isArray(
-      data?.hunter_signals
-    )
-  ) {
-    return data.hunter_signals;
-  }
 
-  if (
-    Array.isArray(
-      data?.candidates
-    )
-  ) {
-    return data.candidates;
-  }
-
-  return [];
+  return Array.from(
+    unique.values()
+  );
 }
 
 
 // ============================================================
-// SIGNAL CHECK
+// HUNTER ENTRY CHECK
 // ============================================================
 
 function isHunterEntry(
@@ -201,15 +400,10 @@ function isHunterEntry(
   const values = [
 
     signal?.type,
-
     signal?.signal,
-
     signal?.action,
-
     signal?.status,
-
     signal?.event,
-
     signal?.result
 
   ]
@@ -226,8 +420,10 @@ function isHunterEntry(
 
   return values.some(
     value =>
-      value.includes("ENTRY") ||
-      value.includes("HUNTER_ENTRY")
+      value === "ENTRY" ||
+      value === "HUNTER_ENTRY" ||
+      value.includes("HUNTER_ENTRY") ||
+      value.includes("ENTRY")
   );
 }
 
@@ -260,7 +456,7 @@ function signalMatchName(
 
 
 // ============================================================
-// SIGNAL MATCH ID
+// MATCH ID
 // ============================================================
 
 function signalMatchId(
@@ -289,6 +485,7 @@ function signalMatchId(
     value === null ||
     value === ""
   ) {
+
     return null;
   }
 
@@ -298,7 +495,7 @@ function signalMatchId(
 
 
 // ============================================================
-// SIGNAL MINUTE
+// MINUTE
 // ============================================================
 
 function signalMinute(
@@ -364,6 +561,8 @@ function signalHunterScore(
 
     signal?.hunterScore ??
 
+    signal?.hunter?.score ??
+
     signal?.score;
 
 
@@ -374,6 +573,7 @@ function signalHunterScore(
   if (
     !Number.isFinite(score)
   ) {
+
     return null;
   }
 
@@ -383,7 +583,7 @@ function signalHunterScore(
 
 
 // ============================================================
-// RESULT / SCORE
+// SCORE
 // ============================================================
 
 function signalScore(
@@ -404,18 +604,114 @@ function signalScore(
 
 
 // ============================================================
-// MATCHER
+// TRACKER LOAD
 // ============================================================
 //
-// The matcher currently operates as:
+// First:
+//     /
 //
-// GET /
+// If root response contains no actual ENTRY:
 //
-// because its V7-FH implementation reads V27 and Cloudbet
-// through its own service bindings.
+//     /signals
+//     /entries
 //
-// V1 therefore sends the Hunter signal as diagnostic metadata
-// only. It does NOT modify Matcher behaviour.
+// This prevents the previous problem where the Tracker
+// reported entries but the Bet Worker saw zero.
+// ============================================================
+
+async function loadTrackerSignals(
+  env: Env
+): Promise<{
+  root: AnyObj;
+  signals: AnyObj[];
+  endpoint: string;
+}> {
+
+  const endpoints = [
+    "/",
+    "/signals",
+    "/entries"
+  ];
+
+
+  let lastData: AnyObj = {};
+  let lastEndpoint = "/";
+
+
+  for (
+    const endpoint of endpoints
+  ) {
+
+    const data =
+      await tryFetchServiceJSON(
+        env.TRACKER,
+        endpoint
+      );
+
+
+    if (!data) {
+      continue;
+    }
+
+
+    lastData =
+      data;
+
+    lastEndpoint =
+      endpoint;
+
+
+    const signals =
+      extractSignals(
+        data
+      );
+
+
+    const entries =
+      signals.filter(
+        isHunterEntry
+      );
+
+
+    if (
+      entries.length > 0
+    ) {
+
+      return {
+
+        root:
+          data,
+
+        signals:
+          signals,
+
+        endpoint:
+          endpoint
+
+      };
+    }
+  }
+
+
+  return {
+
+    root:
+      lastData,
+
+    signals:
+      extractSignals(
+        lastData
+      ),
+
+    endpoint:
+      lastEndpoint
+
+  };
+}
+
+
+// ============================================================
+// MATCHER
 // ============================================================
 
 async function runMatcher(
@@ -432,27 +728,15 @@ async function runMatcher(
 // ============================================================
 // FIND MATCHER COUNTERPART
 // ============================================================
-//
-// Matcher returns:
-//
-// matches[]
-//
-// Each item contains:
-//
-// v27
-// cloudbet
-// scoring
-//
-// We compare the Hunter signal with the matcher results.
-// ============================================================
 
 function findMatcherMatch(
   signal: AnyObj,
   matcherData: AnyObj
 ): AnyObj | null {
 
-  const signalsId =
+  const signalId =
     signalMatchId(signal);
+
 
   const signalName =
     signalMatchName(signal)
@@ -468,15 +752,11 @@ function findMatcherMatch(
       : [];
 
 
-  let best: AnyObj | null =
-    null;
-
-
   // ----------------------------------------------------------
-  // FIRST: EXACT MATCH ID
+  // EXACT ID
   // ----------------------------------------------------------
 
-  if (signalsId) {
+  if (signalId) {
 
     for (
       const item of matches
@@ -491,7 +771,7 @@ function findMatcherMatch(
 
       if (
         String(v27Id ?? "") ===
-        signalsId
+        signalId
       ) {
 
         return item;
@@ -500,7 +780,7 @@ function findMatcherMatch(
 
       if (
         String(cbId ?? "") ===
-        signalsId
+        signalId
       ) {
 
         return item;
@@ -510,7 +790,7 @@ function findMatcherMatch(
 
 
   // ----------------------------------------------------------
-  // SECOND: NORMALIZED NAME COMPARISON
+  // EXACT MATCH NAME
   // ----------------------------------------------------------
 
   if (signalName) {
@@ -522,9 +802,7 @@ function findMatcherMatch(
       const names = [
 
         item?.match,
-
         item?.v27?.match,
-
         item?.cloudbet?.match
 
       ]
@@ -550,7 +828,7 @@ function findMatcherMatch(
 
 
   // ----------------------------------------------------------
-  // THIRD: HOME/AWAY
+  // HOME / AWAY
   // ----------------------------------------------------------
 
   const signalHome =
@@ -586,8 +864,8 @@ function findMatcherMatch(
 
       const home =
         String(
-          item?.cloudbet?.home ??
           item?.v27?.home ??
+          item?.cloudbet?.home ??
           ""
         )
           .toLowerCase()
@@ -596,8 +874,8 @@ function findMatcherMatch(
 
       const away =
         String(
-          item?.cloudbet?.away ??
           item?.v27?.away ??
+          item?.cloudbet?.away ??
           ""
         )
           .toLowerCase()
@@ -615,12 +893,12 @@ function findMatcherMatch(
   }
 
 
-  return best;
+  return null;
 }
 
 
 // ============================================================
-// BET PREPARATION
+// PREPARE BET
 // ============================================================
 
 function prepareBet(
@@ -686,48 +964,49 @@ function prepareBet(
     },
 
 
-    cloudbet: cloudbet
-      ? {
+    cloudbet:
+      cloudbet
+        ? {
 
-          id:
-            cloudbet?.id ??
-            null,
+            id:
+              cloudbet?.id ??
+              null,
 
-          key:
-            cloudbet?.key ??
-            null,
+            key:
+              cloudbet?.key ??
+              null,
 
-          match:
-            cloudbet?.match ??
-            null,
+            match:
+              cloudbet?.match ??
+              null,
 
-          home:
-            cloudbet?.home ??
-            null,
+            home:
+              cloudbet?.home ??
+              null,
 
-          away:
-            cloudbet?.away ??
-            null,
+            away:
+              cloudbet?.away ??
+              null,
 
-          status:
-            cloudbet?.status ??
-            null,
+            status:
+              cloudbet?.status ??
+              null,
 
-          minute:
-            cloudbet?.minute ??
-            null,
+            minute:
+              cloudbet?.minute ??
+              null,
 
-          score:
-            cloudbet?.score ??
-            null,
+            score:
+              cloudbet?.score ??
+              null,
 
-          competition:
-            cloudbet?.competition ??
-            null
+            competition:
+              cloudbet?.competition ??
+              null
 
-        }
+          }
 
-      : null,
+        : null,
 
 
     matcher_scoring:
@@ -736,7 +1015,7 @@ function prepareBet(
 
 
     action:
-      "NO_BET_IN_V1"
+      "NO_BET_IN_V2"
 
   };
 }
@@ -755,20 +1034,17 @@ async function process(
 
 
   // ----------------------------------------------------------
-  // GET TRACKER
+  // TRACKER
   // ----------------------------------------------------------
 
-  const trackerData =
-    await fetchServiceJSON(
-      env.TRACKER,
-      "/"
+  const tracker =
+    await loadTrackerSignals(
+      env
     );
 
 
   const allSignals =
-    extractSignals(
-      trackerData
-    );
+    tracker.signals;
 
 
   const hunterEntries =
@@ -778,7 +1054,7 @@ async function process(
 
 
   // ----------------------------------------------------------
-  // NOTHING TO PROCESS
+  // NO ENTRY
   // ----------------------------------------------------------
 
   if (
@@ -802,7 +1078,11 @@ async function process(
       betting:
         "DISABLED",
 
+
       tracker: {
+
+        endpoint:
+          tracker.endpoint,
 
         signals:
           allSignals.length,
@@ -811,6 +1091,7 @@ async function process(
           0
 
       },
+
 
       target: {
 
@@ -828,15 +1109,19 @@ async function process(
 
       },
 
+
       bets_ready:
         0,
+
 
       message:
         "No Hunter ENTRY signal available.",
 
+
       processing_ms:
         Date.now() -
         started,
+
 
       timestamp:
         new Date()
@@ -847,7 +1132,7 @@ async function process(
 
 
   // ----------------------------------------------------------
-  // GET MATCHER
+  // MATCHER
   // ----------------------------------------------------------
 
   const matcherData =
@@ -857,10 +1142,11 @@ async function process(
 
 
   // ----------------------------------------------------------
-  // PREPARE RESULTS
+  // PREPARE
   // ----------------------------------------------------------
 
-  const prepared: AnyObj[] = [];
+  const prepared:
+    AnyObj[] = [];
 
 
   for (
@@ -890,6 +1176,10 @@ async function process(
         "READY"
     );
 
+
+  // ----------------------------------------------------------
+  // RESPONSE
+  // ----------------------------------------------------------
 
   return json({
 
@@ -941,6 +1231,9 @@ async function process(
 
 
     tracker: {
+
+      endpoint:
+        tracker.endpoint,
 
       total_signals:
         allSignals.length,
