@@ -2,7 +2,7 @@
 // CLOUDBET BET WORKER V4
 // HUNTER TRACKER -> MATCHER V7-FH -> CLOUDBET
 //
-// V4 FIX:
+// V4 SECURE MATCH FIX:
 // - FIXED HUNTER TRACKER -> MATCHER CONNECTION
 // - Keeps Hunter entry minute unchanged
 // - Keeps Hunter score unchanged
@@ -10,8 +10,11 @@
 // - Supports nested matcher candidates
 // - Supports V27 / Cloudbet IDs
 // - Supports exact normalized match name
-// - Supports HOME + AWAY matching
-// - Uses Matcher scoring when available
+// - Supports exact HOME + AWAY matching
+// - Supports token HOME + AWAY matching
+// - Matcher scoring is used ONLY as secondary confirmation
+// - Matcher score alone CANNOT produce READY
+// - Prevents unsafe score-only Cloudbet match selection
 // - READ ONLY
 // - NO REAL BET
 //
@@ -24,6 +27,8 @@
 //    BET WORKER V4
 //       ↓
 //   MATCHER V7-FH
+//       ↓
+//   SECURE MATCH VALIDATION
 //       ↓
 //   MATCHED V27/CLOUDBET
 //       ↓
@@ -56,6 +61,9 @@ const PERIOD = "FIRST_HALF";
 const OUTCOME = "OVER";
 
 const LINE = 0.5;
+
+// Minimum matcher score used only as secondary confirmation
+const MATCHER_MIN_SCORE = 0.45;
 
 
 // ============================================================
@@ -445,7 +453,7 @@ function signalMinute(
     signal?.match_minute ??
 
     signal?.matchMinute ??
-    
+
     signal?.entry;
 
 
@@ -859,7 +867,6 @@ function objectId(
 // V7-FH can expose matches in different structures.
 // We collect all object candidates recursively.
 //
-// This is the important V4 connection fix.
 // ============================================================
 
 function extractMatcherCandidates(
@@ -1096,17 +1103,8 @@ function nameMatches(
   }
 
 
-  if (
-    source === candidate
-  ) {
-
-    return true;
-  }
-
-
   return (
-    source.includes(candidate) ||
-    candidate.includes(source)
+    source === candidate
   );
 }
 
@@ -1157,15 +1155,11 @@ function teamsMatch(
 
   return (
 
-    (
-      signalHomeName ===
-      candidateHome
-    ) &&
+    signalHomeName ===
+    candidateHome &&
 
-    (
-      signalAwayName ===
-      candidateAway
-    )
+    signalAwayName ===
+    candidateAway
 
   );
 }
@@ -1241,25 +1235,44 @@ function tokenTeamMatch(
 
 
 // ============================================================
-// FIND MATCHER MATCH
+// SECURE MATCH RESULT
 // ============================================================
 //
-// Priority:
+// Returns:
+// - matched object
+// - match method
+// - matcher score
 //
-// 1. Exact ID
-// 2. Exact normalized name
-// 3. Exact home + away
-// 4. Token home + away
-// 5. Matcher scoring
+// SECURITY RULE:
 //
-// IMPORTANT:
-// We return the actual Matcher object.
+// Matcher score alone is NEVER enough.
+//
+// Allowed:
+//
+// 1. EXACT_ID
+// 2. EXACT_NAME
+// 3. EXACT_TEAMS
+// 4. TOKEN_TEAMS + score >= 0.45
+//
+// This prevents an unrelated Cloudbet match from becoming READY
+// merely because the matcher returned a high numerical score.
+// ============================================================
+
+interface MatchResult {
+  matched: AnyObj | null;
+  method: string;
+  matcherScore: number;
+}
+
+
+// ============================================================
+// FIND MATCHER MATCH
 // ============================================================
 
 function findMatcherMatch(
   signal: AnyObj,
   matcherData: AnyObj
-): AnyObj | null {
+): MatchResult {
 
   const candidates =
     extractMatcherCandidates(
@@ -1294,43 +1307,58 @@ function findMatcherMatch(
         )
       ) {
 
-        return item;
+        return {
+
+          matched:
+            item,
+
+          method:
+            "EXACT_ID",
+
+          matcherScore:
+            getMatcherScore(
+              item
+            )
+
+        };
       }
     }
   }
 
 
   // ----------------------------------------------------------
-  // 2. EXACT NAME
+  // 2. EXACT NORMALIZED NAME
   // ----------------------------------------------------------
 
   if (
     signalName
   ) {
 
-    const source =
-      normalizeText(
-        signalName
-      );
-
-
     for (
       const item of candidates
     ) {
 
-      const candidate =
-        normalizeText(
-          objectMatchName(item)
-        );
-
-
       if (
-        source &&
-        candidate &&
-        source === candidate
+        nameMatches(
+          signalName,
+          item
+        )
       ) {
 
-        return item;
+        return {
+
+          matched:
+            item,
+
+          method:
+            "EXACT_NAME",
+
+          matcherScore:
+            getMatcherScore(
+              item
+            )
+
+        };
       }
     }
   }
@@ -1351,45 +1379,52 @@ function findMatcherMatch(
       )
     ) {
 
-      return item;
+      return {
+
+        matched:
+          item,
+
+        method:
+          "EXACT_TEAMS",
+
+        matcherScore:
+          getMatcherScore(
+            item
+          )
+
+      };
     }
   }
 
 
   // ----------------------------------------------------------
   // 4. TOKEN HOME + AWAY
+  //
+  // IMPORTANT:
+  // Token match MUST also have sufficient Matcher score.
   // ----------------------------------------------------------
 
-  for (
-    const item of candidates
-  ) {
-
-    if (
-      tokenTeamMatch(
-        signal,
-        item
-      )
-    ) {
-
-      return item;
-    }
-  }
-
-
-  // ----------------------------------------------------------
-  // 5. HIGH MATCHER SCORE
-  // ----------------------------------------------------------
-
-  let best:
+  let bestTokenMatch:
     AnyObj | null = null;
 
-  let bestScore =
+  let bestTokenScore =
     0;
 
 
   for (
     const item of candidates
   ) {
+
+    if (
+      !tokenTeamMatch(
+        signal,
+        item
+      )
+    ) {
+
+      continue;
+    }
+
 
     const score =
       getMatcherScore(
@@ -1398,28 +1433,60 @@ function findMatcherMatch(
 
 
     if (
-      score > bestScore
+      score > bestTokenScore
     ) {
 
-      bestScore =
+      bestTokenScore =
         score;
 
-      best =
+      bestTokenMatch =
         item;
     }
   }
 
 
   if (
-    best &&
-    bestScore >= 0.45
+    bestTokenMatch &&
+    bestTokenScore >=
+      MATCHER_MIN_SCORE
   ) {
 
-    return best;
+    return {
+
+      matched:
+        bestTokenMatch,
+
+      method:
+        "TOKEN_TEAMS_SCORE_CONFIRMED",
+
+      matcherScore:
+        bestTokenScore
+
+    };
   }
 
 
-  return null;
+  // ----------------------------------------------------------
+  // 5. SCORE-ONLY MATCH
+  //
+  // DISABLED FOR SECURITY.
+  //
+  // A high score without matching identity/team information
+  // cannot safely identify the Cloudbet event.
+  // ----------------------------------------------------------
+
+  return {
+
+    matched:
+      null,
+
+    method:
+      "NO_SECURE_MATCH",
+
+    matcherScore:
+      0
+
+  };
 }
 
 
@@ -1613,8 +1680,12 @@ function extractCloudbet(
 
 function prepareBet(
   signal: AnyObj,
-  matched: AnyObj | null
+  matchResult: MatchResult
 ): AnyObj {
+
+  const matched =
+    matchResult.matched;
+
 
   const cloudbet =
     extractCloudbet(
@@ -1627,13 +1698,30 @@ function prepareBet(
       ? getMatcherScore(
           matched
         )
-      : null;
+      : matchResult.matcherScore;
+
+
+  // ----------------------------------------------------------
+  // SECURITY CHECK
+  //
+  // A matcher object is READY only when:
+  //
+  // 1. It passed secure identity validation
+  // 2. A Cloudbet object can actually be extracted
+  //
+  // This prevents a partial matcher object from being exposed
+  // as a usable Cloudbet betting target.
+  // ----------------------------------------------------------
+
+  const secureReady =
+    !!matched &&
+    !!cloudbet;
 
 
   return {
 
     status:
-      matched
+      secureReady
         ? "READY"
         : "NO_MATCH",
 
@@ -1761,7 +1849,10 @@ function prepareBet(
               score:
                 matcherScore
             }
-          : null
+          : {
+              score:
+                null
+            }
       ),
 
 
@@ -1787,11 +1878,34 @@ function prepareBet(
             away:
               objectAway(
                 matched
-              )
+              ),
+
+            match_method:
+              matchResult.method,
+
+            matcher_score:
+              matcherScore
 
           }
 
         : null,
+
+
+    security: {
+
+      secure_match:
+        secureReady,
+
+      match_method:
+        matchResult.method,
+
+      score_only_match:
+        false,
+
+      minimum_score_for_token_match:
+        MATCHER_MIN_SCORE
+
+    },
 
 
     action:
@@ -2085,7 +2199,7 @@ async function process(
     const signal of hunterEntries
   ) {
 
-    const matched =
+    const matchResult =
       findMatcherMatch(
         signal,
         matcherData
@@ -2095,7 +2209,7 @@ async function process(
     prepared.push(
       prepareBet(
         signal,
-        matched
+        matchResult
       )
     );
   }
@@ -2162,6 +2276,20 @@ async function process(
     },
 
 
+    security: {
+
+      secure_matching:
+        true,
+
+      score_only_matching:
+        false,
+
+      token_team_min_score:
+        MATCHER_MIN_SCORE
+
+    },
+
+
     tracker: {
 
       endpoint:
@@ -2223,7 +2351,7 @@ async function process(
 
 
     message:
-      "READ ONLY betting preparation worker. No bet can be placed.",
+      "READ ONLY secure betting preparation worker. No bet can be placed.",
 
 
     timestamp:
@@ -2289,8 +2417,22 @@ function health(): Response {
     },
 
 
+    security: {
+
+      secure_matching:
+        true,
+
+      score_only_matching:
+        false,
+
+      token_team_min_score:
+        MATCHER_MIN_SCORE
+
+    },
+
+
     message:
-      "READ ONLY betting preparation worker. No bet can be placed.",
+      "READ ONLY secure betting preparation worker. No bet can be placed.",
 
 
     timestamp:
