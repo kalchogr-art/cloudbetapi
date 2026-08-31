@@ -1,9 +1,9 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V5-FH
+// CLOUDBET MATCH MATCHER V6-FH
 // V27 + CLOUDBET SERVICE BINDINGS
 // READ ONLY
 //
-// V5-FH:
+// V6-FH:
 // 1. FIRST-HALF INPUT FILTER
 // 2. V27 FIRST-HALF FILTER
 // 3. CLOUDBET FIRST-HALF FILTER
@@ -15,11 +15,18 @@
 // 9. CATEGORY PROTECTION
 // 10. HOME/AWAY DIRECTION CHECK
 // 11. COMPETITION / COUNTRY SIGNAL
-// 12. READ ONLY
+// 12. CLOUDBET-ONLY FIRST-HALF OUTPUT
+// 13. COMPETITION NORMALIZATION
+// 14. READ ONLY
 //
 // IMPORTANT:
-// Matcher scoring is NOT changed.
-// Only FIRST-HALF INPUT FILTER was added.
+// MATCH SCORING IS NOT CHANGED.
+//
+// V6 adds a separate Cloudbet-first-half feed for matches
+// that have no V27 counterpart.
+//
+// They are NOT marked as matched.
+// They are exposed separately for the next worker.
 // ============================================================
 
 interface Env {
@@ -235,7 +242,7 @@ function categoryCompatible(
 
 
 // ============================================================
-// ALIASES
+// TEAM ALIASES
 // ============================================================
 
 function applyTeamAliases(value: string): string {
@@ -696,7 +703,7 @@ function extractAway(
 
 
 // ============================================================
-// MINUTE PARSER
+// MINUTE
 // ============================================================
 
 function parseMinute(value: any): number | null {
@@ -738,9 +745,7 @@ function parseMinute(value: any): number | null {
   }
 
   const match =
-    text.match(
-      /(\d{1,3})/
-    );
+    text.match(/(\d{1,3})/);
 
   if (!match) return null;
 
@@ -760,7 +765,7 @@ function parseMinute(value: any): number | null {
 
 
 // ============================================================
-// PERIOD DETECTION
+// PERIOD
 // ============================================================
 
 function periodText(
@@ -770,25 +775,15 @@ function periodText(
   const fields = [
 
     match?.period,
-
     match?.period_name,
-
     match?.periodName,
-
     match?.phase,
-
     match?.phase_name,
-
     match?.half,
-
     match?.match_period,
-
     match?.game_period,
-
     match?.status,
-
     match?.status_text,
-
     match?.statusText
 
   ];
@@ -836,8 +831,7 @@ function hasExplicitSecondHalf(
 
   if (!text) return false;
 
-  const secondHalfPatterns = [
-
+  return [
     /\b2h\b/,
     /\bsecond half\b/,
     /\b2nd half\b/,
@@ -846,10 +840,7 @@ function hasExplicitSecondHalf(
     /\bperiod 2\b/,
     /\bhalf 2\b/,
     /\bhalf2\b/
-
-  ];
-
-  return secondHalfPatterns.some(
+  ].some(
     pattern => pattern.test(text)
   );
 }
@@ -864,8 +855,7 @@ function hasExplicitFirstHalf(
 
   if (!text) return false;
 
-  const firstHalfPatterns = [
-
+  return [
     /\b1h\b/,
     /\bfirst half\b/,
     /\b1st half\b/,
@@ -874,17 +864,14 @@ function hasExplicitFirstHalf(
     /\bperiod 1\b/,
     /\bhalf 1\b/,
     /\bhalf1\b/
-
-  ];
-
-  return firstHalfPatterns.some(
+  ].some(
     pattern => pattern.test(text)
   );
 }
 
 
 // ============================================================
-// EXTRACT MATCH MINUTE
+// MATCH MINUTE
 // ============================================================
 
 function matchMinute(
@@ -894,23 +881,14 @@ function matchMinute(
   const fields = [
 
     match?.minute,
-
     match?.minute_display,
-
     match?.minuteDisplay,
-
     match?.clock?.minute,
-
     match?.clock?.display,
-
     match?.game_time,
-
     match?.gameTime,
-
     match?.elapsed,
-
     match?.elapsed_time,
-
     match?.elapsedTime
 
   ];
@@ -930,15 +908,7 @@ function matchMinute(
 
 
 // ============================================================
-// FIRST HALF FILTER
-//
-// IMPORTANT:
-// - Explicit 2H => reject.
-// - Explicit 1H => accept.
-// - No explicit period + minute <=45 => accept.
-// - No reliable information => keep the match.
-//
-// This prevents accidental loss of live matches.
+// FIRST HALF
 // ============================================================
 
 function isFirstHalf(
@@ -966,8 +936,6 @@ function isFirstHalf(
     return true;
   }
 
-  // If feed has no reliable period/minute,
-  // keep it rather than incorrectly deleting it.
   return true;
 }
 
@@ -1027,6 +995,41 @@ function competitionText(
 
 
 // ============================================================
+// COMPETITION NORMALIZATION
+//
+// Examples:
+//
+// Liga MX - Apertura
+// Liga MX, Apertura
+// Liga MX Apertura
+//
+// -> liga mx apertura
+// ============================================================
+
+function normalizeCompetition(
+  value: any
+): string {
+
+  let s =
+    normalizeText(value);
+
+  if (!s) return "";
+
+  s = s
+    .replace(/\bapertura\b/g, "apertura")
+    .replace(/\bclausura\b/g, "clausura")
+    .replace(/\bprimera a\b/g, "primera a")
+    .replace(/\bprimera b\b/g, "primera b")
+    .replace(/\bnext pro\b/g, "next pro")
+    .replace(/\bnextpro\b/g, "next pro");
+
+  return s
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+
+// ============================================================
 // COUNTRY
 // ============================================================
 
@@ -1037,11 +1040,8 @@ function countryText(
   const fields = [
 
     match?.country,
-
     match?.country_name,
-
     match?.competition?.country,
-
     match?.league?.country
 
   ];
@@ -1060,16 +1060,24 @@ function countryText(
 }
 
 
+// ============================================================
+// COMPETITION SIMILARITY
+// ============================================================
+
 function competitionSimilarity(
   a: AnyObj,
   b: AnyObj
 ): number {
 
   const A =
-    competitionText(a);
+    normalizeCompetition(
+      competitionText(a)
+    );
 
   const B =
-    competitionText(b);
+    normalizeCompetition(
+      competitionText(b)
+    );
 
   if (!A || !B) return 0;
 
@@ -1106,6 +1114,10 @@ function competitionSimilarity(
   );
 }
 
+
+// ============================================================
+// COUNTRY SIMILARITY
+// ============================================================
 
 function countrySimilarity(
   a: AnyObj,
@@ -1288,24 +1300,20 @@ function classifyMatch(
     ) {
 
       return {
-
         classification:
           "CONFIDENT_MATCH",
 
         reason:
           "STRONG_REVERSED_TWO_SIDED_MATCH"
-
       };
     }
 
     return {
-
       classification:
         "REVERSED_CANDIDATE",
 
       reason:
         "HOME_AWAY_DIRECTION_REVERSED"
-
     };
   }
 
@@ -1320,13 +1328,11 @@ function classifyMatch(
   ) {
 
     return {
-
       classification:
         "CONFIDENT_MATCH",
 
       reason:
         "STRONG_TWO_SIDED_MATCH"
-
     };
   }
 
@@ -1337,13 +1343,11 @@ function classifyMatch(
   ) {
 
     return {
-
       classification:
         "POSSIBLE_MATCH",
 
       reason:
         "BOTH_TEAMS_HAVE_REASONABLE_SIMILARITY"
-
     };
   }
 
@@ -1359,13 +1363,11 @@ function classifyMatch(
   ) {
 
     return {
-
       classification:
         "FALSE_POSITIVE_RISK",
 
       reason:
         "ONLY_ONE_TEAM_MATCHES"
-
     };
   }
 
@@ -1378,24 +1380,20 @@ function classifyMatch(
   ) {
 
     return {
-
       classification:
         "CLOSE_BELOW_THRESHOLD",
 
       reason:
         "BOTH_SIDES_NOT_STRONG_ENOUGH"
-
     };
   }
 
   return {
-
     classification:
       "TRUE_UNMATCHED",
 
     reason:
       "WEAK_TWO_SIDED_SIMILARITY"
-
   };
 }
 
@@ -1466,7 +1464,7 @@ function prepareMatch(
 
 
 // ============================================================
-// FAST CANDIDATE INDEX
+// TOKEN INDEX
 // ============================================================
 
 function buildTokenIndex(
@@ -1509,7 +1507,7 @@ function buildTokenIndex(
 
 
 // ============================================================
-// CANDIDATE GENERATION
+// CANDIDATES
 // ============================================================
 
 function getCandidates(
@@ -1539,13 +1537,8 @@ function getCandidates(
     }
   }
 
-  // Exact normalized team lookup naturally
-  // enters the token candidate set.
-
   if (!candidateSet.size) {
 
-    // Very limited fallback.
-    // This is intentionally capped.
     const limit =
       Math.min(
         cloudbet.length,
@@ -1794,54 +1787,82 @@ function matchDisplayName(
 
 
 // ============================================================
-// SERVICE FETCH
+// CLOUDBET ONLY RECORD
 // ============================================================
 
-async function fetchServiceJSON(
-  service: Fetcher,
-  path: string
-): Promise<any> {
+function buildCloudbetOnlyRecord(
+  cb: PreparedMatch
+) {
 
-  const response =
-    await service.fetch(
-      new Request(
-        `https://service${path}`,
-        {
-          method: "GET",
+  return {
 
-          headers: {
-            "accept":
-              "application/json"
-          }
-        }
-      )
-    );
+    id:
+      cb.raw?.id ??
+      null,
 
-  const text =
-    await response.text();
+    key:
+      cb.raw?.key ??
+      null,
 
-  if (!response.ok) {
+    match:
+      matchDisplayName(
+        cb.raw
+      ),
 
-    throw new Error(
-      `HTTP ${response.status}: ${text.slice(0, 300)}`
-    );
-  }
+    home:
+      extractHome(cb.raw),
 
-  try {
+    away:
+      extractAway(cb.raw),
 
-    return JSON.parse(text);
+    normalized_home:
+      cb.normalizedHome,
 
-  } catch {
+    normalized_away:
+      cb.normalizedAway,
 
-    throw new Error(
-      `Invalid JSON from ${path}`
-    );
-  }
+    category_home:
+      cb.homeCategory,
+
+    category_away:
+      cb.awayCategory,
+
+    competition:
+      cb.raw?.competition ??
+      cb.raw?.league ??
+      null,
+
+    competition_normalized:
+      normalizeCompetition(
+        competitionText(cb.raw)
+      ),
+
+    country:
+      countryText(cb.raw),
+
+    status:
+      cb.raw?.status ??
+      null,
+
+    minute:
+      matchMinute(cb.raw),
+
+    score:
+      cb.raw?.score ??
+      null,
+
+    source:
+      "CLOUDBET_FIRST_HALF_ONLY",
+
+    reason:
+      "NO_V27_COUNTERPART"
+
+  };
 }
 
 
 // ============================================================
-// BUILD MATCH RECORD
+// MATCH RECORD
 // ============================================================
 
 function buildMatchRecord(
@@ -2007,159 +2028,49 @@ function buildMatchRecord(
 
 
 // ============================================================
-// UNMATCHED
+// SERVICE FETCH
 // ============================================================
 
-function buildUnmatchedRecord(
-  index: number,
-  v27: AnyObj,
-  result: AnyObj,
-  threshold: number
-) {
+async function fetchServiceJSON(
+  service: Fetcher,
+  path: string
+): Promise<any> {
 
-  return {
+  const response =
+    await service.fetch(
+      new Request(
+        `https://service${path}`,
+        {
+          method: "GET",
 
-    index,
-
-    v27: {
-
-      id:
-        v27?.id ??
-        null,
-
-      match:
-        matchDisplayName(v27),
-
-      home:
-        extractHome(v27),
-
-      away:
-        extractAway(v27),
-
-      normalized_home:
-        normalizeTeam(
-          extractHome(v27)
-        ),
-
-      normalized_away:
-        normalizeTeam(
-          extractAway(v27)
-        ),
-
-      category_home:
-        teamCategory(
-          extractHome(v27)
-        ),
-
-      category_away:
-        teamCategory(
-          extractAway(v27)
-        ),
-
-      minute:
-        v27?.minute ??
-        v27?.minute_display ??
-        null,
-
-      score:
-        v27?.score ??
-        null
-
-    },
-
-    best_cloudbet:
-      result.best
-        ? {
-
-            id:
-              result.best.raw?.id ??
-              null,
-
-            key:
-              result.best.raw?.key ??
-              null,
-
-            match:
-              matchDisplayName(
-                result.best.raw
-              ),
-
-            home:
-              extractHome(
-                result.best.raw
-              ),
-
-            away:
-              extractAway(
-                result.best.raw
-              ),
-
-            normalized_home:
-              normalizeTeam(
-                extractHome(
-                  result.best.raw
-                )
-              ),
-
-            normalized_away:
-              normalizeTeam(
-                extractAway(
-                  result.best.raw
-                )
-              ),
-
-            competition:
-              result.best.raw?.competition ??
-              null
-
+          headers: {
+            "accept":
+              "application/json"
           }
-        : null,
+        }
+      )
+    );
 
-    scoring:
-      result.detail
-        ? {
+  const text =
+    await response.text();
 
-            total:
-              Number(
-                result.detail.total.toFixed(3)
-              ),
+  if (!response.ok) {
 
-            home_score:
-              Number(
-                result.detail.homeScore.toFixed(3)
-              ),
+    throw new Error(
+      `HTTP ${response.status}: ${text.slice(0, 300)}`
+    );
+  }
 
-            away_score:
-              Number(
-                result.detail.awayScore.toFixed(3)
-              ),
+  try {
 
-            direction:
-              result.detail.direction
+    return JSON.parse(text);
 
-          }
-        : null,
+  } catch {
 
-    threshold,
-
-    gap_to_threshold:
-      Number(
-        Math.max(
-          0,
-          threshold -
-          Number(
-            result.detail?.total ?? 0
-          )
-        ).toFixed(3)
-      ),
-
-    classification:
-      result.classification,
-
-    reason:
-      result.reason
-
-  };
+    throw new Error(
+      `Invalid JSON from ${path}`
+    );
+  }
 }
 
 
@@ -2241,7 +2152,7 @@ async function runMatcher(
     );
 
   // ==========================================================
-  // FIRST HALF FILTER
+  // FIRST HALF
   // ==========================================================
 
   const v27Matches =
@@ -2289,7 +2200,7 @@ async function runMatcher(
   let candidateEvaluations = 0;
 
   // ==========================================================
-  // PROCESS
+  // V27 -> CLOUDBET MATCHING
   // ==========================================================
 
   for (
@@ -2319,7 +2230,9 @@ async function runMatcher(
         result.best;
 
       if (cb.id) {
-        usedCloudbetIds.add(cb.id);
+        usedCloudbetIds.add(
+          cb.id
+        );
       }
 
       matches.push({
@@ -2414,15 +2327,48 @@ async function runMatcher(
       }
     }
 
-    unmatched.push(
-      buildUnmatchedRecord(
-        unmatched.length,
-        v27.raw,
-        result,
-        threshold
-      )
-    );
+    unmatched.push({
+
+      v27:
+        matchDisplayName(
+          v27.raw
+        ),
+
+      v27_id:
+        v27.id,
+
+      classification:
+        result.classification,
+
+      reason:
+        result.reason
+
+    });
   }
+
+  // ==========================================================
+  // CLOUDBET-ONLY FIRST HALF
+  //
+  // IMPORTANT:
+  // These are NOT matches.
+  // They are simply Cloudbet live first-half events
+  // which were not consumed by a confident V27 match.
+  // ==========================================================
+
+  const cloudbetOnlyFirstHalf =
+    preparedCloudbet
+      .filter(cb => {
+
+        if (!cb.id) return true;
+
+        return !usedCloudbetIds.has(
+          cb.id
+        );
+
+      })
+      .map(
+        buildCloudbetOnlyRecord
+      );
 
   // ==========================================================
   // RESPONSE
@@ -2437,7 +2383,7 @@ async function runMatcher(
       "cloudbet-match-matcher",
 
     version:
-      "V5-FH",
+      "V6-FH",
 
     mode:
       "READ ONLY",
@@ -2480,6 +2426,9 @@ async function runMatcher(
 
       matcher:
         "STRICT TWO-SIDED TEAM NORMALIZATION + ALIAS + TOKEN FUZZY + CATEGORY PROTECTION + COMPETITION/COUNTRY SIGNAL",
+
+      cloudbet_only:
+        "UNMATCHED CLOUDBET FIRST-HALF EVENTS EXPOSED SEPARATELY",
 
       optimization:
         "FIRST-HALF INPUT FILTER + PRE-NORMALIZED TEAMS + TOKEN INDEX + SAFE EXACT/ALIAS LOOKUP + LIMITED FUZZY FALLBACK"
@@ -2526,6 +2475,9 @@ async function runMatcher(
       true_unmatched:
         unmatched.length,
 
+      cloudbet_only_first_half:
+        cloudbetOnlyFirstHalf.length,
+
       unique_cloudbet_used:
         usedCloudbetIds.size,
 
@@ -2557,6 +2509,90 @@ async function runMatcher(
 
     unmatched:
       unmatched.slice(0, 100),
+
+    // ========================================================
+    // THIS IS THE NEW OUTPUT FOR THE NEXT WORKER
+    // ========================================================
+
+    cloudbet_only_first_half:
+      cloudbetOnlyFirstHalf,
+
+    timestamp:
+      new Date().toISOString()
+
+  });
+}
+
+
+// ============================================================
+// HEALTH
+// ============================================================
+
+function health(): Response {
+
+  return json({
+
+    success:
+      true,
+
+    worker:
+      "cloudbet-match-matcher",
+
+    version:
+      "V6-FH",
+
+    mode:
+      "READ ONLY",
+
+    bindings: {
+
+      V27:
+        true,
+
+      CLOUDBET:
+        true
+
+    },
+
+    matcher:
+      "V6 FIRST-HALF FILTER + STRICT TWO-SIDED MATCH + CLOUDBET-ONLY OUTPUT",
+
+    rules: {
+
+      first_half:
+        "EXPLICIT FIRST HALF OR MINUTE <= 45",
+
+      second_half:
+        "EXPLICIT SECOND HALF IS EXCLUDED",
+
+      confident:
+        "Both teams >= 0.78 and total >= 0.80",
+
+      possible:
+        "Both teams >= 0.60 and total >= 0.72",
+
+      false_positive:
+        "One team strong while the other is weak",
+
+      reversed:
+        "Home/Away reversed candidates are separately classified",
+
+      category_protection:
+        "U19/U21/U23/reserve/women categories are protected",
+
+      aliases:
+        "Aliases are applied inside larger team names",
+
+      common_tokens:
+        "Generic/common club tokens cannot create a strong match alone",
+
+      cloudbet_only:
+        "Cloudbet first-half events without a V27 counterpart are exposed separately"
+
+    },
+
+    message:
+      "V6-FH keeps V5 scoring unchanged and adds a separate Cloudbet-only first-half feed.",
 
     timestamp:
       new Date().toISOString()
@@ -2599,10 +2635,14 @@ async function runDiagnostic(
     ]);
 
   const rawV27Matches =
-    extractV27Matches(v27Data);
+    extractV27Matches(
+      v27Data
+    );
 
   const rawCloudbetMatches =
-    extractCloudbetMatches(cloudbetData);
+    extractCloudbetMatches(
+      cloudbetData
+    );
 
   const cloudbetLive =
     rawCloudbetMatches.filter(
@@ -2682,6 +2722,21 @@ async function runDiagnostic(
     }
   }
 
+  const cloudbetOnly =
+    preparedCloudbet
+      .filter(cb => {
+
+        if (!cb.id) return true;
+
+        return !usedCloudbetIds.has(
+          cb.id
+        );
+
+      })
+      .map(
+        buildCloudbetOnlyRecord
+      );
+
   const diagnostics: AnyObj[] = [];
 
   let potentialMatches = 0;
@@ -2689,10 +2744,6 @@ async function runDiagnostic(
   let reversedCandidates = 0;
   let falsePositiveRisk = 0;
   let trueUnmatched = 0;
-
-  // ==========================================================
-  // DIAGNOSTIC AGAINST ALL PREPARED CLOUDBET
-  // ==========================================================
 
   for (
     let i = 0;
@@ -3010,7 +3061,7 @@ async function runDiagnostic(
       "cloudbet-match-matcher",
 
     version:
-      "V5-FH",
+      "V6-FH",
 
     mode:
       "READ ONLY",
@@ -3039,14 +3090,8 @@ async function runDiagnostic(
       first_half_rule:
         "EXPLICIT FIRST HALF OR MINUTE <= 45; EXPLICIT SECOND HALF IS EXCLUDED",
 
-      matcher:
-        "STRICT TWO-SIDED TEAM NORMALIZATION + ALIAS + TOKEN FUZZY + CATEGORY PROTECTION + COMPETITION/COUNTRY SIGNAL",
-
-      optimization:
-        "FIRST-HALF INPUT FILTER + PRE-NORMALIZED TEAMS + TOKEN INDEX + SAFE EXACT/ALIAS LOOKUP + LIMITED FUZZY FALLBACK",
-
-      diagnostic_note:
-        "Diagnostic compares unmatched first-half V27 matches against all prepared first-half Cloudbet events and ignores used Cloudbet IDs."
+      cloudbet_only:
+        "Cloudbet first-half events not consumed by confident V27 matching are returned separately"
 
     },
 
@@ -3080,6 +3125,9 @@ async function runDiagnostic(
 
       unmatched:
         normalUnmatched.length,
+
+      cloudbet_only_first_half:
+        cloudbetOnly.length,
 
       potential_matches:
         potentialMatches,
@@ -3117,79 +3165,8 @@ async function runDiagnostic(
     diagnostics:
       diagnostics.slice(0, 100),
 
-    timestamp:
-      new Date().toISOString()
-
-  });
-}
-
-
-// ============================================================
-// HEALTH
-// ============================================================
-
-function health(): Response {
-
-  return json({
-
-    success:
-      true,
-
-    worker:
-      "cloudbet-match-matcher",
-
-    version:
-      "V5-FH",
-
-    mode:
-      "READ ONLY",
-
-    bindings: {
-
-      V27:
-        true,
-
-      CLOUDBET:
-        true
-
-    },
-
-    matcher:
-      "V5 FIRST-HALF FILTER + STRICT TWO-SIDED MATCH",
-
-    rules: {
-
-      first_half:
-        "EXPLICIT FIRST HALF OR MINUTE <= 45",
-
-      second_half:
-        "EXPLICIT SECOND HALF IS EXCLUDED",
-
-      confident:
-        "Both teams >= 0.78 and total >= 0.80",
-
-      possible:
-        "Both teams >= 0.60 and total >= 0.72",
-
-      false_positive:
-        "One team strong while the other is weak",
-
-      reversed:
-        "Home/Away reversed candidates are separately classified",
-
-      category_protection:
-        "U19/U21/U23/reserve/women categories are protected",
-
-      aliases:
-        "Aliases are applied inside larger team names",
-
-      common_tokens:
-        "Generic/common club tokens cannot create a strong match alone"
-
-    },
-
-    message:
-      "V5-FH uses FIRST-HALF filtering before matching. No API key is required here.",
+    cloudbet_only_first_half:
+      cloudbetOnly,
 
     timestamp:
       new Date().toISOString()
@@ -3296,7 +3273,7 @@ export default {
             "cloudbet-match-matcher",
 
           version:
-            "V5-FH",
+            "V6-FH",
 
           mode:
             "READ ONLY",
