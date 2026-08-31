@@ -1,17 +1,37 @@
 // ============================================================
-// CLOUDBET BET WORKER V2
+// CLOUDBET BET WORKER V3
 // HUNTER TRACKER -> MATCHER -> CLOUDBET
 //
-// V2:
+// V3:
 // - READ ONLY
 // - NO REAL BET
-// - REAL HUNTER ENTRY EXTRACTION
-// - SUPPORTS NESTED TRACKER RESPONSES
-// - SUPPORTS /signals AND /entries FALLBACK
-// - MATCHER V7-FH
-// - PREPARES FIRST_HALF OVER 0.5
-// - DOES NOT PLACE BETS
+// - Reads Hunter ENTRY signals robustly
+// - Tries multiple Tracker endpoints
+// - Supports multiple signal array formats
+// - Sends signal match to Matcher
+// - Prepares FIRST_HALF OVER 0.5
+// - Keeps entry minute
+// - Keeps Hunter score
+// - Keeps Cloudbet match data
+// - NO betting request is ever sent
+//
+// FLOW:
+//
+// HUNTER TRACKER
+//       ↓
+//   HUNTER ENTRY
+//       ↓
+//    BET WORKER
+//       ↓
+//     MATCHER
+//       ↓
+//   CLOUDBET MATCH
+//       ↓
+// FIRST HALF OVER 0.5
+//       ↓
+//     READ ONLY
 // ============================================================
+
 
 interface Env {
   TRACKER: Fetcher;
@@ -19,14 +39,34 @@ interface Env {
   CLOUDBET: Fetcher;
 }
 
+
 type AnyObj = Record<string, any>;
 
-const VERSION = "V2";
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+
+const VERSION = "V3";
 
 const SPORT = "SOCCER";
+
 const PERIOD = "FIRST_HALF";
+
 const OUTCOME = "OVER";
+
 const LINE = 0.5;
+
+
+// Tracker endpoints checked in this order.
+//
+// /entries is the preferred endpoint.
+// / is kept as fallback because older Tracker versions
+// expose their data from the root endpoint.
+const TRACKER_ENDPOINTS = [
+  "/entries",
+  "/"
+];
 
 
 // ============================================================
@@ -39,9 +79,14 @@ function json(
 ): Response {
 
   return new Response(
-    JSON.stringify(data, null, 2),
+    JSON.stringify(
+      data,
+      null,
+      2
+    ),
     {
       status,
+
       headers: {
         "content-type":
           "application/json; charset=UTF-8",
@@ -78,8 +123,10 @@ async function fetchServiceJSON(
       )
     );
 
+
   const text =
     await response.text();
+
 
   if (!response.ok) {
 
@@ -87,6 +134,7 @@ async function fetchServiceJSON(
       `HTTP ${response.status}: ${text.slice(0, 500)}`
     );
   }
+
 
   try {
 
@@ -102,309 +150,149 @@ async function fetchServiceJSON(
 
 
 // ============================================================
-// SAFE FETCH
+// ARRAY HELPER
+// ============================================================
+
+function asArray(
+  value: any
+): AnyObj[] {
+
+  return Array.isArray(value)
+    ? value
+    : [];
+}
+
+
+// ============================================================
+// TRACKER SIGNAL EXTRACTION
 // ============================================================
 //
-// Used for optional Tracker endpoints.
-// 404 does NOT crash the worker.
-// ============================================================
-
-async function tryFetchServiceJSON(
-  service: Fetcher,
-  path: string
-): Promise<any | null> {
-
-  try {
-
-    return await fetchServiceJSON(
-      service,
-      path
-    );
-
-  } catch {
-
-    return null;
-  }
-}
-
-
-// ============================================================
-// ARRAY EXTRACTION
-// ============================================================
-
-function collectArrays(
-  data: any,
-  output: AnyObj[][] = [],
-  depth = 0
-): AnyObj[][] {
-
-  if (
-    depth > 5 ||
-    data === null ||
-    data === undefined
-  ) {
-    return output;
-  }
-
-  if (
-    Array.isArray(data)
-  ) {
-
-    if (
-      data.length > 0 &&
-      data.every(
-        item =>
-          item &&
-          typeof item === "object" &&
-          !Array.isArray(item)
-      )
-    ) {
-
-      output.push(data);
-    }
-
-    for (
-      const item of data
-    ) {
-
-      collectArrays(
-        item,
-        output,
-        depth + 1
-      );
-    }
-
-    return output;
-  }
-
-
-  if (
-    typeof data === "object"
-  ) {
-
-    for (
-      const value of Object.values(data)
-    ) {
-
-      collectArrays(
-        value,
-        output,
-        depth + 1
-      );
-    }
-  }
-
-
-  return output;
-}
-
-
-// ============================================================
-// SIGNAL LIKENESS
-// ============================================================
-
-function looksLikeSignal(
-  item: AnyObj
-): boolean {
-
-  if (!item || typeof item !== "object") {
-    return false;
-  }
-
-  const values = [
-
-    item?.type,
-    item?.signal,
-    item?.action,
-    item?.status,
-    item?.event,
-    item?.result
-
-  ]
-    .filter(
-      value =>
-        value !== undefined &&
-        value !== null
-    )
-    .map(
-      value =>
-        String(value).toUpperCase()
-    );
-
-
-  if (
-    values.some(
-      value =>
-        value.includes("ENTRY") ||
-        value.includes("HUNTER")
-    )
-  ) {
-    return true;
-  }
-
-
-  return Boolean(
-
-    item?.match ||
-    item?.match_name ||
-    item?.matchName ||
-    item?.fixture ||
-    item?.event_name
-
-  );
-}
-
-
-// ============================================================
-// SIGNAL EXTRACTION
+// Different Tracker versions can expose the same Hunter
+// entries under different array names.
+//
+// V3 checks all known structures.
+//
+// IMPORTANT:
+// We do not require "ENTRY" to be in the array name.
+// The individual signal is checked separately.
 // ============================================================
 
 function extractSignals(
   data: AnyObj
 ): AnyObj[] {
 
-  const directKeys = [
+  const possibleArrays = [
 
-    "signals",
-    "entries",
-    "hunter_entries",
-    "hunter_signals",
-    "candidates",
+    data?.entries,
 
-    "data",
-    "tracker",
-    "result"
+    data?.hunter_entries,
+
+    data?.hunterEntries,
+
+    data?.hunter_signals,
+
+    data?.hunterSignals,
+
+    data?.signals,
+
+    data?.candidates,
+
+    data?.results
 
   ];
 
 
-  const found: AnyObj[] = [];
-
-
-  // ----------------------------------------------------------
-  // DIRECT ARRAYS
-  // ----------------------------------------------------------
-
   for (
-    const key of directKeys
+    const value of possibleArrays
   ) {
 
-    const value =
-      data?.[key];
+    const arr =
+      asArray(value);
 
 
     if (
-      Array.isArray(value)
+      arr.length > 0
     ) {
 
-      for (
-        const item of value
-      ) {
-
-        if (
-          item &&
-          typeof item === "object"
-        ) {
-
-          found.push(item);
-        }
-      }
+      return arr;
     }
   }
 
 
   // ----------------------------------------------------------
-  // NESTED ARRAYS
+  // Some Tracker responses can contain a single signal.
   // ----------------------------------------------------------
 
-  const arrays =
-    collectArrays(data);
-
-
-  for (
-    const array of arrays
+  if (
+    data?.entry &&
+    typeof data.entry === "object"
   ) {
 
-    for (
-      const item of array
-    ) {
-
-      if (
-        looksLikeSignal(item)
-      ) {
-
-        found.push(item);
-      }
-    }
+    return [
+      data.entry
+    ];
   }
 
 
-  // ----------------------------------------------------------
-  // DEDUPLICATE
-  // ----------------------------------------------------------
-
-  const unique =
-    new Map<string, AnyObj>();
-
-
-  for (
-    const signal of found
+  if (
+    data?.hunter_entry &&
+    typeof data.hunter_entry === "object"
   ) {
 
-    const id =
-      signalMatchId(signal);
-
-
-    const name =
-      signalMatchName(signal);
-
-
-    const minute =
-      signalMinute(signal);
-
-
-    const key =
-
-      id
-        ? `id:${id}`
-
-        : `name:${name}|minute:${minute}`;
-    
-
-    if (
-      !unique.has(key)
-    ) {
-
-      unique.set(
-        key,
-        signal
-      );
-    }
+    return [
+      data.hunter_entry
+    ];
   }
 
 
-  return Array.from(
-    unique.values()
-  );
+  return [];
 }
 
 
 // ============================================================
-// HUNTER ENTRY CHECK
+// SIGNAL CHECK
 // ============================================================
 
 function isHunterEntry(
   signal: AnyObj
 ): boolean {
 
+  // ----------------------------------------------------------
+  // Explicit boolean flags
+  // ----------------------------------------------------------
+
+  if (
+    signal?.is_hunter_entry === true ||
+    signal?.isHunterEntry === true ||
+    signal?.hunter_entry === true ||
+    signal?.hunterEntry === true
+  ) {
+
+    return true;
+  }
+
+
+  // ----------------------------------------------------------
+  // Text fields
+  // ----------------------------------------------------------
+
   const values = [
 
     signal?.type,
+
     signal?.signal,
+
     signal?.action,
+
     signal?.status,
+
     signal?.event,
-    signal?.result
+
+    signal?.result,
+
+    signal?.signal_type,
+
+    signal?.signalType
 
   ]
     .filter(
@@ -422,6 +310,7 @@ function isHunterEntry(
     value =>
       value === "ENTRY" ||
       value === "HUNTER_ENTRY" ||
+      value.includes("HUNTER ENTRY") ||
       value.includes("HUNTER_ENTRY") ||
       value.includes("ENTRY")
   );
@@ -436,7 +325,7 @@ function signalMatchName(
   signal: AnyObj
 ): string {
 
-  return (
+  return String(
 
     signal?.match ??
 
@@ -446,12 +335,19 @@ function signalMatchName(
 
     signal?.fixture ??
 
+    signal?.fixture_name ??
+
+    signal?.fixtureName ??
+
     signal?.event_name ??
+
+    signal?.eventName ??
 
     signal?.name ??
 
     ""
-  );
+
+  ).trim();
 }
 
 
@@ -477,6 +373,10 @@ function signalMatchId(
 
     signal?.eventId ??
 
+    signal?.v27_id ??
+
+    signal?.v27Id ??
+
     signal?.id;
 
 
@@ -495,6 +395,58 @@ function signalMatchId(
 
 
 // ============================================================
+// HOME TEAM
+// ============================================================
+
+function signalHome(
+  signal: AnyObj
+): string {
+
+  return String(
+
+    signal?.home ??
+
+    signal?.home_team ??
+
+    signal?.homeTeam ??
+
+    signal?.home_name ??
+
+    signal?.homeName ??
+
+    ""
+
+  ).trim();
+}
+
+
+// ============================================================
+// AWAY TEAM
+// ============================================================
+
+function signalAway(
+  signal: AnyObj
+): string {
+
+  return String(
+
+    signal?.away ??
+
+    signal?.away_team ??
+
+    signal?.awayTeam ??
+
+    signal?.away_name ??
+
+    signal?.awayName ??
+
+    ""
+
+  ).trim();
+}
+
+
+// ============================================================
 // MINUTE
 // ============================================================
 
@@ -508,7 +460,15 @@ function signalMinute(
 
     signal?.entryMinute ??
 
+    signal?.hunter_entry_minute ??
+
+    signal?.hunterEntryMinute ??
+
     signal?.minute ??
+
+    signal?.match_minute ??
+
+    signal?.matchMinute ??
 
     signal?.entry;
 
@@ -533,6 +493,7 @@ function signalMinute(
 
 
   if (!match) {
+
     return null;
   }
 
@@ -561,29 +522,57 @@ function signalHunterScore(
 
     signal?.hunterScore ??
 
-    signal?.hunter?.score ??
+    signal?.hunter_score_value ??
 
-    signal?.score;
+    signal?.hunterScoreValue;
 
 
-  const score =
+  const direct =
     Number(value);
 
 
   if (
-    !Number.isFinite(score)
+    Number.isFinite(direct)
   ) {
 
-    return null;
+    return direct;
   }
 
 
-  return score;
+  // ----------------------------------------------------------
+  // Some Tracker responses use score as the Hunter score.
+  // ----------------------------------------------------------
+
+  if (
+    typeof signal?.score === "number"
+  ) {
+
+    return signal.score;
+  }
+
+
+  const nested =
+    Number(
+      signal?.score?.hunter ??
+      signal?.score?.hunter_score ??
+      signal?.score?.value
+    );
+
+
+  if (
+    Number.isFinite(nested)
+  ) {
+
+    return nested;
+  }
+
+
+  return null;
 }
 
 
 // ============================================================
-// SCORE
+// SCORE / RESULT
 // ============================================================
 
 function signalScore(
@@ -598,113 +587,122 @@ function signalScore(
 
     signal?.score ??
 
+    signal?.result ??
+
     null
+
   );
 }
 
 
 // ============================================================
-// TRACKER LOAD
+// FETCH TRACKER
 // ============================================================
 //
-// First:
-//     /
+// We check /entries first.
 //
-// If root response contains no actual ENTRY:
+// If /entries returns zero signals, we also check /.
 //
-//     /signals
-//     /entries
-//
-// This prevents the previous problem where the Tracker
-// reported entries but the Bet Worker saw zero.
+// This prevents the Bet Worker from silently reporting zero
+// when the Tracker exposes its entries through another route.
 // ============================================================
 
-async function loadTrackerSignals(
+async function fetchTracker(
   env: Env
 ): Promise<{
-  root: AnyObj;
+  data: AnyObj | null;
+  endpoint: string | null;
   signals: AnyObj[];
-  endpoint: string;
+  attempts: AnyObj[];
 }> {
 
-  const endpoints = [
-    "/",
-    "/signals",
-    "/entries"
-  ];
-
-
-  let lastData: AnyObj = {};
-  let lastEndpoint = "/";
+  const attempts: AnyObj[] = [];
 
 
   for (
-    const endpoint of endpoints
+    const endpoint of TRACKER_ENDPOINTS
   ) {
 
-    const data =
-      await tryFetchServiceJSON(
-        env.TRACKER,
-        endpoint
-      );
+    try {
+
+      const data =
+        await fetchServiceJSON(
+          env.TRACKER,
+          endpoint
+        );
 
 
-    if (!data) {
-      continue;
-    }
+      const signals =
+        extractSignals(data);
 
 
-    lastData =
-      data;
+      attempts.push({
 
-    lastEndpoint =
-      endpoint;
+        endpoint,
 
+        success:
+          true,
 
-    const signals =
-      extractSignals(
-        data
-      );
+        extracted:
+          signals.length,
 
+        keys:
+          Object.keys(data ?? {})
+            .slice(0, 30)
 
-    const entries =
-      signals.filter(
-        isHunterEntry
-      );
+      });
 
 
-    if (
-      entries.length > 0
-    ) {
+      if (
+        signals.length > 0
+      ) {
 
-      return {
+        return {
 
-        root:
           data,
 
-        signals:
+          endpoint,
+
           signals,
 
-        endpoint:
-          endpoint
+          attempts
 
-      };
+        };
+      }
+
+
+    } catch (
+      error: any
+    ) {
+
+      attempts.push({
+
+        endpoint,
+
+        success:
+          false,
+
+        error:
+          error?.message ??
+          String(error)
+
+      });
     }
   }
 
 
   return {
 
-    root:
-      lastData,
-
-    signals:
-      extractSignals(
-        lastData
-      ),
+    data:
+      null,
 
     endpoint:
-      lastEndpoint
+      null,
+
+    signals:
+      [],
+
+    attempts
 
   };
 }
@@ -726,7 +724,31 @@ async function runMatcher(
 
 
 // ============================================================
-// FIND MATCHER COUNTERPART
+// NORMALIZE TEXT
+// ============================================================
+
+function normalizeText(
+  value: any
+): string {
+
+  return String(
+    value ?? ""
+  )
+    .toLowerCase()
+    .replace(
+      /[^a-z0-9]+/g,
+      " "
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .trim();
+}
+
+
+// ============================================================
+// MATCHER COUNTERPART
 // ============================================================
 
 function findMatcherMatch(
@@ -739,48 +761,58 @@ function findMatcherMatch(
 
 
   const signalName =
-    signalMatchName(signal)
-      .toLowerCase()
-      .trim();
+    normalizeText(
+      signalMatchName(signal)
+    );
+
+
+  const home =
+    normalizeText(
+      signalHome(signal)
+    );
+
+
+  const away =
+    normalizeText(
+      signalAway(signal)
+    );
 
 
   const matches =
-    Array.isArray(
+    asArray(
       matcherData?.matches
-    )
-      ? matcherData.matches
-      : [];
+    );
 
 
   // ----------------------------------------------------------
-  // EXACT ID
+  // 1. EXACT V27 / CLOUDBET ID
   // ----------------------------------------------------------
 
-  if (signalId) {
+  if (
+    signalId
+  ) {
 
     for (
       const item of matches
     ) {
 
       const v27Id =
-        item?.v27?.id;
+        String(
+          item?.v27?.id ??
+          ""
+        );
+
 
       const cbId =
-        item?.cloudbet?.id;
+        String(
+          item?.cloudbet?.id ??
+          ""
+        );
 
 
       if (
-        String(v27Id ?? "") ===
-        signalId
-      ) {
-
-        return item;
-      }
-
-
-      if (
-        String(cbId ?? "") ===
-        signalId
+        v27Id === signalId ||
+        cbId === signalId
       ) {
 
         return item;
@@ -790,10 +822,12 @@ function findMatcherMatch(
 
 
   // ----------------------------------------------------------
-  // EXACT MATCH NAME
+  // 2. EXACT MATCH NAME
   // ----------------------------------------------------------
 
-  if (signalName) {
+  if (
+    signalName
+  ) {
 
     for (
       const item of matches
@@ -802,17 +836,14 @@ function findMatcherMatch(
       const names = [
 
         item?.match,
+
         item?.v27?.match,
+
         item?.cloudbet?.match
 
       ]
         .filter(Boolean)
-        .map(
-          value =>
-            String(value)
-              .toLowerCase()
-              .trim()
-        );
+        .map(normalizeText);
 
 
       if (
@@ -828,63 +859,37 @@ function findMatcherMatch(
 
 
   // ----------------------------------------------------------
-  // HOME / AWAY
+  // 3. HOME + AWAY
   // ----------------------------------------------------------
 
-  const signalHome =
-    String(
-      signal?.home ??
-      signal?.home_team ??
-      signal?.homeTeam ??
-      ""
-    )
-      .toLowerCase()
-      .trim();
-
-
-  const signalAway =
-    String(
-      signal?.away ??
-      signal?.away_team ??
-      signal?.awayTeam ??
-      ""
-    )
-      .toLowerCase()
-      .trim();
-
-
   if (
-    signalHome &&
-    signalAway
+    home &&
+    away
   ) {
 
     for (
       const item of matches
     ) {
 
-      const home =
-        String(
+      const candidateHome =
+        normalizeText(
           item?.v27?.home ??
           item?.cloudbet?.home ??
           ""
-        )
-          .toLowerCase()
-          .trim();
+        );
 
 
-      const away =
-        String(
+      const candidateAway =
+        normalizeText(
           item?.v27?.away ??
           item?.cloudbet?.away ??
           ""
-        )
-          .toLowerCase()
-          .trim();
+        );
 
 
       if (
-        home === signalHome &&
-        away === signalAway
+        candidateHome === home &&
+        candidateAway === away
       ) {
 
         return item;
@@ -944,22 +949,43 @@ function prepareBet(
       type:
         signal?.type ??
         signal?.signal ??
+        signal?.action ??
         "HUNTER_ENTRY",
 
       match:
-        signalMatchName(signal),
+        signalMatchName(
+          signal
+        ),
 
       match_id:
-        signalMatchId(signal),
+        signalMatchId(
+          signal
+        ),
+
+      home:
+        signalHome(
+          signal
+        ),
+
+      away:
+        signalAway(
+          signal
+        ),
 
       entry_minute:
-        signalMinute(signal),
+        signalMinute(
+          signal
+        ),
 
       hunter_score:
-        signalHunterScore(signal),
+        signalHunterScore(
+          signal
+        ),
 
       score:
-        signalScore(signal)
+        signalScore(
+          signal
+        )
 
     },
 
@@ -1015,7 +1041,7 @@ function prepareBet(
 
 
     action:
-      "NO_BET_IN_V2"
+      "NO_BET_IN_V3"
 
   };
 }
@@ -1038,7 +1064,7 @@ async function process(
   // ----------------------------------------------------------
 
   const tracker =
-    await loadTrackerSignals(
+    await fetchTracker(
       env
     );
 
@@ -1088,7 +1114,10 @@ async function process(
           allSignals.length,
 
         hunter_entries:
-          0
+          0,
+
+        attempts:
+          tracker.attempts
 
       },
 
@@ -1118,6 +1147,17 @@ async function process(
         "No Hunter ENTRY signal available.",
 
 
+      diagnostics: {
+
+        tracker_endpoints_checked:
+          TRACKER_ENDPOINTS,
+
+        tracker_attempts:
+          tracker.attempts
+
+      },
+
+
       processing_ms:
         Date.now() -
         started,
@@ -1145,8 +1185,7 @@ async function process(
   // PREPARE
   // ----------------------------------------------------------
 
-  const prepared:
-    AnyObj[] = [];
+  const prepared: AnyObj[] = [];
 
 
   for (
@@ -1257,9 +1296,9 @@ async function process(
       confident_matched:
         matcherData?.stats
           ?.confident_matched ??
-        matcherData?.matches
-          ?.length ??
-        0
+        asArray(
+          matcherData?.matches
+        ).length
 
     },
 
@@ -1413,7 +1452,8 @@ export default {
 
       if (
         path === "/prepare" ||
-        path === "/bet"
+        path === "/bet" ||
+        path === "/entries"
       ) {
 
         return process(
@@ -1427,6 +1467,7 @@ export default {
       // ------------------------------------------------------
 
       return json(
+
         {
 
           success:
@@ -1449,13 +1490,16 @@ export default {
 
             "/prepare",
 
-            "/bet"
+            "/bet",
+
+            "/entries"
 
           ]
 
         },
 
         404
+
       );
 
 
@@ -1464,6 +1508,7 @@ export default {
     ) {
 
       return json(
+
         {
 
           success:
@@ -1492,6 +1537,7 @@ export default {
         },
 
         500
+
       );
     }
   }
