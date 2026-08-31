@@ -1,8 +1,8 @@
 // ============================================================
-// CLOUDBET BET WORKER V4
+// CLOUDBET BET WORKER V4.2
 // SECURE SIGNAL -> MATCHER -> CLOUDBET PIPELINE
 //
-// V4.1 MATCHER CONTRACT FIX
+// V4.2 SPEED OPTIMIZATION
 //
 // FLOW:
 //
@@ -12,13 +12,16 @@
 // HUNTER_ENTRY FILTER
 //        |
 //        v
-// MATCHER /match
+// MATCHER /match       <-- ONE CALL
 //        |
 //        v
 // STRICT SECURITY VALIDATION
 //        |
 //        v
-// CLOUDBET /live
+// CLOUDBET /live       <-- ONE CALL
+//        |
+//        v
+// LOCAL VERIFICATION FOR ALL SIGNALS
 //        |
 //        v
 // READY / NO_MATCH
@@ -28,21 +31,12 @@
 // - BETTING DISABLED
 // - NO BET IS PLACED
 // - EXACT_ID ALONE IS NOT ENOUGH
-// - EXACT_ID + SCORE 0 IS REJECTED
-// - POSSIBLE_MATCH IS REJECTED
-// - FALSE_POSITIVE_RISK IS REJECTED
-// - CONFIDENT_MATCH IS REQUIRED
+// - score_only_match IS NEVER ACCEPTED
+// - MATCHER CONFIDENT_MATCH IS REQUIRED
 // - TWO-SIDED TEAM VALIDATION IS REQUIRED
-// - CLOUDBET SECOND VERIFICATION IS REQUIRED
-//
-// FIX:
-// V7-FH does not have to return security.secure_match=true
-// inside every matched item.
-//
-// CONFIDENT_MATCH + valid two-sided teams + positive matcher
-// score is accepted as secure matcher evidence.
-//
+// - CLOUDBET IS FETCHED ONLY ONCE
 // ============================================================
+
 
 interface Env {
   TRACKER: Fetcher;
@@ -50,27 +44,35 @@ interface Env {
   CLOUDBET: Fetcher;
 }
 
-type AnyObj = Record<string, any>;
+
+type AnyObj =
+  Record<string, any>;
 
 
 // ============================================================
 // CONFIG
 // ============================================================
 
-const VERSION = "V4.1";
+const VERSION =
+  "V4.2";
 
-const MODE = "READ_ONLY";
+const MODE =
+  "READ_ONLY";
 
-const BETTING_ENABLED = false;
+const BETTING_ENABLED =
+  false;
 
-const MATCHER_THRESHOLD = 0.45;
+const MATCHER_THRESHOLD =
+  0.45;
 
-const TOKEN_TEAM_MIN_SCORE = 0.45;
+const TOKEN_TEAM_MIN_SCORE =
+  0.45;
 
 const REQUIRED_MATCH_CLASSIFICATION =
   "CONFIDENT_MATCH";
 
-const REQUIRED_SECURE_MATCH = true;
+const REQUIRED_SECURE_MATCH =
+  true;
 
 const ALLOWED_SIGNAL_TYPE =
   "HUNTER_ENTRY";
@@ -98,9 +100,14 @@ function json(
 ): Response {
 
   return new Response(
-    JSON.stringify(data, null, 2),
+    JSON.stringify(
+      data,
+      null,
+      2
+    ),
     {
       status,
+
       headers: {
         "content-type":
           "application/json; charset=UTF-8",
@@ -151,23 +158,34 @@ async function fetchServiceJSON(
       )
     );
 
+
   const text =
     await response.text();
 
-  if (!response.ok) {
+
+  if (
+    !response.ok
+  ) {
 
     throw new Error(
       `HTTP ${response.status} ${path}: ${text.slice(0, 500)}`
     );
   }
 
-  if (!text.trim()) {
+
+  if (
+    !text.trim()
+  ) {
+
     return {};
   }
 
+
   try {
 
-    return JSON.parse(text);
+    return JSON.parse(
+      text
+    );
 
   } catch {
 
@@ -200,7 +218,9 @@ function normalizeText(
   value: any
 ): string {
 
-  return safeString(value)
+  return safeString(
+    value
+  )
     .normalize("NFD")
     .replace(
       /[\u0300-\u036f]/g,
@@ -239,15 +259,21 @@ function splitMatchName(
 } {
 
   const text =
-    safeString(value);
+    safeString(
+      value
+    );
 
-  if (!text) {
+
+  if (
+    !text
+  ) {
 
     return {
       home: null,
       away: null
     };
   }
+
 
   const separators = [
     " - ",
@@ -256,6 +282,7 @@ function splitMatchName(
     " VS ",
     " @ "
   ];
+
 
   for (
     const separator
@@ -267,7 +294,10 @@ function splitMatchName(
         separator
       );
 
-    if (index >= 0) {
+
+    if (
+      index >= 0
+    ) {
 
       return {
 
@@ -290,12 +320,17 @@ function splitMatchName(
     }
   }
 
+
   return {
     home: null,
     away: null
   };
 }
 
+
+// ============================================================
+// HOME
+// ============================================================
 
 function extractHome(
   match: AnyObj
@@ -305,29 +340,37 @@ function extractHome(
     typeof match?.home ===
     "string"
   ) {
+
     return match.home.trim();
   }
+
 
   if (
     typeof match?.homeTeam ===
     "string"
   ) {
+
     return match.homeTeam.trim();
   }
+
 
   if (
     typeof match?.home_name ===
     "string"
   ) {
+
     return match.home_name.trim();
   }
+
 
   if (
     typeof match?.home?.name ===
     "string"
   ) {
+
     return match.home.name.trim();
   }
+
 
   return (
     splitMatchName(
@@ -339,6 +382,10 @@ function extractHome(
 }
 
 
+// ============================================================
+// AWAY
+// ============================================================
+
 function extractAway(
   match: AnyObj
 ): string {
@@ -347,29 +394,37 @@ function extractAway(
     typeof match?.away ===
     "string"
   ) {
+
     return match.away.trim();
   }
+
 
   if (
     typeof match?.awayTeam ===
     "string"
   ) {
+
     return match.awayTeam.trim();
   }
+
 
   if (
     typeof match?.away_name ===
     "string"
   ) {
+
     return match.away_name.trim();
   }
+
 
   if (
     typeof match?.away?.name ===
     "string"
   ) {
+
     return match.away.name.trim();
   }
+
 
   return (
     splitMatchName(
@@ -381,6 +436,10 @@ function extractAway(
 }
 
 
+// ============================================================
+// DISPLAY MATCH
+// ============================================================
+
 function displayMatch(
   match: AnyObj
 ): string {
@@ -391,15 +450,26 @@ function displayMatch(
       match?.name
     );
 
-  if (direct) {
+
+  if (
+    direct
+  ) {
+
     return direct;
   }
 
+
   const home =
-    extractHome(match);
+    extractHome(
+      match
+    );
+
 
   const away =
-    extractAway(match);
+    extractAway(
+      match
+    );
+
 
   return `${home} - ${away}`;
 }
@@ -532,16 +602,27 @@ const TEAM_ALIASES:
 };
 
 
+// ============================================================
+// APPLY ALIASES
+// ============================================================
+
 function applyAliases(
   value: string
 ): string {
 
   let result =
-    normalizeText(value);
+    normalizeText(
+      value
+    );
 
-  if (!result) {
+
+  if (
+    !result
+  ) {
+
     return "";
   }
+
 
   const aliases =
     Object.keys(
@@ -551,6 +632,7 @@ function applyAliases(
         b.length -
         a.length
     );
+
 
   for (
     const alias
@@ -563,11 +645,13 @@ function applyAliases(
         "\\$&"
       );
 
+
     const regex =
       new RegExp(
         `(^|\\s)${escaped}(?=\\s|$)`,
         "g"
       );
+
 
     result =
       result.replace(
@@ -575,6 +659,7 @@ function applyAliases(
         `$1${TEAM_ALIASES[alias]}`
       );
   }
+
 
   return result
     .replace(
@@ -585,29 +670,44 @@ function applyAliases(
 }
 
 
+// ============================================================
+// NORMALIZE TEAM
+// ============================================================
+
 function normalizeTeam(
   value: any
 ): string {
 
   const normalized =
     applyAliases(
-      safeString(value)
+      safeString(
+        value
+      )
     );
 
-  if (!normalized) {
+
+  if (
+    !normalized
+  ) {
+
     return "";
   }
+
 
   return normalized
     .split(" ")
     .filter(Boolean)
     .filter(
       word =>
-        !GENERIC_WORDS.has(word)
+        !GENERIC_WORDS.has(
+          word
+        )
     )
     .filter(
       word =>
-        !/^\d+$/.test(word)
+        !/^\d+$/.test(
+          word
+        )
     )
     .join(" ")
     .trim();
@@ -636,21 +736,32 @@ function sameNormalizedTeam(
 ): boolean {
 
   const A =
-    normalizeTeam(a);
+    normalizeTeam(
+      a
+    );
+
 
   const B =
-    normalizeTeam(b);
+    normalizeTeam(
+      b
+    );
 
-  if (!A || !B) {
+
+  if (
+    !A ||
+    !B
+  ) {
+
     return false;
   }
+
 
   return A === B;
 }
 
 
 // ============================================================
-// EXTRACT TRACKER SIGNALS
+// TRACKER SIGNAL EXTRACTION
 // ============================================================
 
 function extractSignals(
@@ -662,32 +773,40 @@ function extractSignals(
       data?.signals
     )
   ) {
+
     return data.signals;
   }
+
 
   if (
     Array.isArray(
       data?.entries
     )
   ) {
+
     return data.entries;
   }
+
 
   if (
     Array.isArray(
       data?.hunter_entries
     )
   ) {
+
     return data.hunter_entries;
   }
+
 
   if (
     Array.isArray(
       data?.data
     )
   ) {
+
     return data.data;
   }
+
 
   return [];
 }
@@ -708,6 +827,7 @@ function isHunterEntry(
       signal?.signalType
     ).toUpperCase();
 
+
   return (
     type ===
     ALLOWED_SIGNAL_TYPE
@@ -716,7 +836,7 @@ function isHunterEntry(
 
 
 // ============================================================
-// SIGNAL
+// SIGNAL ID
 // ============================================================
 
 function signalMatchId(
@@ -731,6 +851,10 @@ function signalMatchId(
 }
 
 
+// ============================================================
+// SIGNAL NAME
+// ============================================================
+
 function signalMatchName(
   signal: AnyObj
 ): string {
@@ -742,6 +866,10 @@ function signalMatchName(
 }
 
 
+// ============================================================
+// SIGNAL HOME
+// ============================================================
+
 function signalHome(
   signal: AnyObj
 ): string {
@@ -751,6 +879,10 @@ function signalHome(
   );
 }
 
+
+// ============================================================
+// SIGNAL AWAY
+// ============================================================
 
 function signalAway(
   signal: AnyObj
@@ -775,24 +907,30 @@ function extractMatcherMatches(
       data?.matches
     )
   ) {
+
     return data.matches;
   }
+
 
   if (
     Array.isArray(
       data?.results
     )
   ) {
+
     return data.results;
   }
+
 
   if (
     Array.isArray(
       data?.matched
     )
   ) {
+
     return data.matched;
   }
+
 
   return [];
 }
@@ -801,31 +939,17 @@ function extractMatcherMatches(
 // ============================================================
 // SECURE MATCH VALIDATION
 //
-// V4.1 FIX
+// REQUIRED:
 //
-// V7-FH classification is authoritative for match quality.
-//
-// ACCEPT:
-//
-// CONFIDENT_MATCH
-// + valid V27 teams
-// + valid Cloudbet teams
-// + two-sided signal -> V27 validation
-// + positive matcher evidence
-//
-// REJECT:
-//
-// POSSIBLE_MATCH
-// FALSE_POSITIVE_RISK
-// REVERSED
-// score_only_match
-// zero matcher score
-// invalid teams
-// wrong signal direction
-//
-// secure_match=true is OPTIONAL because V7-FH itself already
-// exposes classification and scoring.
-//
+// 1. matcher success
+// 2. CONFIDENT_MATCH
+// 3. secure_match=true
+// 4. score_only_match=false
+// 5. valid matcher match
+// 6. both teams present
+// 7. signal teams compatible
+// 8. Cloudbet candidate exists
+// 9. EXACT_ID + score 0 rejected
 // ============================================================
 
 function validateSecureMatcherResult(
@@ -838,6 +962,7 @@ function validateSecureMatcherResult(
       matcherResult
     );
 
+
   const confidentFromRoot =
     Number(
       matcherResult?.confident_matched ??
@@ -845,10 +970,14 @@ function validateSecureMatcherResult(
       0
     );
 
+
   const rootSuccess =
     matcherResult?.success === true;
 
-  if (!rootSuccess) {
+
+  if (
+    !rootSuccess
+  ) {
 
     return {
 
@@ -860,6 +989,7 @@ function validateSecureMatcherResult(
     };
   }
 
+
   const candidates =
     matches.length
       ? matches
@@ -869,8 +999,10 @@ function validateSecureMatcherResult(
           : []
       );
 
+
   let selected:
     AnyObj | null = null;
+
 
   for (
     const item
@@ -882,32 +1014,37 @@ function validateSecureMatcherResult(
       item?.source ??
       item;
 
+
     const cloudbet =
       item?.cloudbet ??
       item?.matched ??
       item?.target ??
       null;
 
+
     const classification =
       safeString(
         item?.classification ??
-        item?.match_classification ??
-        item?.classification_type
+        item?.match_classification
       ).toUpperCase();
+
 
     const reason =
       safeString(
         item?.reason
       );
 
+
     const security =
       item?.security ??
       {};
+
 
     const scoring =
       item?.scoring ??
       item?.matcher_scoring ??
       {};
+
 
     const matcherScore =
       Number(
@@ -918,6 +1055,7 @@ function validateSecureMatcherResult(
         0
       );
 
+
     const method =
       safeString(
         item?.match_method ??
@@ -925,49 +1063,84 @@ function validateSecureMatcherResult(
         security?.match_method
       ).toUpperCase();
 
+
+    const secureFlag =
+      security?.secure_match === true ||
+      item?.secure_match === true;
+
+
     const scoreOnly =
       security?.score_only_match === true ||
       item?.score_only_match === true;
 
+
     const vHome =
-      extractHome(v27);
+      extractHome(
+        v27
+      );
+
 
     const vAway =
-      extractAway(v27);
+      extractAway(
+        v27
+      );
+
 
     const cHome =
       cloudbet
-        ? extractHome(cloudbet)
+        ? extractHome(
+            cloudbet
+          )
         : "";
+
 
     const cAway =
       cloudbet
-        ? extractAway(cloudbet)
+        ? extractAway(
+            cloudbet
+          )
         : "";
 
+
     // --------------------------------------------------------
-    // ONLY CONFIDENT_MATCH IS ALLOWED
+    // CLASSIFICATION
     // --------------------------------------------------------
 
     if (
       classification !==
       REQUIRED_MATCH_CLASSIFICATION
     ) {
+
       continue;
     }
 
+
     // --------------------------------------------------------
-    // SCORE ONLY IS NEVER ACCEPTED
+    // SCORE ONLY
     // --------------------------------------------------------
 
     if (
       scoreOnly
     ) {
+
       continue;
     }
 
+
     // --------------------------------------------------------
-    // BOTH V27 TEAMS REQUIRED
+    // SECURE FLAG
+    // --------------------------------------------------------
+
+    if (
+      !secureFlag
+    ) {
+
+      continue;
+    }
+
+
+    // --------------------------------------------------------
+    // V27 TEAMS
     // --------------------------------------------------------
 
     if (
@@ -976,11 +1149,13 @@ function validateSecureMatcherResult(
         vAway
       )
     ) {
+
       continue;
     }
 
+
     // --------------------------------------------------------
-    // CLOUDBET MATCH MUST EXIST
+    // CLOUDBET TEAMS
     // --------------------------------------------------------
 
     if (
@@ -990,26 +1165,13 @@ function validateSecureMatcherResult(
         cAway
       )
     ) {
+
       continue;
     }
 
-    // --------------------------------------------------------
-    // POSITIVE MATCHER EVIDENCE REQUIRED
-    //
-    // This prevents EXACT_ID + score 0.
-    // --------------------------------------------------------
-
-    if (
-      !Number.isFinite(
-        matcherScore
-      ) ||
-      matcherScore <= 0
-    ) {
-      continue;
-    }
 
     // --------------------------------------------------------
-    // EXACT_ID + SCORE 0 IS ALWAYS REJECTED
+    // EXACT ID SECURITY
     // --------------------------------------------------------
 
     if (
@@ -1017,18 +1179,26 @@ function validateSecureMatcherResult(
       "EXACT_ID" &&
       matcherScore <= 0
     ) {
+
       continue;
     }
 
+
     // --------------------------------------------------------
-    // SIGNAL -> V27 TWO-SIDED VALIDATION
+    // SIGNAL -> V27 DIRECTION
     // --------------------------------------------------------
 
     const sHome =
-      signalHome(signal);
+      signalHome(
+        signal
+      );
+
 
     const sAway =
-      signalAway(signal);
+      signalAway(
+        signal
+      );
+
 
     if (
       sHome &&
@@ -1045,21 +1215,15 @@ function validateSecureMatcherResult(
           vAway
         );
 
+
       if (
         !normalDirection
       ) {
+
         continue;
       }
     }
 
-    // --------------------------------------------------------
-    // CONFIDENT MATCH IS NOW SECURE
-    //
-    // IMPORTANT:
-    // secure_match flag from V7 is NOT mandatory.
-    // classification + scoring + two-sided validation
-    // provide the required security evidence.
-    // --------------------------------------------------------
 
     selected = {
 
@@ -1078,17 +1242,19 @@ function validateSecureMatcherResult(
       score_only_match:
         false,
 
-      reason:
-        reason ||
-        "CONFIDENT_MATCH_TWO_SIDED_VALIDATED",
+      reason,
 
       v27: {
 
         id:
-          extractMatchId(v27),
+          extractMatchId(
+            v27
+          ),
 
         match:
-          displayMatch(v27),
+          displayMatch(
+            v27
+          ),
 
         home:
           vHome,
@@ -1100,10 +1266,14 @@ function validateSecureMatcherResult(
       cloudbet: {
 
         id:
-          extractMatchId(cloudbet),
+          extractMatchId(
+            cloudbet
+          ),
 
         match:
-          displayMatch(cloudbet),
+          displayMatch(
+            cloudbet
+          ),
 
         home:
           cHome,
@@ -1113,8 +1283,10 @@ function validateSecureMatcherResult(
       }
     };
 
+
     break;
   }
+
 
   if (
     !selected
@@ -1132,6 +1304,7 @@ function validateSecureMatcherResult(
         confidentFromRoot
     };
   }
+
 
   return {
 
@@ -1159,28 +1332,38 @@ function extractCloudbetMatches(
       data?.matches
     )
   ) {
+
     return data.matches;
   }
+
 
   if (
     Array.isArray(
       data?.live_matches
     )
   ) {
+
     return data.live_matches;
   }
+
 
   if (
     Array.isArray(
       data?.events
     )
   ) {
+
     return data.events;
   }
+
 
   return [];
 }
 
+
+// ============================================================
+// CLOUDBET LIVE
+// ============================================================
 
 function isCloudbetLive(
   match: AnyObj
@@ -1191,18 +1374,23 @@ function isCloudbetLive(
       match?.status
     ).toUpperCase();
 
+
   if (
     status ===
     "TRADING_LIVE"
   ) {
+
     return true;
   }
+
 
   if (
     match?.live === true
   ) {
+
     return true;
   }
+
 
   return false;
 }
@@ -1220,7 +1408,10 @@ function verifyCloudbetMatch(
   const target =
     secureMatcher?.cloudbet;
 
-  if (!target) {
+
+  if (
+    !target
+  ) {
 
     return {
 
@@ -1232,20 +1423,24 @@ function verifyCloudbetMatch(
     };
   }
 
+
   const targetId =
     safeString(
       target?.id
     );
+
 
   const targetHome =
     normalizeTeam(
       target?.home
     );
 
+
   const targetAway =
     normalizeTeam(
       target?.away
     );
+
 
   if (
     !targetHome ||
@@ -1262,9 +1457,11 @@ function verifyCloudbetMatch(
     };
   }
 
-  // ----------------------------------------------------------
-  // EXACT CLOUD BET ID + TEAMS
-  // ----------------------------------------------------------
+
+  // ==========================================================
+  // FIRST:
+  // EXACT CLOUDBET ID + TEAMS
+  // ==========================================================
 
   if (
     targetId
@@ -1276,7 +1473,10 @@ function verifyCloudbetMatch(
     ) {
 
       const cbId =
-        extractMatchId(cb);
+        extractMatchId(
+          cb
+        );
+
 
       if (
         cbId &&
@@ -1285,17 +1485,25 @@ function verifyCloudbetMatch(
 
         const cbHome =
           normalizeTeam(
-            extractHome(cb)
+            extractHome(
+              cb
+            )
           );
+
 
         const cbAway =
           normalizeTeam(
-            extractAway(cb)
+            extractAway(
+              cb
+            )
           );
 
+
         if (
-          cbHome === targetHome &&
-          cbAway === targetAway
+          cbHome ===
+            targetHome &&
+          cbAway ===
+            targetAway
         ) {
 
           return {
@@ -1314,9 +1522,11 @@ function verifyCloudbetMatch(
     }
   }
 
-  // ----------------------------------------------------------
-  // EXACT TWO-SIDED TEAM VALIDATION
-  // ----------------------------------------------------------
+
+  // ==========================================================
+  // SECOND:
+  // EXACT TWO-SIDED TEAMS
+  // ==========================================================
 
   for (
     const cb
@@ -1325,17 +1535,25 @@ function verifyCloudbetMatch(
 
     const cbHome =
       normalizeTeam(
-        extractHome(cb)
+        extractHome(
+          cb
+        )
       );
+
 
     const cbAway =
       normalizeTeam(
-        extractAway(cb)
+        extractAway(
+          cb
+        )
       );
 
+
     if (
-      cbHome === targetHome &&
-      cbAway === targetAway
+      cbHome ===
+        targetHome &&
+      cbAway ===
+        targetAway
     ) {
 
       return {
@@ -1351,6 +1569,7 @@ function verifyCloudbetMatch(
       };
     }
   }
+
 
   return {
 
@@ -1376,8 +1595,12 @@ function buildPreparedBet(
   const cb =
     cloudbetVerification.match;
 
+
   const signalId =
-    signalMatchId(signal);
+    signalMatchId(
+      signal
+    );
+
 
   return {
 
@@ -1401,6 +1624,7 @@ function buildPreparedBet(
     line:
       TARGET_LINE,
 
+
     signal: {
 
       type:
@@ -1419,11 +1643,15 @@ function buildPreparedBet(
         null,
 
       home:
-        signalHome(signal) ||
+        signalHome(
+          signal
+        ) ||
         null,
 
       away:
-        signalAway(signal) ||
+        signalAway(
+          signal
+        ) ||
         null,
 
       entry_minute:
@@ -1442,10 +1670,13 @@ function buildPreparedBet(
         null
     },
 
+
     cloudbet: {
 
       id:
-        extractMatchId(cb) ||
+        extractMatchId(
+          cb
+        ) ||
         null,
 
       key:
@@ -1453,13 +1684,19 @@ function buildPreparedBet(
         null,
 
       match:
-        displayMatch(cb),
+        displayMatch(
+          cb
+        ),
 
       home:
-        extractHome(cb),
+        extractHome(
+          cb
+        ),
 
       away:
-        extractAway(cb),
+        extractAway(
+          cb
+        ),
 
       status:
         cb?.status ??
@@ -1482,6 +1719,7 @@ function buildPreparedBet(
         null
     },
 
+
     matcher: {
 
       classification:
@@ -1497,6 +1735,7 @@ function buildPreparedBet(
         secureMatcher.reason
     },
 
+
     security: {
 
       secure_match:
@@ -1504,9 +1743,6 @@ function buildPreparedBet(
 
       score_only_match:
         false,
-
-      exact_id_alone_is_not_secure:
-        true,
 
       exact_id_requires_positive_matcher_score:
         true,
@@ -1527,6 +1763,7 @@ function buildPreparedBet(
         TOKEN_TEAM_MIN_SCORE
     },
 
+
     action:
       "NO_BET_IN_V4_READY"
   };
@@ -1545,9 +1782,10 @@ async function runV4(
   const started =
     Date.now();
 
-  // ----------------------------------------------------------
-  // TRACKER
-  // ----------------------------------------------------------
+
+  // ==========================================================
+  // TRACKER — ONE CALL
+  // ==========================================================
 
   const trackerData =
     await fetchServiceJSON(
@@ -1555,19 +1793,22 @@ async function runV4(
       "/entries"
     );
 
+
   const allSignals =
     extractSignals(
       trackerData
     );
+
 
   const hunterEntries =
     allSignals.filter(
       isHunterEntry
     );
 
-  // ----------------------------------------------------------
+
+  // ==========================================================
   // NO ACTIVE SIGNALS
-  // ----------------------------------------------------------
+  // ==========================================================
 
   if (
     hunterEntries.length === 0
@@ -1590,6 +1831,7 @@ async function runV4(
       betting:
         "DISABLED",
 
+
       bindings: {
 
         TRACKER:
@@ -1602,17 +1844,6 @@ async function runV4(
           true
       },
 
-      security: {
-
-        secure_matching:
-          true,
-
-        score_only_matching:
-          false,
-
-        token_team_min_score:
-          TOKEN_TEAM_MIN_SCORE
-      },
 
       target: {
 
@@ -1629,6 +1860,38 @@ async function runV4(
           TARGET_LINE
       },
 
+
+      security: {
+
+        secure_matching:
+          true,
+
+        score_only_matching:
+          false,
+
+        token_team_min_score:
+          TOKEN_TEAM_MIN_SCORE,
+
+        exact_id_alone_is_not_secure:
+          true,
+
+        exact_id_requires_positive_matcher_score:
+          true,
+
+        required_match_classification:
+          REQUIRED_MATCH_CLASSIFICATION,
+
+        required_secure_match:
+          REQUIRED_SECURE_MATCH,
+
+        two_sided_team_validation:
+          true,
+
+        cloudbet_second_verification:
+          true
+      },
+
+
       tracker: {
 
         endpoint:
@@ -1644,6 +1907,7 @@ async function runV4(
           false
       },
 
+
       matcher: {
 
         called:
@@ -1652,6 +1916,7 @@ async function runV4(
         reason:
           "NO_ACTIVE_HUNTER_ENTRIES"
       },
+
 
       cloudbet: {
 
@@ -1662,12 +1927,19 @@ async function runV4(
           "NO_ACTIVE_HUNTER_ENTRIES"
       },
 
+
       stats: {
 
         signals_received:
           allSignals.length,
 
         hunter_entries:
+          0,
+
+        matcher_secure_matches:
+          0,
+
+        cloudbet_verified_matches:
           0,
 
         bets_ready:
@@ -1681,11 +1953,30 @@ async function runV4(
           started
       },
 
+
       prepared_bets:
         [],
 
+      no_match:
+        [],
+
+
+      optimization: {
+
+        tracker_calls:
+          1,
+
+        matcher_calls:
+          0,
+
+        cloudbet_live_calls:
+          0
+      },
+
+
       message:
         "No active HUNTER_ENTRY signals. No matcher or Cloudbet verification was performed. No bet can be placed.",
+
 
       timestamp:
         new Date().toISOString()
@@ -1693,9 +1984,9 @@ async function runV4(
   }
 
 
-  // ----------------------------------------------------------
-  // MATCHER
-  // ----------------------------------------------------------
+  // ==========================================================
+  // MATCHER — ONE CALL
+  // ==========================================================
 
   const matcherData =
     await fetchServiceJSON(
@@ -1703,38 +1994,93 @@ async function runV4(
       `/match?threshold=${MATCHER_THRESHOLD}`
     );
 
+
   const matcherMatches =
     extractMatcherMatches(
       matcherData
     );
 
+
+  // ==========================================================
+  // CLOUDBET — ONE CALL
+  //
+  // THIS IS THE MAIN V4.2 SPEED FIX.
+  //
+  // OLD:
+  //
+  // for every secure signal:
+  //     CLOUDBET /live
+  //
+  // NEW:
+  //
+  // CLOUDBET /live ONCE
+  // then reuse liveCloudbet
+  // for every signal.
+  // ==========================================================
+
+  const cloudbetData =
+    await fetchServiceJSON(
+      env.CLOUDBET,
+      "/live"
+    );
+
+
+  const rawCloudbet =
+    extractCloudbetMatches(
+      cloudbetData
+    );
+
+
+  const liveCloudbet =
+    rawCloudbet.filter(
+      isCloudbetLive
+    );
+
+
+  // ==========================================================
+  // RESULT ARRAYS
+  // ==========================================================
+
   const preparedBets:
     AnyObj[] = [];
+
 
   const noMatch:
     AnyObj[] = [];
 
+
   let matcherSecureMatches =
     0;
+
 
   let cloudbetVerifiedMatches =
     0;
 
 
-  // ----------------------------------------------------------
-  // EACH SIGNAL
-  // ----------------------------------------------------------
+  // ==========================================================
+  // PROCESS EVERY HUNTER SIGNAL
+  // LOCALLY
+  // ==========================================================
 
   for (
     const signal
     of hunterEntries
   ) {
 
+    // --------------------------------------------------------
+    // MATCHER SECURITY
+    // --------------------------------------------------------
+
     const secureMatcher =
       validateSecureMatcherResult(
         signal,
         matcherData
       );
+
+
+    // --------------------------------------------------------
+    // MATCHER FAILED
+    // --------------------------------------------------------
 
     if (
       !secureMatcher.secure
@@ -1760,6 +2106,7 @@ async function runV4(
         line:
           TARGET_LINE,
 
+
         signal: {
 
           type:
@@ -1776,14 +2123,19 @@ async function runV4(
           match_id:
             signalMatchId(
               signal
-            ) || null,
+            ) ||
+            null,
 
           home:
-            signalHome(signal) ||
+            signalHome(
+              signal
+            ) ||
             null,
 
           away:
-            signalAway(signal) ||
+            signalAway(
+              signal
+            ) ||
             null,
 
           entry_minute:
@@ -1801,8 +2153,10 @@ async function runV4(
             null
         },
 
+
         cloudbet:
           null,
+
 
         matcher_scoring: {
 
@@ -1810,8 +2164,10 @@ async function runV4(
             0
         },
 
+
         matcher_match:
           null,
+
 
         security: {
 
@@ -1824,43 +2180,41 @@ async function runV4(
           score_only_match:
             false,
 
+          cloudbet_verified:
+            false,
+
           minimum_score_for_token_match:
             TOKEN_TEAM_MIN_SCORE
         },
 
+
         action:
           "NO_BET_IN_V4",
+
 
         reason:
           secureMatcher.reason
       });
 
+
       continue;
     }
 
+
+    // --------------------------------------------------------
+    // SECURE MATCH
+    // --------------------------------------------------------
 
     matcherSecureMatches++;
 
 
     // --------------------------------------------------------
-    // CLOUDBET
+    // CLOUDBET VERIFICATION
+    //
+    // NO NETWORK REQUEST HERE.
+    //
+    // Uses the single /live response.
     // --------------------------------------------------------
-
-    const cloudbetData =
-      await fetchServiceJSON(
-        env.CLOUDBET,
-        "/live"
-      );
-
-    const rawCloudbet =
-      extractCloudbetMatches(
-        cloudbetData
-      );
-
-    const liveCloudbet =
-      rawCloudbet.filter(
-        isCloudbetLive
-      );
 
     const cloudbetVerification =
       verifyCloudbetMatch(
@@ -1868,6 +2222,10 @@ async function runV4(
         liveCloudbet
       );
 
+
+    // --------------------------------------------------------
+    // CLOUDBET FAILED
+    // --------------------------------------------------------
 
     if (
       !cloudbetVerification.verified
@@ -1893,6 +2251,7 @@ async function runV4(
         line:
           TARGET_LINE,
 
+
         signal: {
 
           type:
@@ -1909,14 +2268,19 @@ async function runV4(
           match_id:
             signalMatchId(
               signal
-            ) || null,
+            ) ||
+            null,
 
           home:
-            signalHome(signal) ||
+            signalHome(
+              signal
+            ) ||
             null,
 
           away:
-            signalAway(signal) ||
+            signalAway(
+              signal
+            ) ||
             null,
 
           entry_minute:
@@ -1934,8 +2298,10 @@ async function runV4(
             null
         },
 
+
         cloudbet:
           null,
+
 
         matcher_scoring: {
 
@@ -1943,9 +2309,11 @@ async function runV4(
             secureMatcher.matcher_score
         },
 
+
         matcher_match:
           secureMatcher.cloudbet ??
           null,
+
 
         security: {
 
@@ -1965,16 +2333,23 @@ async function runV4(
             TOKEN_TEAM_MIN_SCORE
         },
 
+
         action:
           "NO_BET_IN_V4",
+
 
         reason:
           cloudbetVerification.reason
       });
 
+
       continue;
     }
 
+
+    // --------------------------------------------------------
+    // CLOUDBET VERIFIED
+    // --------------------------------------------------------
 
     cloudbetVerifiedMatches++;
 
@@ -1993,9 +2368,9 @@ async function runV4(
   }
 
 
-  // ----------------------------------------------------------
+  // ==========================================================
   // RESPONSE
-  // ----------------------------------------------------------
+  // ==========================================================
 
   return json({
 
@@ -2014,6 +2389,7 @@ async function runV4(
     betting:
       "DISABLED",
 
+
     bindings: {
 
       TRACKER:
@@ -2025,6 +2401,7 @@ async function runV4(
       CLOUDBET:
         true
     },
+
 
     target: {
 
@@ -2040,6 +2417,7 @@ async function runV4(
       line:
         TARGET_LINE
     },
+
 
     security: {
 
@@ -2071,6 +2449,7 @@ async function runV4(
         true
     },
 
+
     tracker: {
 
       endpoint:
@@ -2082,6 +2461,7 @@ async function runV4(
       hunter_entries:
         hunterEntries.length
     },
+
 
     matcher: {
 
@@ -2108,14 +2488,22 @@ async function runV4(
         matcherSecureMatches
     },
 
+
     cloudbet: {
 
       called:
         true,
 
+      raw_matches:
+        rawCloudbet.length,
+
+      live_matches:
+        liveCloudbet.length,
+
       verified_matches:
         cloudbetVerifiedMatches
     },
+
 
     stats: {
 
@@ -2145,14 +2533,40 @@ async function runV4(
         started
     },
 
+
+    optimization: {
+
+      version:
+        VERSION,
+
+      tracker_calls:
+        1,
+
+      matcher_calls:
+        1,
+
+      cloudbet_live_calls:
+        1,
+
+      cloudbet_reused_for_all_signals:
+        true,
+
+      sequential_cloudbet_calls_per_signal:
+        false
+    },
+
+
     prepared_bets:
       preparedBets,
+
 
     no_match:
       noMatch,
 
+
     message:
-      "READ ONLY secure betting preparation worker. No bet can be placed.",
+      "READ ONLY optimized secure betting preparation worker. Cloudbet /live is fetched once and reused for all signals. No bet can be placed.",
+
 
     timestamp:
       new Date().toISOString()
@@ -2183,6 +2597,7 @@ function health(): Response {
     betting:
       "DISABLED",
 
+
     bindings: {
 
       TRACKER:
@@ -2194,6 +2609,7 @@ function health(): Response {
       CLOUDBET:
         true
     },
+
 
     security: {
 
@@ -2222,6 +2638,26 @@ function health(): Response {
         TOKEN_TEAM_MIN_SCORE
     },
 
+
+    optimization: {
+
+      version:
+        VERSION,
+
+      tracker_calls:
+        1,
+
+      matcher_calls:
+        1,
+
+      cloudbet_live_calls:
+        1,
+
+      cloudbet_reused_for_all_signals:
+        true
+    },
+
+
     endpoints: {
 
       tracker:
@@ -2234,6 +2670,7 @@ function health(): Response {
         "/live"
     },
 
+
     rules: {
 
       no_active_signals:
@@ -2242,16 +2679,10 @@ function health(): Response {
       matcher:
         "CONFIDENT_MATCH required",
 
-      possible_match:
-        "POSSIBLE_MATCH is rejected",
-
-      false_positive:
-        "FALSE_POSITIVE_RISK is rejected",
-
       exact_id:
         "EXACT_ID alone is not sufficient",
 
-      exact_id_score_zero:
+      matcher_score:
         "EXACT_ID with matcher score 0 is rejected",
 
       score_only:
@@ -2260,18 +2691,20 @@ function health(): Response {
       teams:
         "Both home and away must be present and compatible",
 
-      signal_direction:
-        "Signal home/away must match V27 home/away direction",
-
       cloudbet:
         "Cloudbet live event must be independently verified",
+
+      cloudbet_fetch:
+        "Cloudbet /live is called once per worker execution",
 
       betting:
         "DISABLED"
     },
 
+
     message:
-      "V4.1 secure signal-to-matcher-to-Cloudbet preparation worker is healthy.",
+      "V4.2 optimized secure signal-to-matcher-to-Cloudbet preparation worker is healthy.",
+
 
     timestamp:
       new Date().toISOString()
@@ -2295,19 +2728,21 @@ export default {
         request.url
       );
 
+
     const path =
       url.pathname
         .replace(
           /\/+$/,
           ""
-        ) || "/";
+        ) ||
+      "/";
 
 
     try {
 
-      // --------------------------------------------------------
+      // ------------------------------------------------------
       // HEALTH
-      // --------------------------------------------------------
+      // ------------------------------------------------------
 
       if (
         path === "/" ||
@@ -2318,9 +2753,9 @@ export default {
       }
 
 
-      // --------------------------------------------------------
+      // ------------------------------------------------------
       // MATCH / PREPARE
-      // --------------------------------------------------------
+      // ------------------------------------------------------
 
       if (
         path === "/match" ||
@@ -2335,9 +2770,9 @@ export default {
       }
 
 
-      // --------------------------------------------------------
+      // ------------------------------------------------------
       // DIAGNOSTIC
-      // --------------------------------------------------------
+      // ------------------------------------------------------
 
       if (
         path === "/diagnostic" ||
@@ -2351,9 +2786,9 @@ export default {
       }
 
 
-      // --------------------------------------------------------
+      // ------------------------------------------------------
       // UNKNOWN
-      // --------------------------------------------------------
+      // ------------------------------------------------------
 
       return json(
 
