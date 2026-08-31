@@ -1,10 +1,9 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7-FH
+// CLOUDBET MATCH MATCHER V7-FH FIXED
 // V27 + CLOUDBET SERVICE BINDINGS
 // READ ONLY
 //
-// V7-FH FIXED:
-//
+// FIX:
 // 1. FIRST-HALF INPUT FILTER
 // 2. V27 FIRST-HALF / FILTERED SPLIT
 // 3. CLOUDBET FIRST-HALF FILTER
@@ -21,11 +20,13 @@
 // 14. V27_COUNTERPART_FILTERED
 // 15. NO_V27_COUNTERPART
 // 16. EXACT ID ALONE IS NEVER SECURITY
-// 17. READ ONLY
+// 17. HUNTER TARGET-SPECIFIC MATCHING
+// 18. HUNTER MATCHING IS NOT BLOCKED BY usedCloudbetIds
+// 19. DETAILED TARGET SCORING
+// 20. READ ONLY
 //
 // IMPORTANT:
-// Matcher scoring thresholds remain unchanged.
-// The fix improves candidate discovery and exact/alias linking.
+// Secure thresholds remain unchanged.
 // ============================================================
 
 interface Env {
@@ -240,8 +241,7 @@ function applyTeamAliases(value: string): string {
 
   for (const alias of aliases) {
 
-    const canonical =
-      TEAM_ALIASES[alias];
+    const canonical = TEAM_ALIASES[alias];
 
     const regex = new RegExp(
       `(^|\\s)${alias.replace(
@@ -313,10 +313,9 @@ function levenshtein(
 
   if (!b.length) return a.length;
 
-  let prev =
-    new Array<number>(
-      b.length + 1
-    );
+  let prev = new Array<number>(
+    b.length + 1
+  );
 
   for (
     let j = 0;
@@ -1214,22 +1213,80 @@ function countrySimilarity(
 
 
 // ============================================================
-// NEW FIX:
-// DIRECT TWO-SIDED NORMALIZED TEAM MATCH
-//
-// This is intentionally BEFORE token/fuzzy candidate selection.
-//
-// It allows:
-//
-// V27:
-//   Aberystwyth - Llanelli
-//
-// Cloudbet:
-//   Aberystwyth FC - Llanelli AFC
-//
-// to reach detailed scoring even when the raw IDs differ.
-//
-// Security is still decided by detailedMatchScore + classifyMatch.
+// PREPARED
+// ============================================================
+
+interface PreparedMatch {
+
+  raw: AnyObj;
+
+  id: string;
+
+  home: string;
+
+  away: string;
+
+  normalizedHome: string;
+
+  normalizedAway: string;
+
+  homeTokens: string[];
+
+  awayTokens: string[];
+
+  homeCategory: string;
+
+  awayCategory: string;
+}
+
+
+function prepareMatch(
+  match: AnyObj
+): PreparedMatch {
+
+  const home =
+    extractHome(match) ?? "";
+
+  const away =
+    extractAway(match) ?? "";
+
+  return {
+
+    raw: match,
+
+    id: String(
+      match?.id ??
+      match?.key ??
+      ""
+    ),
+
+    home,
+
+    away,
+
+    normalizedHome:
+      normalizeTeam(home),
+
+    normalizedAway:
+      normalizeTeam(away),
+
+    homeTokens:
+      [...teamTokens(home)],
+
+    awayTokens:
+      [...teamTokens(away)],
+
+    homeCategory:
+      teamCategory(home),
+
+    awayCategory:
+      teamCategory(away)
+  };
+}
+
+
+// ============================================================
+// DIRECT TWO-SIDED NORMALIZED MATCH
 // ============================================================
 
 function directTwoSidedMatch(
@@ -1264,31 +1321,17 @@ function directTwoSidedMatch(
     return false;
   }
 
-  const normalHome =
+  return (
     v27.normalizedHome ===
-    cb.normalizedHome;
-
-  const normalAway =
+      cb.normalizedHome &&
     v27.normalizedAway ===
-    cb.normalizedAway;
-
-  if (
-    normalHome &&
-    normalAway
-  ) {
-    return true;
-  }
-
-  return false;
+      cb.normalizedAway
+  );
 }
 
 
 // ============================================================
-// DIRECT ALIAS / TOKEN PAIR MATCH
-//
-// Requires both sides to have meaningful overlap.
-// This prevents a single common team token from creating
-// a candidate by itself.
+// DIRECT TWO-SIDED TOKEN MATCH
 // ============================================================
 
 function directTwoSidedTokenMatch(
@@ -1614,79 +1657,6 @@ function classifyMatch(
 
 
 // ============================================================
-// PREPARED
-// ============================================================
-
-interface PreparedMatch {
-
-  raw: AnyObj;
-
-  id: string;
-
-  home: string;
-
-  away: string;
-
-  normalizedHome: string;
-
-  normalizedAway: string;
-
-  homeTokens: string[];
-
-  awayTokens: string[];
-
-  homeCategory: string;
-
-  awayCategory: string;
-}
-
-
-function prepareMatch(
-  match: AnyObj
-): PreparedMatch {
-
-  const home =
-    extractHome(match) ?? "";
-
-  const away =
-    extractAway(match) ?? "";
-
-  return {
-
-    raw: match,
-
-    id: String(
-      match?.id ??
-      match?.key ??
-      ""
-    ),
-
-    home,
-
-    away,
-
-    normalizedHome:
-      normalizeTeam(home),
-
-    normalizedAway:
-      normalizeTeam(away),
-
-    homeTokens:
-      [...teamTokens(home)],
-
-    awayTokens:
-      [...teamTokens(away)],
-
-    homeCategory:
-      teamCategory(home),
-
-    awayCategory:
-      teamCategory(away)
-  };
-}
-
-
-// ============================================================
 // TOKEN INDEX
 // ============================================================
 
@@ -1752,24 +1722,17 @@ function getCandidates(
     new Set<number>();
 
 
-  // ----------------------------------------------------------
-  // FIX 1:
-  // Direct two-sided normalized match.
-  // ----------------------------------------------------------
-
+  // DIRECT TWO-SIDED NORMALIZED
   for (
     let i = 0;
     i < cloudbet.length;
     i++
   ) {
-
-    const cb =
-      cloudbet[i];
 
     if (
       directTwoSidedMatch(
         v27,
-        cb
+        cloudbet[i]
       )
     ) {
       candidateSet.add(i);
@@ -1777,24 +1740,17 @@ function getCandidates(
   }
 
 
-  // ----------------------------------------------------------
-  // FIX 2:
-  // Two-sided token/alias candidate.
-  // ----------------------------------------------------------
-
+  // DIRECT TWO-SIDED TOKEN
   for (
     let i = 0;
     i < cloudbet.length;
     i++
   ) {
 
-    const cb =
-      cloudbet[i];
-
     if (
       directTwoSidedTokenMatch(
         v27,
-        cb
+        cloudbet[i]
       )
     ) {
       candidateSet.add(i);
@@ -1802,10 +1758,7 @@ function getCandidates(
   }
 
 
-  // ----------------------------------------------------------
-  // Existing token index.
-  // ----------------------------------------------------------
-
+  // TOKEN INDEX
   const vTokens =
     new Set([
       ...v27.homeTokens,
@@ -1829,10 +1782,7 @@ function getCandidates(
   }
 
 
-  // ----------------------------------------------------------
-  // Limited fallback.
-  // ----------------------------------------------------------
-
+  // LIMITED FALLBACK
   if (
     !candidateSet.size
   ) {
@@ -1973,6 +1923,196 @@ function findBestMatch(
   return {
 
     matched:
+      classification.classification ===
+      "CONFIDENT_MATCH",
+
+    best,
+
+    score:
+      bestDetail.total,
+
+    detail:
+      bestDetail,
+
+    classification:
+      classification.classification,
+
+    reason:
+      classification.reason,
+
+    candidateEvaluations
+  };
+}
+
+
+// ============================================================
+// TARGET-SPECIFIC HUNTER MATCHING
+//
+// IMPORTANT:
+// This function DOES NOT use usedCloudbetIds.
+//
+// A Hunter signal is an independent target.
+// The global V27 -> Cloudbet matching pass cannot consume
+// the Cloudbet event before this signal is verified.
+// ============================================================
+
+function findHunterTargetMatch(
+  signal: AnyObj,
+  cloudbet: PreparedMatch[],
+  tokenIndex: Map<string, number[]>,
+  threshold: number
+) {
+
+  const signalHome =
+    String(
+      signal?.home ??
+      ""
+    ).trim();
+
+  const signalAway =
+    String(
+      signal?.away ??
+      ""
+    ).trim();
+
+  if (
+    !signalHome ||
+    !signalAway
+  ) {
+
+    return {
+
+      found: false,
+
+      best: null,
+
+      score: 0,
+
+      detail: null,
+
+      classification:
+        "TRUE_UNMATCHED",
+
+      reason:
+        "HUNTER_SIGNAL_MISSING_HOME_OR_AWAY",
+
+      candidateEvaluations: 0
+    };
+  }
+
+
+  const target: PreparedMatch =
+    prepareMatch({
+
+      id:
+        signal?.match_id ??
+        "",
+
+      home:
+        signalHome,
+
+      away:
+        signalAway,
+
+      match:
+        `${signalHome} - ${signalAway}`
+    });
+
+
+  const candidates =
+    getCandidates(
+      target,
+      cloudbet,
+      tokenIndex
+    );
+
+
+  let best:
+    PreparedMatch | null =
+    null;
+
+  let bestDetail:
+    AnyObj | null =
+    null;
+
+  let bestScore = 0;
+
+  let candidateEvaluations = 0;
+
+
+  for (
+    const index of candidates
+  ) {
+
+    const cb =
+      cloudbet[index];
+
+    if (!cb) continue;
+
+    candidateEvaluations++;
+
+
+    const detail =
+      detailedMatchScore(
+        target.raw,
+        cb.raw
+      );
+
+
+    if (
+      !bestDetail ||
+      detail.total >
+      bestScore
+    ) {
+
+      best =
+        cb;
+
+      bestDetail =
+        detail;
+
+      bestScore =
+        detail.total;
+    }
+  }
+
+
+  if (
+    !best ||
+    !bestDetail
+  ) {
+
+    return {
+
+      found: false,
+
+      best: null,
+
+      score: 0,
+
+      detail: null,
+
+      classification:
+        "TRUE_UNMATCHED",
+
+      reason:
+        "NO_CLOUDBET_CANDIDATE_FOR_HUNTER_TARGET",
+
+      candidateEvaluations
+    };
+  }
+
+
+  const classification =
+    classifyMatch(
+      bestDetail,
+      threshold
+    );
+
+
+  return {
+
+    found:
       classification.classification ===
       "CONFIDENT_MATCH",
 
@@ -2221,15 +2361,7 @@ function scoringRecord(
 
 
 // ============================================================
-// V27 COUNTERPART SEARCH
-//
-// FIX:
-// The counterpart search now performs a direct two-sided
-// normalized/alias candidate check before full scoring.
-//
-// ALL V27 is still searched here, including filtered 2H.
-//
-// Security still requires CONFIDENT_MATCH.
+// V27 COUNTERPART
 // ============================================================
 
 function findV27Counterpart(
@@ -2247,22 +2379,19 @@ function findV27Counterpart(
     null;
 
 
-  // ----------------------------------------------------------
-  // PASS 1:
-  // Direct two-sided normalized/alias candidate.
-  // ----------------------------------------------------------
-
+  // PASS 1
   for (
     const v27 of allV27
   ) {
 
-    const direct =
-      directTwoSidedMatch(
+    if (
+      !directTwoSidedMatch(
         v27,
         cloudbetMatch
-      );
-
-    if (!direct) continue;
+      )
+    ) {
+      continue;
+    }
 
 
     const detail =
@@ -2287,11 +2416,7 @@ function findV27Counterpart(
   }
 
 
-  // ----------------------------------------------------------
-  // PASS 2:
-  // Two-sided team candidate.
-  // ----------------------------------------------------------
-
+  // PASS 2
   if (!bestDetail) {
 
     for (
@@ -2331,11 +2456,7 @@ function findV27Counterpart(
   }
 
 
-  // ----------------------------------------------------------
-  // PASS 3:
-  // Full controlled scoring fallback.
-  // ----------------------------------------------------------
-
+  // PASS 3
   if (!bestDetail) {
 
     for (
@@ -2433,7 +2554,7 @@ function findV27Counterpart(
 
 
 // ============================================================
-// CLOUDBET-ONLY RECORD
+// CLOUDBET ONLY
 // ============================================================
 
 function buildCloudbetOnlyRecord(
@@ -2578,6 +2699,110 @@ function buildCloudbetOnlyRecord(
 
 
 // ============================================================
+// HUNTER SIGNAL EXTRACTION
+// ============================================================
+
+function extractHunterSignals(
+  data: any
+): AnyObj[] {
+
+  if (
+    Array.isArray(
+      data?.hunter_entries
+    )
+  ) {
+    return data.hunter_entries;
+  }
+
+  if (
+    Array.isArray(
+      data?.entries
+    )
+  ) {
+    return data.entries;
+  }
+
+  if (
+    Array.isArray(
+      data?.signals
+    )
+  ) {
+    return data.signals;
+  }
+
+  return [];
+}
+
+
+function normalizeHunterSignal(
+  item: AnyObj
+): AnyObj | null {
+
+  const signal =
+    item?.signal ??
+    item;
+
+  if (
+    !signal ||
+    typeof signal !== "object"
+  ) {
+    return null;
+  }
+
+  const home =
+    signal?.home ??
+    signal?.homeTeam ??
+    signal?.home_name ??
+    "";
+
+  const away =
+    signal?.away ??
+    signal?.awayTeam ??
+    signal?.away_name ??
+    "";
+
+  const match =
+    signal?.match ??
+    signal?.name ??
+    `${home} - ${away}`;
+
+  if (
+    !String(home).trim() ||
+    !String(away).trim()
+  ) {
+    return null;
+  }
+
+  return {
+
+    ...signal,
+
+    home:
+      String(home).trim(),
+
+    away:
+      String(away).trim(),
+
+    match:
+      String(match).trim(),
+
+    match_id:
+      signal?.match_id ??
+      signal?.id ??
+      null,
+
+    entry_minute:
+      signal?.entry_minute ??
+      null,
+
+    hunter_score:
+      signal?.hunter_score ??
+      null
+  };
+}
+
+
+// ============================================================
 // MAIN
 // ============================================================
 
@@ -2675,6 +2900,63 @@ async function runMatcher(
     );
 
 
+  // ==========================================================
+  // HUNTER SIGNALS
+  //
+  // V4.2 can send the target list through:
+  // ?signals=[...] OR ?signals JSON body.
+  //
+  // If no explicit signals are provided, we also inspect V27.
+  // ==========================================================
+
+  let hunterSignals:
+    AnyObj[] = [];
+
+
+  const url =
+    new URL(
+      request.url
+    );
+
+
+  const signalParam =
+    url.searchParams.get(
+      "signals"
+    );
+
+
+  if (signalParam) {
+
+    try {
+
+      const parsed =
+        JSON.parse(
+          signalParam
+        );
+
+      if (
+        Array.isArray(parsed)
+      ) {
+        hunterSignals =
+          parsed
+            .map(
+              normalizeHunterSignal
+            )
+            .filter(
+              Boolean
+            ) as AnyObj[];
+      }
+
+    } catch {
+      // ignore malformed optional signal parameter
+    }
+  }
+
+
+  // ==========================================================
+  // GLOBAL MATCHING
+  // ==========================================================
+
   const matches:
     AnyObj[] = [];
 
@@ -2698,10 +2980,6 @@ async function runMatcher(
   let candidateEvaluations =
     0;
 
-
-  // ==========================================================
-  // NORMAL FIRST-HALF MATCHING
-  // ==========================================================
 
   for (
     const v27 of preparedV27
@@ -2852,7 +3130,6 @@ async function runMatcher(
           result.reason
       });
 
-
       continue;
     }
 
@@ -2889,15 +3166,8 @@ async function runMatcher(
             v27.normalizedHome,
 
           normalized_away:
-            v27.normalizedAway,
-
-          category_home:
-            v27.homeCategory,
-
-          category_away:
-            v27.awayCategory
+            v27.normalizedAway
         },
-
 
         cloudbet: {
 
@@ -2928,15 +3198,8 @@ async function runMatcher(
             result.best.normalizedHome,
 
           normalized_away:
-            result.best.normalizedAway,
-
-          category_home:
-            result.best.homeCategory,
-
-          category_away:
-            result.best.awayCategory
+            result.best.normalizedAway
         },
-
 
         scoring:
           scoringRecord(
@@ -3064,7 +3327,188 @@ async function runMatcher(
 
 
   // ==========================================================
-  // CLOUDBET-ONLY AGAINST ALL V27
+  // HUNTER TARGET MATCHING
+  //
+  // THIS IS THE IMPORTANT FIX.
+  //
+  // It does NOT use usedCloudbetIds.
+  // ==========================================================
+
+  const hunterResults:
+    AnyObj[] = [];
+
+
+  for (
+    const signal of hunterSignals
+  ) {
+
+    const result =
+      findHunterTargetMatch(
+        signal,
+        preparedCloudbet,
+        tokenIndex,
+        threshold
+      );
+
+
+    const detail =
+      result.detail;
+
+
+    hunterResults.push({
+
+      status:
+        result.found
+          ? "MATCH"
+          : "NO_MATCH",
+
+      signal: {
+
+        type:
+          signal?.type ??
+          "HUNTER_ENTRY",
+
+        match:
+          signal.match,
+
+        match_id:
+          signal.match_id ??
+          null,
+
+        home:
+          signal.home,
+
+        away:
+          signal.away,
+
+        entry_minute:
+          signal.entry_minute ??
+          null,
+
+        hunter_score:
+          signal.hunter_score ??
+          null
+      },
+
+
+      cloudbet:
+        result.best
+          ? {
+
+              id:
+                result.best.raw?.id ??
+                null,
+
+              key:
+                result.best.raw?.key ??
+                null,
+
+              match:
+                matchDisplayName(
+                  result.best.raw
+                ),
+
+              home:
+                extractHome(
+                  result.best.raw
+                ),
+
+              away:
+                extractAway(
+                  result.best.raw
+                ),
+
+              normalized_home:
+                result.best.normalizedHome,
+
+              normalized_away:
+                result.best.normalizedAway,
+
+              status:
+                result.best.raw?.status ??
+                null,
+
+              minute:
+                matchMinute(
+                  result.best.raw
+                ),
+
+              score:
+                result.best.raw?.score ??
+                null,
+
+              competition:
+                result.best.raw?.competition ??
+                null
+            }
+
+          : null,
+
+
+      matcher_scoring:
+        detail
+          ? scoringRecord(
+              detail
+            )
+          : {
+              total: 0,
+              base_score: 0,
+              home_score: 0,
+              away_score: 0,
+              reverse_home_score: 0,
+              reverse_away_score: 0,
+              direction: "NONE",
+              competition_score: 0,
+              country_score: 0
+            },
+
+
+      classification:
+        result.classification,
+
+      reason:
+        result.reason,
+
+
+      security: {
+
+        secure_match:
+          result.found,
+
+        match_method:
+          result.found
+            ? "HUNTER_TARGET_TWO_SIDED"
+            : null,
+
+        score_only_match:
+          false,
+
+        minimum_score_for_token_match:
+          DEFAULT_THRESHOLD
+      },
+
+
+      diagnostics: {
+
+        candidate_evaluations:
+          result.candidateEvaluations,
+
+        target_normalized_home:
+          normalizeTeam(
+            signal.home
+          ),
+
+        target_normalized_away:
+          normalizeTeam(
+            signal.away
+          )
+      }
+    });
+  }
+
+
+  // ==========================================================
+  // CLOUDBET ONLY
   // ==========================================================
 
   const cloudbetOnlyFirstHalf:
@@ -3115,7 +3559,7 @@ async function runMatcher(
       "cloudbet-match-matcher",
 
     version:
-      "V7-FH",
+      "V7-FH-FIXED",
 
     mode:
       "READ ONLY",
@@ -3163,20 +3607,20 @@ async function runMatcher(
       candidate_discovery:
         "DIRECT TWO-SIDED NORMALIZED/ALIAS PASS + TWO-SIDED TOKEN PASS + TOKEN INDEX + LIMITED FALLBACK",
 
+      hunter_target_matching:
+        "EACH HUNTER ENTRY IS MATCHED DIRECTLY AGAINST CURRENT CLOUDBET FIRST-HALF EVENTS",
+
+      hunter_used_id_isolation:
+        "HUNTER TARGET MATCHING DOES NOT USE GLOBAL usedCloudbetIds",
+
       exact_id_security:
         "EXACT ID ALONE IS NEVER SUFFICIENT; CONFIDENT TWO-SIDED MATCH IS REQUIRED",
 
       cloudbet_only:
         "UNMATCHED CLOUDBET FIRST-HALF EVENTS CHECKED AGAINST ALL V27 EVENTS",
 
-      filtered_counterpart:
-        "V27_SECOND_HALF_COUNTERPARTS ARE EXPOSED AS V27_COUNTERPART_FILTERED",
-
       scoring:
-        "UNCHANGED FROM V6-FH",
-
-      optimization:
-        "PRE-NORMALIZED TEAMS + DIRECT TWO-SIDED MATCH + TOKEN INDEX + LIMITED FUZZY FALLBACK"
+        "UNCHANGED FROM V6-FH"
     },
 
 
@@ -3255,6 +3699,23 @@ async function runMatcher(
       candidate_evaluations:
         candidateEvaluations,
 
+      hunter_signals:
+        hunterSignals.length,
+
+      hunter_secure_matches:
+        hunterResults.filter(
+          x =>
+            x.security?.secure_match ===
+            true
+        ).length,
+
+      hunter_no_matches:
+        hunterResults.filter(
+          x =>
+            x.security?.secure_match !==
+            true
+        ).length,
+
       processing_ms:
         Date.now() -
         started
@@ -3277,6 +3738,9 @@ async function runMatcher(
         0,
         100
       ),
+
+    hunter_results:
+      hunterResults,
 
     v27_filtered_second_half:
       v27Filtered
@@ -3566,10 +4030,6 @@ async function runDiagnostic(
   }
 
 
-  // ==========================================================
-  // CLOUD BET ONLY DIAGNOSTIC
-  // ==========================================================
-
   const cloudbetOnly:
     AnyObj[] = [];
 
@@ -3614,13 +4074,13 @@ async function runDiagnostic(
       "cloudbet-match-matcher",
 
     version:
-      "V7-FH",
+      "V7-FH-FIXED",
 
     mode:
       "READ ONLY",
 
     diagnostic:
-      "V7 ALL-V27 COUNTERPART CHECK + DIRECT TWO-SIDED LINK FIX",
+      "V7-FH TARGET-SPECIFIC HUNTER MATCHING + ALL-V27 COUNTERPART CHECK",
 
 
     settings: {
@@ -3631,17 +4091,11 @@ async function runDiagnostic(
       first_half_filter:
         true,
 
-      first_half_rule:
-        "EXPLICIT FIRST HALF OR MINUTE <= 45; EXPLICIT SECOND HALF IS EXCLUDED",
+      hunter_target_matching:
+        "HUNTER TARGETS ARE MATCHED DIRECTLY WITHOUT GLOBAL usedCloudbetIds",
 
       direct_two_sided_link:
         "NORMALIZED HOME + NORMALIZED AWAY ARE CHECKED BEFORE TOKEN/FUZZY FALLBACK",
-
-      cloudbet_only_rule:
-        "UNMATCHED CLOUDBET FIRST-HALF EVENTS ARE CHECKED AGAINST ALL V27 EVENTS",
-
-      filtered_counterpart:
-        "SECOND-HALF V27 COUNTERPARTS ARE EXPOSED SEPARATELY",
 
       exact_id_security:
         "EXACT ID ALONE IS NEVER SUFFICIENT",
@@ -3816,7 +4270,7 @@ function health(): Response {
       "cloudbet-match-matcher",
 
     version:
-      "V7-FH",
+      "V7-FH-FIXED",
 
     mode:
       "READ ONLY",
@@ -3832,7 +4286,7 @@ function health(): Response {
 
 
     matcher:
-      "V7 FIRST-HALF FILTER + DIRECT TWO-SIDED LINK + ALL-V27 COUNTERPART CHECK",
+      "V7 FIRST-HALF FILTER + HUNTER TARGET MATCHING + DIRECT TWO-SIDED LINK + ALL-V27 COUNTERPART CHECK",
 
 
     rules: {
@@ -3848,6 +4302,12 @@ function health(): Response {
 
       token_link:
         "BOTH TEAMS MUST HAVE REASONABLE SIMILARITY",
+
+      hunter_target:
+        "HUNTER ENTRY IS MATCHED DIRECTLY AGAINST CLOUDBET FIRST-HALF EVENTS",
+
+      hunter_used_id:
+        "GLOBAL usedCloudbetIds DOES NOT BLOCK HUNTER TARGET MATCHING",
 
       cloudbet_only:
         "UNMATCHED CLOUDBET FIRST-HALF EVENTS ARE CHECKED AGAINST ALL V27 EVENTS",
@@ -3882,7 +4342,7 @@ function health(): Response {
 
 
     message:
-      "V7-FH uses direct two-sided normalized/alias linking before controlled fuzzy matching while preserving secure two-sided classification.",
+      "V7-FH-FIXED keeps strict secure matching while adding independent target-specific Hunter matching.",
 
 
     timestamp:
@@ -3970,13 +4430,11 @@ export default {
 
             "/match?threshold=0.45",
 
-            "/match?threshold=0.40",
-
-            "/live",
-
             "/diagnostic",
 
-            "/diagnostic?threshold=0.45"
+            "/diagnostic?threshold=0.45",
+
+            "/match?signals=%5B...%5D"
           ]
         },
 
@@ -3999,7 +4457,7 @@ export default {
             "cloudbet-match-matcher",
 
           version:
-            "V7-FH",
+            "V7-FH-FIXED",
 
           mode:
             "READ ONLY",
