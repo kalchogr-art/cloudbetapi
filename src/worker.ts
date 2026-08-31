@@ -1,9 +1,9 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7-FH FIXED
+// CLOUDBET MATCH MATCHER V7.1-FH-HUNTER-FIX
 // V27 + CLOUDBET SERVICE BINDINGS
 // READ ONLY
 //
-// FIX:
+// V7.1 FIX:
 // 1. FIRST-HALF INPUT FILTER
 // 2. V27 FIRST-HALF / FILTERED SPLIT
 // 3. CLOUDBET FIRST-HALF FILTER
@@ -25,16 +25,25 @@
 // 19. DETAILED TARGET SCORING
 // 20. READ ONLY
 //
+// V7.1 HUNTER FIX:
+// 21. HUNTER DOES NOT USE GLOBAL CANDIDATE FILTER
+// 22. HUNTER CHECKS EVERY CURRENT CLOUDBET FIRST-HALF EVENT
+// 23. HUNTER CANDIDATE DISCOVERY CANNOT HIDE A REAL EVENT
+// 24. FINAL SECURITY STILL REQUIRES CONFIDENT_MATCH
+//
 // IMPORTANT:
 // Secure thresholds remain unchanged.
 // ============================================================
+
 
 interface Env {
   V27: Fetcher;
   CLOUDBET: Fetcher;
 }
 
+
 type AnyObj = Record<string, any>;
+
 
 const DEFAULT_THRESHOLD = 0.45;
 
@@ -54,15 +63,25 @@ const COUNTRY_BONUS = 0.02;
 // JSON
 // ============================================================
 
-function json(data: any, status = 200): Response {
+function json(
+  data: any,
+  status = 200
+): Response {
 
   return new Response(
-    JSON.stringify(data, null, 2),
+    JSON.stringify(
+      data,
+      null,
+      2
+    ),
     {
       status,
       headers: {
-        "content-type": "application/json; charset=UTF-8",
-        "cache-control": "no-store"
+        "content-type":
+          "application/json; charset=UTF-8",
+
+        "cache-control":
+          "no-store"
       }
     }
   );
@@ -73,16 +92,35 @@ function json(data: any, status = 200): Response {
 // NORMALIZATION
 // ============================================================
 
-function normalizeText(value: any): string {
+function normalizeText(
+  value: any
+): string {
 
-  return String(value ?? "")
+  return String(
+    value ?? ""
+  )
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
+    .replace(
+      /[\u0300-\u036f]/g,
+      ""
+    )
     .toLowerCase()
-    .replace(/&/g, " and ")
-    .replace(/['’`]/g, "")
-    .replace(/[^a-z0-9]+/g, " ")
-    .replace(/\s+/g, " ")
+    .replace(
+      /&/g,
+      " and "
+    )
+    .replace(
+      /['’`]/g,
+      ""
+    )
+    .replace(
+      /[^a-z0-9]+/g,
+      " "
+    )
+    .replace(
+      /\s+/g,
+      " "
+    )
     .trim();
 }
 
@@ -91,116 +129,216 @@ function normalizeText(value: any): string {
 // ALIASES
 // ============================================================
 
-const TEAM_ALIASES: Record<string, string> = {
+const TEAM_ALIASES:
+  Record<string, string> = {
 
-  "man city": "manchester city",
-  "man utd": "manchester united",
-  "man united": "manchester united",
-  "man u": "manchester united",
-  "manchester utd": "manchester united",
+  "man city":
+    "manchester city",
 
-  "psg": "paris saint germain",
-  "paris sg": "paris saint germain",
+  "man utd":
+    "manchester united",
 
-  "inter": "inter milan",
-  "inter milano": "inter milan",
-  "internazionale": "inter milan",
-  "fc internazionale": "inter milan",
+  "man united":
+    "manchester united",
 
-  "atletico": "atletico madrid",
-  "atletico de madrid": "atletico madrid",
+  "man u":
+    "manchester united",
 
-  "sporting cp": "sporting lisbon",
-  "sporting lisboa": "sporting lisbon",
+  "manchester utd":
+    "manchester united",
 
-  "red star": "crvena zvezda",
-  "red star belgrade": "crvena zvezda",
+  "psg":
+    "paris saint germain",
 
-  "psv eindhoven": "psv",
+  "paris sg":
+    "paris saint germain",
 
-  "bayern munchen": "bayern munich",
+  "inter":
+    "inter milan",
 
-  "utd": "united",
-  "ath": "athletic",
-  "dep": "deportivo",
-  "depor": "deportivo"
+  "inter milano":
+    "inter milan",
+
+  "internazionale":
+    "inter milan",
+
+  "fc internazionale":
+    "inter milan",
+
+  "atletico":
+    "atletico madrid",
+
+  "atletico de madrid":
+    "atletico madrid",
+
+  "sporting cp":
+    "sporting lisbon",
+
+  "sporting lisboa":
+    "sporting lisbon",
+
+  "red star":
+    "crvena zvezda",
+
+  "red star belgrade":
+    "crvena zvezda",
+
+  "psv eindhoven":
+    "psv",
+
+  "bayern munchen":
+    "bayern munich",
+
+  "utd":
+    "united",
+
+  "ath":
+    "athletic",
+
+  "dep":
+    "deportivo",
+
+  "depor":
+    "deportivo"
 };
 
 
-const GENERIC_WORDS = new Set([
-  "fc",
-  "cf",
-  "sc",
-  "ac",
-  "afc",
-  "ca",
-  "cd",
-  "sd",
-  "ss",
-  "as",
-  "us",
-  "ud",
-  "aa",
-  "ad",
-  "rc",
-  "fk",
-  "sk",
-  "ks",
-  "sv",
-  "vfb",
-  "vfl",
-  "club",
-  "calcio",
-  "spa",
-  "srl",
-  "football",
-  "soccer"
-]);
+const GENERIC_WORDS =
+  new Set([
+    "fc",
+    "cf",
+    "sc",
+    "ac",
+    "afc",
+    "ca",
+    "cd",
+    "sd",
+    "ss",
+    "as",
+    "us",
+    "ud",
+    "aa",
+    "ad",
+    "rc",
+    "fk",
+    "sk",
+    "ks",
+    "sv",
+    "vfb",
+    "vfl",
+    "club",
+    "calcio",
+    "spa",
+    "srl",
+    "football",
+    "soccer"
+  ]);
 
 
 // ============================================================
 // CATEGORY
 // ============================================================
 
-function normalizeCategory(value: any): string {
+function normalizeCategory(
+  value: any
+): string {
 
-  let s = normalizeText(value);
+  let s =
+    normalizeText(value);
 
   if (!s) return "";
 
-  s = s
-    .replace(/\bu\s+(\d{2})\b/g, "u$1")
-    .replace(/\bu(\d{2})\b/g, "u$1")
-    .replace(/\bunder\s+(\d{2})\b/g, "u$1")
-    .replace(/\b(\d{2})\s*years?\b/g, "u$1")
-    .replace(/\bii\b/g, "2")
-    .replace(/\biii\b/g, "3")
-    .replace(/\biv\b/g, "4")
-    .replace(/\breserves?\b/g, "reserve")
-    .replace(/\bres\b/g, "reserve")
-    .replace(/\bwomen\b/g, "women")
-    .replace(/\bwomen'?s\b/g, "women")
-    .replace(/\bladies\b/g, "women")
-    .replace(/\bgirls\b/g, "women");
+  s =
+    s
+      .replace(
+        /\bu\s+(\d{2})\b/g,
+        "u$1"
+      )
+      .replace(
+        /\bu(\d{2})\b/g,
+        "u$1"
+      )
+      .replace(
+        /\bunder\s+(\d{2})\b/g,
+        "u$1"
+      )
+      .replace(
+        /\b(\d{2})\s*years?\b/g,
+        "u$1"
+      )
+      .replace(
+        /\bii\b/g,
+        "2"
+      )
+      .replace(
+        /\biii\b/g,
+        "3"
+      )
+      .replace(
+        /\biv\b/g,
+        "4"
+      )
+      .replace(
+        /\breserves?\b/g,
+        "reserve"
+      )
+      .replace(
+        /\bres\b/g,
+        "reserve"
+      )
+      .replace(
+        /\bwomen\b/g,
+        "women"
+      )
+      .replace(
+        /\bwomen'?s\b/g,
+        "women"
+      )
+      .replace(
+        /\bladies\b/g,
+        "women"
+      )
+      .replace(
+        /\bgirls\b/g,
+        "women"
+      );
 
-  const categories: string[] = [];
+  const categories:
+    string[] = [];
 
-  for (const token of s.split(" ").filter(Boolean)) {
+  for (
+    const token of
+    s.split(" ").filter(Boolean)
+  ) {
 
-    if (/^u\d{2}$/.test(token)) {
+    if (
+      /^u\d{2}$/.test(token)
+    ) {
       categories.push(token);
     }
 
-    if (token === "reserve") {
-      categories.push("reserve");
+    if (
+      token === "reserve"
+    ) {
+      categories.push(
+        "reserve"
+      );
     }
 
-    if (token === "women") {
-      categories.push("women");
+    if (
+      token === "women"
+    ) {
+      categories.push(
+        "women"
+      );
     }
 
-    if (/^[234]$/.test(token)) {
-      categories.push(`team${token}`);
+    if (
+      /^[234]$/.test(token)
+    ) {
+      categories.push(
+        `team${token}`
+      );
     }
   }
 
@@ -208,19 +346,40 @@ function normalizeCategory(value: any): string {
 }
 
 
-function teamCategory(value: any): string {
-  return normalizeCategory(value);
+function teamCategory(
+  value: any
+): string {
+
+  return normalizeCategory(
+    value
+  );
 }
 
 
-function categoryCompatible(a: any, b: any): boolean {
+function categoryCompatible(
+  a: any,
+  b: any
+): boolean {
 
-  const A = teamCategory(a);
-  const B = teamCategory(b);
+  const A =
+    teamCategory(a);
 
-  if (!A && !B) return true;
+  const B =
+    teamCategory(b);
 
-  if (!A || !B) return true;
+  if (
+    !A &&
+    !B
+  ) {
+    return true;
+  }
+
+  if (
+    !A ||
+    !B
+  ) {
+    return true;
+  }
 
   return A === B;
 }
@@ -230,69 +389,99 @@ function categoryCompatible(a: any, b: any): boolean {
 // TEAM ALIASES
 // ============================================================
 
-function applyTeamAliases(value: string): string {
+function applyTeamAliases(
+  value: string
+): string {
 
-  let s = normalizeText(value);
+  let s =
+    normalizeText(value);
 
   if (!s) return "";
 
-  const aliases = Object.keys(TEAM_ALIASES)
-    .sort((a, b) => b.length - a.length);
+  const aliases =
+    Object.keys(
+      TEAM_ALIASES
+    )
+      .sort(
+        (a, b) =>
+          b.length -
+          a.length
+      );
 
-  for (const alias of aliases) {
+  for (
+    const alias of aliases
+  ) {
 
-    const canonical = TEAM_ALIASES[alias];
+    const canonical =
+      TEAM_ALIASES[alias];
 
-    const regex = new RegExp(
-      `(^|\\s)${alias.replace(
-        /[.*+?^${}()|[\]\\]/g,
-        "\\$&"
-      )}(?=\\s|$)`,
-      "g"
-    );
+    const regex =
+      new RegExp(
+        `(^|\\s)${alias.replace(
+          /[.*+?^${}()|[\]\\]/g,
+          "\\$&"
+        )}(?=\\s|$)`,
+        "g"
+      );
 
-    s = s.replace(
-      regex,
-      `$1${canonical}`
-    );
+    s =
+      s.replace(
+        regex,
+        `$1${canonical}`
+      );
   }
 
   return s
-    .replace(/\s+/g, " ")
+    .replace(
+      /\s+/g,
+      " "
+    )
     .trim();
 }
 
 
-function normalizeTeam(value: any): string {
+function normalizeTeam(
+  value: any
+): string {
 
-  let s = normalizeText(value);
+  let s =
+    normalizeText(value);
 
   if (!s) return "";
 
-  s = applyTeamAliases(s);
+  s =
+    applyTeamAliases(s);
 
-  const words = s
-    .split(" ")
-    .filter(Boolean)
-    .filter(
-      w => !GENERIC_WORDS.has(w)
-    )
-    .filter(
-      w => !/^\d+$/.test(w)
-    );
+  const words =
+    s
+      .split(" ")
+      .filter(Boolean)
+      .filter(
+        w =>
+          !GENERIC_WORDS.has(w)
+      )
+      .filter(
+        w =>
+          !/^\d+$/.test(w)
+      );
 
-  return words.join(" ").trim();
+  return words
+    .join(" ")
+    .trim();
 }
 
 
-function teamTokens(value: any): Set<string> {
+function teamTokens(
+  value: any
+): Set<string> {
 
   return new Set(
     normalizeTeam(value)
       .split(" ")
       .filter(Boolean)
       .filter(
-        w => w.length >= 2
+        w =>
+          w.length >= 2
       )
   );
 }
@@ -307,15 +496,24 @@ function levenshtein(
   b: string
 ): number {
 
-  if (a === b) return 0;
+  if (
+    a === b
+  ) {
+    return 0;
+  }
 
-  if (!a.length) return b.length;
+  if (!a.length) {
+    return b.length;
+  }
 
-  if (!b.length) return a.length;
+  if (!b.length) {
+    return a.length;
+  }
 
-  let prev = new Array<number>(
-    b.length + 1
-  );
+  let prev =
+    new Array<number>(
+      b.length + 1
+    );
 
   for (
     let j = 0;
@@ -345,7 +543,8 @@ function levenshtein(
     ) {
 
       const cost =
-        a[i - 1] === b[j - 1]
+        a[i - 1] ===
+        b[j - 1]
           ? 0
           : 1;
 
@@ -369,12 +568,24 @@ function tokenSimilarity(
   b: string
 ): number {
 
-  if (a === b) return 1;
+  if (
+    a === b
+  ) {
+    return 1;
+  }
 
-  if (!a || !b) return 0;
+  if (
+    !a ||
+    !b
+  ) {
+    return 0;
+  }
 
   const distance =
-    levenshtein(a, b);
+    levenshtein(
+      a,
+      b
+    );
 
   const maxLength =
     Math.max(
@@ -383,7 +594,9 @@ function tokenSimilarity(
     );
 
   return maxLength
-    ? 1 - distance / maxLength
+    ? 1 -
+      distance /
+        maxLength
     : 0;
 }
 
@@ -430,21 +643,37 @@ function teamScore(
   const B =
     normalizeTeam(b);
 
-  if (!A || !B) return 0;
-
-  if (!categoryCompatible(a, b)) {
+  if (
+    !A ||
+    !B
+  ) {
     return 0;
   }
 
-  if (A === B) {
+  if (
+    !categoryCompatible(
+      a,
+      b
+    )
+  ) {
+    return 0;
+  }
+
+  if (
+    A === B
+  ) {
     return 1;
   }
 
   const aTokens =
-    [...teamTokens(A)];
+    [
+      ...teamTokens(A)
+    ];
 
   const bTokens =
-    [...teamTokens(B)];
+    [
+      ...teamTokens(B)
+    ];
 
   if (
     !aTokens.length ||
@@ -454,19 +683,23 @@ function teamScore(
   }
 
   const shorter =
-    aTokens.length <= bTokens.length
+    aTokens.length <=
+    bTokens.length
       ? aTokens
       : bTokens;
 
   const longer =
-    aTokens.length <= bTokens.length
+    aTokens.length <=
+    bTokens.length
       ? bTokens
       : aTokens;
 
   const shorterAllExact =
     shorter.every(
       token =>
-        longer.includes(token)
+        longer.includes(
+          token
+        )
     );
 
   if (
@@ -477,19 +710,29 @@ function teamScore(
     const extraTokens =
       longer.filter(
         token =>
-          !shorter.includes(token)
+          !shorter.includes(
+            token
+          )
       );
 
     const meaningfulExtra =
       extraTokens.filter(
         token =>
-          !/^u\d{2}$/.test(token) &&
-          token !== "reserve" &&
-          token !== "women" &&
-          !/^team[234]$/.test(token)
+          !/^u\d{2}$/.test(
+            token
+          ) &&
+          token !==
+            "reserve" &&
+          token !==
+            "women" &&
+          !/^team[234]$/.test(
+            token
+          )
       );
 
-    if (!meaningfulExtra.length) {
+    if (
+      !meaningfulExtra.length
+    ) {
       return 0.97;
     }
   }
@@ -508,7 +751,8 @@ function teamScore(
     ) {
 
       if (
-        aToken === bToken
+        aToken ===
+        bToken
       ) {
         best = 1;
         break;
@@ -520,16 +764,23 @@ function teamScore(
           bToken
         );
 
-      if (sim > best) {
+      if (
+        sim > best
+      ) {
         best = sim;
       }
     }
 
-    if (best >= 0.90) {
+    if (
+      best >= 0.90
+    ) {
       fuzzy += best;
     }
-    else if (best >= 0.75) {
-      fuzzy += best * 0.65;
+    else if (
+      best >= 0.75
+    ) {
+      fuzzy +=
+        best * 0.65;
     }
   }
 
@@ -538,7 +789,9 @@ function teamScore(
   ) {
 
     if (
-      bTokens.includes(token)
+      bTokens.includes(
+        token
+      )
     ) {
       exact++;
     }
@@ -587,7 +840,9 @@ function teamScore(
         bTokens[0]
       );
 
-    if (sim >= 0.90) {
+    if (
+      sim >= 0.90
+    ) {
       score =
         Math.max(
           score,
@@ -616,8 +871,12 @@ function teamScore(
   const exactMeaningful =
     aTokens.filter(
       token =>
-        bTokens.includes(token) &&
-        !WEAK_TEAM_TOKENS.has(token)
+        bTokens.includes(
+          token
+        ) &&
+        !WEAK_TEAM_TOKENS.has(
+          token
+        )
     ).length;
 
   if (
@@ -650,7 +909,9 @@ function splitMatchName(
 } {
 
   const text =
-    String(value ?? "").trim();
+    String(
+      value ?? ""
+    ).trim();
 
   if (!text) {
     return {
@@ -668,7 +929,8 @@ function splitMatchName(
   ];
 
   for (
-    const separator of separators
+    const separator of
+    separators
   ) {
 
     const index =
@@ -676,20 +938,26 @@ function splitMatchName(
         separator
       );
 
-    if (index >= 0) {
+    if (
+      index >= 0
+    ) {
 
       return {
         home:
-          text.slice(
-            0,
-            index
-          ).trim(),
+          text
+            .slice(
+              0,
+              index
+            )
+            .trim(),
 
         away:
-          text.slice(
-            index +
-            separator.length
-          ).trim()
+          text
+            .slice(
+              index +
+              separator.length
+            )
+            .trim()
       };
     }
   }
@@ -790,7 +1058,8 @@ function parseMinute(
 ): number | null {
 
   if (
-    typeof value === "number"
+    typeof value ===
+    "number"
   ) {
 
     if (
@@ -798,16 +1067,22 @@ function parseMinute(
       value >= 0 &&
       value <= 130
     ) {
-      return Math.floor(value);
+      return Math.floor(
+        value
+      );
     }
 
     return null;
   }
 
   const text =
-    String(value ?? "").trim();
+    String(
+      value ?? ""
+    ).trim();
 
-  if (!text) return null;
+  if (!text) {
+    return null;
+  }
 
   const plus =
     text.match(
@@ -817,7 +1092,9 @@ function parseMinute(
   if (plus) {
 
     const base =
-      Number(plus[1]);
+      Number(
+        plus[1]
+      );
 
     if (
       Number.isFinite(base) &&
@@ -833,10 +1110,14 @@ function parseMinute(
       /(\d{1,3})/
     );
 
-  if (!match) return null;
+  if (!match) {
+    return null;
+  }
 
   const minute =
-    Number(match[1]);
+    Number(
+      match[1]
+    );
 
   if (
     !Number.isFinite(minute) ||
@@ -874,7 +1155,7 @@ function periodText(
 
     if (
       typeof value ===
-      "string" &&
+        "string" &&
       value.trim()
     ) {
       return normalizeText(
@@ -884,7 +1165,7 @@ function periodText(
 
     if (
       typeof value ===
-      "object" &&
+        "object" &&
       value
     ) {
 
@@ -896,7 +1177,7 @@ function periodText(
 
       if (
         typeof nested ===
-        "string" &&
+          "string" &&
         nested.trim()
       ) {
         return normalizeText(
@@ -915,9 +1196,13 @@ function hasExplicitSecondHalf(
 ): boolean {
 
   const text =
-    periodText(match);
+    periodText(
+      match
+    );
 
-  if (!text) return false;
+  if (!text) {
+    return false;
+  }
 
   return [
     /\b2h\b/,
@@ -940,9 +1225,13 @@ function hasExplicitFirstHalf(
 ): boolean {
 
   const text =
-    periodText(match);
+    periodText(
+      match
+    );
 
-  if (!text) return false;
+  if (!text) {
+    return false;
+  }
 
   return [
     /\b1h\b/,
@@ -982,7 +1271,9 @@ function matchMinute(
   ) {
 
     const minute =
-      parseMinute(value);
+      parseMinute(
+        value
+      );
 
     if (
       minute !== null
@@ -1025,7 +1316,9 @@ function getV27FilterState(
   }
 
   const minute =
-    matchMinute(match);
+    matchMinute(
+      match
+    );
 
   if (
     minute !== null &&
@@ -1046,7 +1339,8 @@ function isFirstHalf(
   return (
     getV27FilterState(
       match
-    ) === "FIRST_HALF"
+    ) ===
+    "FIRST_HALF"
   );
 }
 
@@ -1131,7 +1425,7 @@ function countryText(
 
     if (
       typeof value ===
-      "string" &&
+        "string" &&
       value.trim()
     ) {
       return normalizeText(
@@ -1150,14 +1444,27 @@ function competitionSimilarity(
 ): number {
 
   const A =
-    competitionText(a);
+    competitionText(
+      a
+    );
 
   const B =
-    competitionText(b);
+    competitionText(
+      b
+    );
 
-  if (!A || !B) return 0;
+  if (
+    !A ||
+    !B
+  ) {
+    return 0;
+  }
 
-  if (A === B) return 1;
+  if (
+    A === B
+  ) {
+    return 1;
+  }
 
   const aWords =
     new Set(
@@ -1178,7 +1485,9 @@ function competitionSimilarity(
   ) {
 
     if (
-      bWords.has(word)
+      bWords.has(
+        word
+      )
     ) {
       overlap++;
     }
@@ -1201,14 +1510,25 @@ function countrySimilarity(
 ): number {
 
   const A =
-    countryText(a);
+    countryText(
+      a
+    );
 
   const B =
-    countryText(b);
+    countryText(
+      b
+    );
 
-  if (!A || !B) return 0;
+  if (
+    !A ||
+    !B
+  ) {
+    return 0;
+  }
 
-  return A === B ? 1 : 0;
+  return A === B
+    ? 1
+    : 0;
 }
 
 
@@ -1245,42 +1565,63 @@ function prepareMatch(
 ): PreparedMatch {
 
   const home =
-    extractHome(match) ?? "";
+    extractHome(
+      match
+    ) ?? "";
 
   const away =
-    extractAway(match) ?? "";
+    extractAway(
+      match
+    ) ?? "";
 
   return {
 
     raw: match,
 
-    id: String(
-      match?.id ??
-      match?.key ??
-      ""
-    ),
+    id:
+      String(
+        match?.id ??
+        match?.key ??
+        ""
+      ),
 
     home,
 
     away,
 
     normalizedHome:
-      normalizeTeam(home),
+      normalizeTeam(
+        home
+      ),
 
     normalizedAway:
-      normalizeTeam(away),
+      normalizeTeam(
+        away
+      ),
 
     homeTokens:
-      [...teamTokens(home)],
+      [
+        ...teamTokens(
+          home
+        )
+      ],
 
     awayTokens:
-      [...teamTokens(away)],
+      [
+        ...teamTokens(
+          away
+        )
+      ],
 
     homeCategory:
-      teamCategory(home),
+      teamCategory(
+        home
+      ),
 
     awayCategory:
-      teamCategory(away)
+      teamCategory(
+        away
+      )
   };
 }
 
@@ -1390,16 +1731,24 @@ function detailedMatchScore(
 ) {
 
   const vHome =
-    extractHome(v27);
+    extractHome(
+      v27
+    );
 
   const vAway =
-    extractAway(v27);
+    extractAway(
+      v27
+    );
 
   const cHome =
-    extractHome(cb);
+    extractHome(
+      cb
+    );
 
   const cAway =
-    extractAway(cb);
+    extractAway(
+      cb
+    );
 
   if (
     !vHome ||
@@ -1446,11 +1795,16 @@ function detailedMatchScore(
     );
 
   const normal =
-    (homeScore + awayScore) / 2;
+    (
+      homeScore +
+      awayScore
+    ) / 2;
 
   const reversed =
-    (reverseHomeScore +
-      reverseAwayScore) / 2;
+    (
+      reverseHomeScore +
+      reverseAwayScore
+    ) / 2;
 
   let direction =
     "NORMAL";
@@ -1690,7 +2044,9 @@ function buildTokenIndex(
     ) {
 
       const list =
-        index.get(token);
+        index.get(
+          token
+        );
 
       if (list) {
         list.push(i);
@@ -1770,14 +2126,20 @@ function getCandidates(
   ) {
 
     const indexes =
-      tokenIndex.get(token);
+      tokenIndex.get(
+        token
+      );
 
-    if (!indexes) continue;
+    if (!indexes) {
+      continue;
+    }
 
     for (
       const index of indexes
     ) {
-      candidateSet.add(index);
+      candidateSet.add(
+        index
+      );
     }
   }
 
@@ -1831,8 +2193,8 @@ function findBestMatch(
 
   let bestScore = 0;
 
-  let candidateEvaluations = 0;
-
+  let candidateEvaluations =
+    0;
 
   const candidates =
     getCandidates(
@@ -1841,7 +2203,6 @@ function findBestMatch(
       tokenIndex
     );
 
-
   for (
     const index of candidates
   ) {
@@ -1849,26 +2210,28 @@ function findBestMatch(
     const cb =
       cloudbet[index];
 
-    if (!cb) continue;
+    if (!cb) {
+      continue;
+    }
 
     if (
       !ignoreUsed &&
       usedIds &&
       cb.id &&
-      usedIds.has(cb.id)
+      usedIds.has(
+        cb.id
+      )
     ) {
       continue;
     }
 
     candidateEvaluations++;
 
-
     const detail =
       detailedMatchScore(
         v27.raw,
         cb.raw
       );
-
 
     if (
       detail.total >
@@ -1885,7 +2248,6 @@ function findBestMatch(
         detail;
     }
   }
-
 
   if (
     !best ||
@@ -1912,13 +2274,11 @@ function findBestMatch(
     };
   }
 
-
   const classification =
     classifyMatch(
       bestDetail,
       threshold
     );
-
 
   return {
 
@@ -1946,14 +2306,36 @@ function findBestMatch(
 
 
 // ============================================================
-// TARGET-SPECIFIC HUNTER MATCHING
+// HUNTER TARGET-SPECIFIC MATCHING — V7.1 FIX
 //
 // IMPORTANT:
-// This function DOES NOT use usedCloudbetIds.
 //
-// A Hunter signal is an independent target.
-// The global V27 -> Cloudbet matching pass cannot consume
-// the Cloudbet event before this signal is verified.
+// Hunter НЕ използва getCandidates().
+//
+// Това е съществената промяна.
+//
+// Причина:
+//
+// getCandidates() е оптимизиран за масовия V27 -> Cloudbet
+// matcher и използва token index / limited fallback.
+//
+// При Hunter вече имаме конкретна цел:
+//
+//     HOME + AWAY
+//
+// Затова няма причина правилният Cloudbet event да бъде
+// изхвърлен преди scoring.
+//
+// Hunter проверява ВСИЧКИ текущи Cloudbet FIRST-HALF events.
+//
+// След пълното сравнение secure match остава строго:
+//
+//     CONFIDENT_MATCH
+//
+// Следователно тази промяна увеличава recall,
+// но НЕ отслабва security.
+//
+// usedCloudbetIds НЕ се използва.
 // ============================================================
 
 function findHunterTargetMatch(
@@ -1996,12 +2378,16 @@ function findHunterTargetMatch(
       reason:
         "HUNTER_SIGNAL_MISSING_HOME_OR_AWAY",
 
-      candidateEvaluations: 0
+      candidateEvaluations: 0,
+
+      candidateDiscovery:
+        "ALL_CLOUDBET_FIRST_HALF_EVENTS"
     };
   }
 
 
-  const target: PreparedMatch =
+  const target:
+    PreparedMatch =
     prepareMatch({
 
       id:
@@ -2019,13 +2405,13 @@ function findHunterTargetMatch(
     });
 
 
-  const candidates =
-    getCandidates(
-      target,
-      cloudbet,
-      tokenIndex
-    );
-
+  // ==========================================================
+  // V7.1:
+  //
+  // DO NOT call getCandidates().
+  //
+  // Check every Cloudbet first-half event.
+  // ==========================================================
 
   let best:
     PreparedMatch | null =
@@ -2037,20 +2423,29 @@ function findHunterTargetMatch(
 
   let bestScore = 0;
 
-  let candidateEvaluations = 0;
+  let candidateEvaluations =
+    0;
 
 
   for (
-    const index of candidates
+    let index = 0;
+    index < cloudbet.length;
+    index++
   ) {
 
     const cb =
       cloudbet[index];
 
-    if (!cb) continue;
+    if (!cb) {
+      continue;
+    }
 
     candidateEvaluations++;
 
+
+    // --------------------------------------------------------
+    // FULL TWO-SIDED DETAILED SCORING
+    // --------------------------------------------------------
 
     const detail =
       detailedMatchScore(
@@ -2077,6 +2472,10 @@ function findHunterTargetMatch(
   }
 
 
+  // ==========================================================
+  // NO CLOUDBET EVENT
+  // ==========================================================
+
   if (
     !best ||
     !bestDetail
@@ -2096,12 +2495,22 @@ function findHunterTargetMatch(
         "TRUE_UNMATCHED",
 
       reason:
-        "NO_CLOUDBET_CANDIDATE_FOR_HUNTER_TARGET",
+        "NO_CLOUDBET_FIRST_HALF_EVENTS",
 
-      candidateEvaluations
+      candidateEvaluations,
+
+      candidateDiscovery:
+        "ALL_CLOUDBET_FIRST_HALF_EVENTS"
     };
   }
 
+
+  // ==========================================================
+  // FINAL SECURITY CLASSIFICATION
+  //
+  // IMPORTANT:
+  // Best score alone is NOT enough.
+  // ==========================================================
 
   const classification =
     classifyMatch(
@@ -2130,7 +2539,13 @@ function findHunterTargetMatch(
     reason:
       classification.reason,
 
-    candidateEvaluations
+    candidateEvaluations,
+
+    candidateDiscovery:
+      "ALL_CLOUDBET_FIRST_HALF_EVENTS",
+
+    securityRequirement:
+      "CONFIDENT_MATCH_REQUIRED"
   };
 }
 
@@ -2209,7 +2624,8 @@ function isCloudbetLive(
 
   const status =
     String(
-      match?.status ?? ""
+      match?.status ??
+      ""
     ).toUpperCase();
 
   if (
@@ -2238,10 +2654,14 @@ function matchDisplayName(
 ): string {
 
   const home =
-    extractHome(match);
+    extractHome(
+      match
+    );
 
   const away =
-    extractAway(match);
+    extractAway(
+      match
+    );
 
   return (
     match?.match ??
@@ -2275,12 +2695,12 @@ async function fetchServiceJSON(
       )
     );
 
-
   const text =
     await response.text();
 
-
-  if (!response.ok) {
+  if (
+    !response.ok
+  ) {
 
     throw new Error(
       `HTTP ${response.status}: ${text.slice(
@@ -2290,12 +2710,14 @@ async function fetchServiceJSON(
     );
   }
 
-
   try {
 
-    return JSON.parse(text);
+    return JSON.parse(
+      text
+    );
 
-  } catch {
+  }
+  catch {
 
     throw new Error(
       `Invalid JSON from ${path}`
@@ -2316,32 +2738,44 @@ function scoringRecord(
 
     total:
       Number(
-        detail.total.toFixed(3)
+        detail.total.toFixed(
+          3
+        )
       ),
 
     base_score:
       Number(
-        detail.baseScore.toFixed(3)
+        detail.baseScore.toFixed(
+          3
+        )
       ),
 
     home_score:
       Number(
-        detail.homeScore.toFixed(3)
+        detail.homeScore.toFixed(
+          3
+        )
       ),
 
     away_score:
       Number(
-        detail.awayScore.toFixed(3)
+        detail.awayScore.toFixed(
+          3
+        )
       ),
 
     reverse_home_score:
       Number(
-        detail.reverseHomeScore.toFixed(3)
+        detail.reverseHomeScore.toFixed(
+          3
+        )
       ),
 
     reverse_away_score:
       Number(
-        detail.reverseAwayScore.toFixed(3)
+        detail.reverseAwayScore.toFixed(
+          3
+        )
       ),
 
     direction:
@@ -2349,12 +2783,16 @@ function scoringRecord(
 
     competition_score:
       Number(
-        detail.competitionScore.toFixed(3)
+        detail.competitionScore.toFixed(
+          3
+        )
       ),
 
     country_score:
       Number(
-        detail.countryScore.toFixed(3)
+        detail.countryScore.toFixed(
+          3
+        )
       )
   };
 }
@@ -2393,13 +2831,11 @@ function findV27Counterpart(
       continue;
     }
 
-
     const detail =
       detailedMatchScore(
         v27.raw,
         cloudbetMatch.raw
       );
-
 
     if (
       !bestDetail ||
@@ -2417,7 +2853,9 @@ function findV27Counterpart(
 
 
   // PASS 2
-  if (!bestDetail) {
+  if (
+    !bestDetail
+  ) {
 
     for (
       const v27 of allV27
@@ -2432,13 +2870,11 @@ function findV27Counterpart(
         continue;
       }
 
-
       const detail =
         detailedMatchScore(
           v27.raw,
           cloudbetMatch.raw
         );
-
 
       if (
         !bestDetail ||
@@ -2457,7 +2893,9 @@ function findV27Counterpart(
 
 
   // PASS 3
-  if (!bestDetail) {
+  if (
+    !bestDetail
+  ) {
 
     for (
       const v27 of allV27
@@ -2468,7 +2906,6 @@ function findV27Counterpart(
           v27.raw,
           cloudbetMatch.raw
         );
-
 
       if (
         !bestDetail ||
@@ -2571,7 +3008,6 @@ function buildCloudbetOnlyRecord(
   const raw =
     cb.raw;
 
-
   return {
 
     id:
@@ -2583,13 +3019,19 @@ function buildCloudbetOnlyRecord(
       null,
 
     match:
-      matchDisplayName(raw),
+      matchDisplayName(
+        raw
+      ),
 
     home:
-      extractHome(raw),
+      extractHome(
+        raw
+      ),
 
     away:
-      extractAway(raw),
+      extractAway(
+        raw
+      ),
 
     normalized_home:
       cb.normalizedHome,
@@ -2608,17 +3050,23 @@ function buildCloudbetOnlyRecord(
       null,
 
     competition_normalized:
-      competitionText(raw),
+      competitionText(
+        raw
+      ),
 
     country:
-      countryText(raw),
+      countryText(
+        raw
+      ),
 
     status:
       raw?.status ??
       null,
 
     minute:
-      matchMinute(raw),
+      matchMinute(
+        raw
+      ),
 
     score:
       raw?.score ??
@@ -2744,7 +3192,8 @@ function normalizeHunterSignal(
 
   if (
     !signal ||
-    typeof signal !== "object"
+    typeof signal !==
+      "object"
   ) {
     return null;
   }
@@ -2767,8 +3216,12 @@ function normalizeHunterSignal(
     `${home} - ${away}`;
 
   if (
-    !String(home).trim() ||
-    !String(away).trim()
+    !String(
+      home
+    ).trim() ||
+    !String(
+      away
+    ).trim()
   ) {
     return null;
   }
@@ -2778,13 +3231,19 @@ function normalizeHunterSignal(
     ...signal,
 
     home:
-      String(home).trim(),
+      String(
+        home
+      ).trim(),
 
     away:
-      String(away).trim(),
+      String(
+        away
+      ).trim(),
 
     match:
-      String(match).trim(),
+      String(
+        match
+      ).trim(),
 
     match_id:
       signal?.match_id ??
@@ -2902,11 +3361,6 @@ async function runMatcher(
 
   // ==========================================================
   // HUNTER SIGNALS
-  //
-  // V4.2 can send the target list through:
-  // ?signals=[...] OR ?signals JSON body.
-  //
-  // If no explicit signals are provided, we also inspect V27.
   // ==========================================================
 
   let hunterSignals:
@@ -2925,7 +3379,9 @@ async function runMatcher(
     );
 
 
-  if (signalParam) {
+  if (
+    signalParam
+  ) {
 
     try {
 
@@ -2935,8 +3391,11 @@ async function runMatcher(
         );
 
       if (
-        Array.isArray(parsed)
+        Array.isArray(
+          parsed
+        )
       ) {
+
         hunterSignals =
           parsed
             .map(
@@ -2947,7 +3406,8 @@ async function runMatcher(
             ) as AnyObj[];
       }
 
-    } catch {
+    }
+    catch {
       // ignore malformed optional signal parameter
     }
   }
@@ -3009,7 +3469,9 @@ async function runMatcher(
         result.best;
 
 
-      if (cb.id) {
+      if (
+        cb.id
+      ) {
         usedCloudbetIds.add(
           cb.id
         );
@@ -3329,9 +3791,15 @@ async function runMatcher(
   // ==========================================================
   // HUNTER TARGET MATCHING
   //
-  // THIS IS THE IMPORTANT FIX.
+  // V7.1:
   //
-  // It does NOT use usedCloudbetIds.
+  // Every Hunter signal is checked against EVERY current
+  // Cloudbet FIRST-HALF event.
+  //
+  // No usedCloudbetIds.
+  // No token-index candidate filtering.
+  //
+  // Security remains CONFIDENT_MATCH only.
   // ==========================================================
 
   const hunterResults:
@@ -3451,14 +3919,24 @@ async function runMatcher(
               detail
             )
           : {
+
               total: 0,
+
               base_score: 0,
+
               home_score: 0,
+
               away_score: 0,
+
               reverse_home_score: 0,
+
               reverse_away_score: 0,
-              direction: "NONE",
+
+              direction:
+                "NONE",
+
               competition_score: 0,
+
               country_score: 0
             },
 
@@ -3477,14 +3955,23 @@ async function runMatcher(
 
         match_method:
           result.found
-            ? "HUNTER_TARGET_TWO_SIDED"
+            ? "HUNTER_TARGET_TWO_SIDED_ALL_CLOUDBET"
             : null,
 
         score_only_match:
           false,
 
+        exact_id_alone:
+          false,
+
         minimum_score_for_token_match:
-          DEFAULT_THRESHOLD
+          DEFAULT_THRESHOLD,
+
+        required_classification:
+          "CONFIDENT_MATCH",
+
+        candidate_discovery:
+          "ALL_CLOUDBET_FIRST_HALF_EVENTS"
       },
 
 
@@ -3492,6 +3979,9 @@ async function runMatcher(
 
         candidate_evaluations:
           result.candidateEvaluations,
+
+        candidate_discovery:
+          result.candidateDiscovery,
 
         target_normalized_home:
           normalizeTeam(
@@ -3559,7 +4049,7 @@ async function runMatcher(
       "cloudbet-match-matcher",
 
     version:
-      "V7-FH-FIXED",
+      "V7.1-FH-HUNTER-FIX",
 
     mode:
       "READ ONLY",
@@ -3608,10 +4098,19 @@ async function runMatcher(
         "DIRECT TWO-SIDED NORMALIZED/ALIAS PASS + TWO-SIDED TOKEN PASS + TOKEN INDEX + LIMITED FALLBACK",
 
       hunter_target_matching:
-        "EACH HUNTER ENTRY IS MATCHED DIRECTLY AGAINST CURRENT CLOUDBET FIRST-HALF EVENTS",
+        "EACH HUNTER ENTRY IS COMPARED DIRECTLY AGAINST ALL CURRENT CLOUDBET FIRST-HALF EVENTS",
+
+      hunter_candidate_filter:
+        "DISABLED",
+
+      hunter_candidate_discovery:
+        "ALL_CLOUDBET_FIRST_HALF_EVENTS",
 
       hunter_used_id_isolation:
         "HUNTER TARGET MATCHING DOES NOT USE GLOBAL usedCloudbetIds",
+
+      hunter_security:
+        "ALL EVENTS ARE EVALUATED BUT ONLY CONFIDENT_MATCH IS ACCEPTED",
 
       exact_id_security:
         "EXACT ID ALONE IS NEVER SUFFICIENT; CONFIDENT TWO-SIDED MATCH IS REQUIRED",
@@ -3715,6 +4214,21 @@ async function runMatcher(
             x.security?.secure_match !==
             true
         ).length,
+
+      hunter_candidate_evaluations:
+        hunterResults.reduce(
+          (
+            sum,
+            x
+          ) =>
+            sum +
+            Number(
+              x.diagnostics
+                ?.candidate_evaluations ??
+              0
+            ),
+          0
+        ),
 
       processing_ms:
         Date.now() -
@@ -4074,13 +4588,13 @@ async function runDiagnostic(
       "cloudbet-match-matcher",
 
     version:
-      "V7-FH-FIXED",
+      "V7.1-FH-HUNTER-FIX",
 
     mode:
       "READ ONLY",
 
     diagnostic:
-      "V7-FH TARGET-SPECIFIC HUNTER MATCHING + ALL-V27 COUNTERPART CHECK",
+      "V7.1-FH ALL-CLOUDBET HUNTER TARGET MATCHING + ALL-V27 COUNTERPART CHECK",
 
 
     settings: {
@@ -4092,7 +4606,16 @@ async function runDiagnostic(
         true,
 
       hunter_target_matching:
-        "HUNTER TARGETS ARE MATCHED DIRECTLY WITHOUT GLOBAL usedCloudbetIds",
+        "HUNTER TARGETS ARE COMPARED AGAINST ALL CURRENT CLOUDBET FIRST-HALF EVENTS",
+
+      hunter_candidate_filter:
+        "DISABLED",
+
+      hunter_candidate_discovery:
+        "ALL_CLOUDBET_FIRST_HALF_EVENTS",
+
+      hunter_used_id:
+        "GLOBAL usedCloudbetIds DOES NOT BLOCK HUNTER TARGET MATCHING",
 
       direct_two_sided_link:
         "NORMALIZED HOME + NORMALIZED AWAY ARE CHECKED BEFORE TOKEN/FUZZY FALLBACK",
@@ -4270,7 +4793,7 @@ function health(): Response {
       "cloudbet-match-matcher",
 
     version:
-      "V7-FH-FIXED",
+      "V7.1-FH-HUNTER-FIX",
 
     mode:
       "READ ONLY",
@@ -4286,7 +4809,7 @@ function health(): Response {
 
 
     matcher:
-      "V7 FIRST-HALF FILTER + HUNTER TARGET MATCHING + DIRECT TWO-SIDED LINK + ALL-V27 COUNTERPART CHECK",
+      "V7.1 FIRST-HALF FILTER + ALL-CLOUDBET HUNTER TARGET MATCHING + DIRECT TWO-SIDED LINK + ALL-V27 COUNTERPART CHECK",
 
 
     rules: {
@@ -4304,10 +4827,19 @@ function health(): Response {
         "BOTH TEAMS MUST HAVE REASONABLE SIMILARITY",
 
       hunter_target:
-        "HUNTER ENTRY IS MATCHED DIRECTLY AGAINST CLOUDBET FIRST-HALF EVENTS",
+        "HUNTER ENTRY IS COMPARED AGAINST EVERY CURRENT CLOUDBET FIRST-HALF EVENT",
+
+      hunter_candidate_filter:
+        "DISABLED",
+
+      hunter_candidate_discovery:
+        "ALL_CLOUDBET_FIRST_HALF_EVENTS",
 
       hunter_used_id:
         "GLOBAL usedCloudbetIds DOES NOT BLOCK HUNTER TARGET MATCHING",
+
+      hunter_security:
+        "ALL EVENTS MAY BE EVALUATED BUT ONLY CONFIDENT_MATCH IS ACCEPTED",
 
       cloudbet_only:
         "UNMATCHED CLOUDBET FIRST-HALF EVENTS ARE CHECKED AGAINST ALL V27 EVENTS",
@@ -4342,7 +4874,7 @@ function health(): Response {
 
 
     message:
-      "V7-FH-FIXED keeps strict secure matching while adding independent target-specific Hunter matching.",
+      "V7.1-FH-HUNTER-FIX removes Hunter candidate pre-filtering. Every Hunter target is compared against all current Cloudbet first-half events, while secure acceptance still requires CONFIDENT_MATCH.",
 
 
     timestamp:
@@ -4457,7 +4989,7 @@ export default {
             "cloudbet-match-matcher",
 
           version:
-            "V7-FH-FIXED",
+            "V7.1-FH-HUNTER-FIX",
 
           mode:
             "READ ONLY",
