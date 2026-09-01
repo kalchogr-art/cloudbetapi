@@ -1,28 +1,34 @@
 // ============================================================
-// CLOUDBET BET WORKER V5.6
+// CLOUDBET BET WORKER V5.7
 // DRY RUN — OPTIMIZED TEST BETTING PIPELINE
 //
-// V5.6
-// - V5.5 LOGIC PRESERVED
+// V5.7
+// - V5.6 LOGIC PRESERVED
 // - 1 TRACKER CALL
 // - 1 MATCHER CALL
 // - 1 CLOUDBET /live CALL
 // - MATCHER + CLOUDBET PARALLEL
 // - RAW CLOUDBET JSON DIAGNOSTIC
 // - STRICT TWO-SIDED TEAM MATCH
-// - DIRECT CLOUDBET FALLBACK
+// - DIRECT CLOUDBET LIVE FALLBACK
+// - ADDITIONAL RAW CLOUDBET MATCH SEARCH
 // - D1 HUNTER ARCHIVE
 // - IDEMPOTENT ARCHIVE
 // - BATCH ARCHIVE
 // - DRY RUN ONLY
 //
-// OPTIMIZATION:
-// - Cloudbet raw diagnostic calculated once per Hunter signal
-// - Diagnostic reused during processing
-// - Reduced duplicated object construction
-// - Reduced response size
-// - No second Cloudbet request
-// - No betting logic change
+// NEW V5.7:
+// If Matcher fails OR Cloudbet live verification fails,
+// search the ENTIRE raw Cloudbet /live JSON for the same
+// two-sided team matchup.
+//
+// IMPORTANT:
+// - No second Cloudbet request.
+// - Uses already downloaded rawCloudbetMatches.
+// - Raw search is performed after liveCloudbet search.
+// - Result can be READY even when Cloudbet item was not
+//   classified as live, but ONLY if strict two-sided teams
+//   are confirmed.
 // ============================================================
 
 interface Env {
@@ -38,7 +44,7 @@ type AnyObj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V5.6";
+const VERSION = "V5.7";
 const MODE = "DRY_RUN";
 
 const BETTING_ENABLED = false;
@@ -1037,6 +1043,123 @@ function findDirectCloudbet(
 }
 
 // ============================================================
+// V5.7 NEW:
+// ADDITIONAL RAW CLOUDBET MATCH SEARCH
+//
+// Searches the COMPLETE raw /live response.
+// This is deliberately separate from findDirectCloudbet(),
+// which searches only liveCloudbet.
+//
+// NO NETWORK REQUEST HERE.
+// Uses the already downloaded raw array.
+// ============================================================
+
+function findRawCloudbetMatch(
+  signal: AnyObj,
+  rawMatches: AnyObj[]
+): AnyObj {
+  const sh = signalHome(signal);
+  const sa = signalAway(signal);
+
+  if (!teamsPresent(sh, sa)) {
+    return {
+      found: false,
+      reason:
+        "RAW_SEARCH_SIGNAL_TEAMS_EMPTY",
+      candidates_checked:
+        rawMatches.length
+    };
+  }
+
+  let best: AnyObj | null = null;
+
+  for (const cb of rawMatches) {
+    const ch = extractHome(cb);
+    const ca = extractAway(cb);
+
+    if (!teamsPresent(ch, ca)) {
+      continue;
+    }
+
+    const score =
+      twoSidedTeamScore(
+        sh,
+        sa,
+        ch,
+        ca
+      );
+
+    if (
+      !score.matched ||
+      score.home_score < TEAM_MATCH_MIN_SCORE ||
+      score.away_score < TEAM_MATCH_MIN_SCORE
+    ) {
+      continue;
+    }
+
+    const candidate = {
+      match: cb,
+
+      direction:
+        score.direction,
+
+      home_score:
+        score.home_score,
+
+      away_score:
+        score.away_score,
+
+      combined_score:
+        score.combined_score,
+
+      live:
+        isCloudbetLive(cb),
+
+      id:
+        extractMatchId(cb),
+
+      home:
+        ch,
+
+      away:
+        ca
+    };
+
+    if (
+      !best ||
+      candidate.combined_score >
+        best.combined_score
+    ) {
+      best = candidate;
+    }
+  }
+
+  if (!best) {
+    return {
+      found: false,
+
+      reason:
+        "RAW_CLOUDBET_STRICT_TWO_SIDED_MATCH_NOT_FOUND",
+
+      candidates_checked:
+        rawMatches.length
+    };
+  }
+
+  return {
+    found: true,
+
+    source:
+      "RAW_CLOUDBET_ADDITIONAL_SEARCH",
+
+    method:
+      "RAW_JSON_STRICT_TWO_SIDED_TEAM_MATCH",
+
+    ...best
+  };
+}
+
+// ============================================================
 // VERIFY CLOUDBET
 // ============================================================
 
@@ -1253,7 +1376,9 @@ function buildPreparedBet(
 
       fallback:
         matcher.source ===
-        "DIRECT_CLOUDBET_FALLBACK"
+        "DIRECT_CLOUDBET_FALLBACK" ||
+        matcher.source ===
+        "RAW_CLOUDBET_ADDITIONAL_SEARCH"
     },
 
     security: {
@@ -1278,7 +1403,7 @@ function buildPreparedBet(
     },
 
     action:
-      "NO_BET_V5_6_DRY_RUN"
+      "NO_BET_V5_7_DRY_RUN"
   };
 }
 
@@ -1548,7 +1673,7 @@ function buildNoMatch(
     },
 
     action:
-      "NO_BET_V5_6_DRY_RUN",
+      "NO_BET_V5_7_DRY_RUN",
 
     reason
   };
@@ -1558,7 +1683,7 @@ function buildNoMatch(
 // MAIN
 // ============================================================
 
-async function runV56(
+async function runV57(
   env: Env
 ): Promise<Response> {
   const started = Date.now();
@@ -1621,7 +1746,7 @@ async function runV56(
       bet_candidates: [],
 
       message:
-        "V5.6 DRY RUN. No active Hunter entries.",
+        "V5.7 DRY RUN. No active Hunter entries.",
 
       timestamp:
         new Date().toISOString()
@@ -1768,6 +1893,7 @@ async function runV56(
 
   let matcherMatchesCount = 0;
   let directFallbackMatches = 0;
+  let rawAdditionalMatches = 0;
   let cloudbetVerified = 0;
 
   const rejectionReasons:
@@ -1817,7 +1943,7 @@ async function runV56(
     }
 
     // --------------------------------------------------------
-    // DIRECT FALLBACK
+    // DIRECT LIVE CLOUDBET FALLBACK
     // --------------------------------------------------------
 
     if (!verification.verified) {
@@ -1852,52 +1978,143 @@ async function runV56(
     }
 
     // --------------------------------------------------------
+    // V5.7 ADDITIONAL RAW CLOUDBET SEARCH
+    //
+    // IMPORTANT:
+    // Only runs if matcher + live fallback both failed.
+    //
+    // Searches ALL raw /live matches.
+    // No second Cloudbet request.
+    // --------------------------------------------------------
+
+    if (!verification.verified) {
+      const rawFallback =
+        findRawCloudbetMatch(
+          signal,
+          rawCloudbetMatches
+        );
+
+      if (rawFallback.found) {
+        rawAdditionalMatches++;
+
+        verification = {
+          verified: true,
+
+          method:
+            "RAW_CLOUDBET_ADDITIONAL_SEARCH",
+
+          direction:
+            rawFallback.direction,
+
+          home_score:
+            rawFallback.home_score,
+
+          away_score:
+            rawFallback.away_score,
+
+          combined_score:
+            rawFallback.combined_score,
+
+          match:
+            rawFallback.match
+        };
+
+        source =
+          "RAW_CLOUDBET_ADDITIONAL_SEARCH";
+      }
+    }
+
+    // --------------------------------------------------------
     // READY
     // --------------------------------------------------------
 
     if (verification.verified) {
       cloudbetVerified++;
 
-      const matcherForBet =
-        source === "MATCHER"
-          ? matcher
-          : {
-              source:
-                "DIRECT_CLOUDBET_FALLBACK",
+      let matcherForBet: AnyObj;
 
-              classification: null,
+      if (source === "MATCHER") {
+        matcherForBet = matcher;
+      } else if (
+        source ===
+        "DIRECT_CLOUDBET_FALLBACK"
+      ) {
+        matcherForBet = {
+          source:
+            "DIRECT_CLOUDBET_FALLBACK",
 
-              method:
-                "DIRECT_STRICT_TEAM_MATCH",
+          classification: null,
 
-              matcher_score:
-                verification.combined_score,
+          method:
+            "DIRECT_STRICT_TEAM_MATCH",
 
-              reason:
-                "DIRECT_CLOUDBET_STRICTLY_CONFIRMED",
+          matcher_score:
+            verification.combined_score,
 
-              cloudbet: {
-                id:
-                  extractMatchId(
-                    verification.match
-                  ),
+          reason:
+            "DIRECT_CLOUDBET_STRICTLY_CONFIRMED",
 
-                match:
-                  displayMatch(
-                    verification.match
-                  ),
+          cloudbet: {
+            id:
+              extractMatchId(
+                verification.match
+              ),
 
-                home:
-                  extractHome(
-                    verification.match
-                  ),
+            match:
+              displayMatch(
+                verification.match
+              ),
 
-                away:
-                  extractAway(
-                    verification.match
-                  )
-              }
-            };
+            home:
+              extractHome(
+                verification.match
+              ),
+
+            away:
+              extractAway(
+                verification.match
+              )
+          }
+        };
+      } else {
+        matcherForBet = {
+          source:
+            "RAW_CLOUDBET_ADDITIONAL_SEARCH",
+
+          classification: null,
+
+          method:
+            "RAW_JSON_STRICT_TEAM_MATCH",
+
+          matcher_score:
+            verification.combined_score,
+
+          reason:
+            "RAW_CLOUDBET_ADDITIONAL_SEARCH_CONFIRMED",
+
+          cloudbet: {
+            id:
+              extractMatchId(
+                verification.match
+              ),
+
+            match:
+              displayMatch(
+                verification.match
+              ),
+
+            home:
+              extractHome(
+                verification.match
+              ),
+
+            away:
+              extractAway(
+                verification.match
+              )
+          }
+        };
+      }
 
       const bet =
         buildPreparedBet(
@@ -1929,6 +2146,22 @@ async function runV56(
           "READY",
 
         source,
+
+        cloudbet_match:
+          displayMatch(
+            verification.match
+          ),
+
+        cloudbet_live:
+          isCloudbetLive(
+            verification.match
+          ),
+
+        team_direction:
+          verification.direction,
+
+        team_score:
+          verification.combined_score,
 
         odds:
           candidate.odds,
@@ -2069,7 +2302,10 @@ async function runV56(
       cloudbet_live: 1,
 
       matcher_cloudbet_parallel:
-        true
+        true,
+
+      additional_cloudbet_request:
+        false
     },
 
     tracker: {
@@ -2107,6 +2343,12 @@ async function runV56(
 
       verified_matches:
         cloudbetVerified,
+
+      direct_live_fallback:
+        directFallbackMatches,
+
+      raw_additional_search:
+        rawAdditionalMatches,
 
       ms:
         cloudbetResult.ms
@@ -2239,6 +2481,9 @@ async function runV56(
       direct_fallback:
         directFallbackMatches,
 
+      raw_additional_search:
+        rawAdditionalMatches,
+
       cloudbet_verified:
         cloudbetVerified,
 
@@ -2305,7 +2550,10 @@ async function runV56(
         direct_cloudbet_fallback:
           true,
 
-        raw_json_diagnostic:
+        raw_json_additional_search:
+          true,
+
+        raw_json_search_uses_existing_response:
           true,
 
         second_cloudbet_request:
@@ -2343,9 +2591,11 @@ async function runV56(
       noMatch,
 
     message:
-      missing.length > 0
-        ? `V5.6 DRY RUN. ${missing.length} Hunter match(es) missing from raw Cloudbet /live JSON.`
-        : "V5.6 DRY RUN. All Hunter matches found in raw Cloudbet /live JSON.",
+      rawAdditionalMatches > 0
+        ? `V5.7 DRY RUN. ${rawAdditionalMatches} match(es) found by additional raw Cloudbet JSON search.`
+        : missing.length > 0
+          ? `V5.7 DRY RUN. ${missing.length} Hunter match(es) missing from raw Cloudbet /live JSON.`
+          : "V5.7 DRY RUN. All Hunter matches found in raw Cloudbet /live JSON.",
 
     timestamp:
       new Date().toISOString()
@@ -2416,6 +2666,9 @@ function health(): Response {
       missing_detection:
         true,
 
+      additional_raw_match_search:
+        true,
+
       second_cloudbet_request:
         false
     },
@@ -2452,6 +2705,9 @@ function health(): Response {
         false,
 
       direct_cloudbet_fallback:
+        true,
+
+      raw_cloudbet_additional_search:
         true
     },
 
@@ -2474,6 +2730,12 @@ function health(): Response {
       cloudbet_data_reused:
         true,
 
+      additional_raw_search:
+        true,
+
+      additional_cloudbet_network_request:
+        false,
+
       archive_batch:
         true,
 
@@ -2493,7 +2755,7 @@ function health(): Response {
     ],
 
     message:
-      "V5.6 DRY RUN worker healthy. Real betting disabled.",
+      "V5.7 DRY RUN worker healthy. Additional raw Cloudbet match search enabled. Real betting disabled.",
 
     timestamp:
       new Date().toISOString()
@@ -2539,7 +2801,7 @@ export default {
         path === "/diagnostic" ||
         path === "/diagnostics"
       ) {
-        return runV56(env);
+        return runV57(env);
       }
 
       return json(
