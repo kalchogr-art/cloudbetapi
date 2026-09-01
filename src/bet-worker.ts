@@ -1,10 +1,10 @@
 // ============================================================
-// CLOUDBET BET WORKER V5.4
+// CLOUDBET BET WORKER V5.5
 // DRY RUN — TEST BETTING PIPELINE
 // REAL BETTING DISABLED
 //
-// V5.4
-// - V5.3 MATCHER/CLOUDBET LOGIC PRESERVED
+// V5.5
+// - V5.4 MATCHER/CLOUDBET LOGIC PRESERVED
 // - D1 HUNTER ARCHIVE PRESERVED
 // - READY HUNTER MATCHES ARCHIVED
 // - IDEMPOTENT ARCHIVE
@@ -16,18 +16,18 @@
 // - MATCHER + CLOUDBET PARALLEL
 // - REDUCED DUPLICATED PROCESSING
 //
-// NEW V5.4
-// - DRY_RUN BETTING PIPELINE
-// - READY -> BET_CANDIDATE
-// - MARKET: 1H Total Goals
-// - SELECTION: OVER 0.5
-// - STAKE: EUR 10
-// - ODDS READ ONLY FROM CLOUDBET /live
-// - NO ODDS INVENTION
-// - NO POST BET REQUEST
-// - BETTING_ENABLED HARD FALSE
-// - BET_PLACED ALWAYS FALSE
-// - TEST BET CANDIDATES COUNTED
+// NEW V5.5
+// - DIAGNOSTIC: COMPARE EVERY HUNTER MATCH AGAINST RAW
+//   CLOUDBET /live JSON BEFORE LIVE FILTER
+// - SHOW WHICH HUNTER MATCHES ARE MISSING FROM /live JSON
+// - DISTINGUISH:
+//     JSON_PRESENT
+//     JSON_PRESENT_NOT_LIVE
+//     MISSING_FROM_LIVE_JSON
+// - NO SECOND CLOUDBET REQUEST
+// - NO BETTING LOGIC CHANGE
+// - NO MATCHER LOGIC CHANGE
+// - STRICT TWO-SIDED TEAM COMPARISON
 // ============================================================
 
 interface Env {
@@ -43,7 +43,7 @@ type AnyObj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V5.4";
+const VERSION = "V5.5";
 const MODE = "DRY_RUN";
 
 const BETTING_ENABLED = false;
@@ -1136,7 +1136,284 @@ function isCloudbetLive(
 }
 
 // ============================================================
-// ODDS EXTRACTION — V5.4
+// V5.5 CLOUDBET RAW JSON PRESENCE CHECK
+//
+// IMPORTANT:
+//
+// This check uses the RAW /live JSON BEFORE the live filter.
+//
+// Therefore:
+//
+// JSON_PRESENT
+//     -> Hunter match exists in Cloudbet /live JSON.
+//
+// JSON_PRESENT_NOT_LIVE
+//     -> Hunter match exists in raw /live JSON,
+//        but isCloudbetLive() returned false.
+//
+// MISSING_FROM_LIVE_JSON
+//     -> No strict two-sided team match exists anywhere
+//        in the raw /live JSON.
+//
+// This is diagnostic only.
+// It does NOT change betting logic.
+// ============================================================
+
+function findCloudbetRawJsonPresence(
+  signal: AnyObj,
+  rawCloudbetMatches: AnyObj[]
+): AnyObj {
+  const sHome =
+    signalHome(signal);
+
+  const sAway =
+    signalAway(signal);
+
+  const signalId =
+    signalMatchId(signal);
+
+  if (!teamsPresent(sHome, sAway)) {
+    return {
+      status:
+        "CANNOT_CHECK",
+
+      reason:
+        "SIGNAL_TEAMS_EMPTY",
+
+      signal_match:
+        signalMatchName(signal),
+
+      signal_match_id:
+        signalId || null,
+
+      raw_candidates_checked:
+        rawCloudbetMatches.length
+    };
+  }
+
+  let best:
+    AnyObj | null = null;
+
+  for (const cb of rawCloudbetMatches) {
+    const cbHome =
+      extractHome(cb);
+
+    const cbAway =
+      extractAway(cb);
+
+    if (
+      !teamsPresent(
+        cbHome,
+        cbAway
+      )
+    ) {
+      continue;
+    }
+
+    const scored =
+      twoSidedTeamScore(
+        sHome,
+        sAway,
+        cbHome,
+        cbAway
+      );
+
+    if (!scored.matched) {
+      continue;
+    }
+
+    if (
+      scored.home_score <
+        DIRECT_CLOUDBET_MIN_SCORE ||
+      scored.away_score <
+        DIRECT_CLOUDBET_MIN_SCORE
+    ) {
+      continue;
+    }
+
+    const candidate = {
+      match:
+        cb,
+
+      id:
+        extractMatchId(cb),
+
+      home:
+        cbHome,
+
+      away:
+        cbAway,
+
+      direction:
+        scored.direction,
+
+      home_score:
+        scored.home_score,
+
+      away_score:
+        scored.away_score,
+
+      combined_score:
+        scored.combined_score,
+
+      live:
+        isCloudbetLive(cb),
+
+      status:
+        cb?.status ??
+        null,
+
+      state:
+        cb?.state ??
+        null,
+
+      raw_match:
+        cb
+    };
+
+    if (
+      !best ||
+      candidate.combined_score >
+        best.combined_score
+    ) {
+      best = candidate;
+    }
+  }
+
+  if (!best) {
+    return {
+      status:
+        "MISSING_FROM_LIVE_JSON",
+
+      found:
+        false,
+
+      signal_match:
+        signalMatchName(signal),
+
+      signal_match_id:
+        signalId || null,
+
+      signal_home:
+        sHome,
+
+      signal_away:
+        sAway,
+
+      raw_candidates_checked:
+        rawCloudbetMatches.length
+    };
+  }
+
+  if (best.live) {
+    return {
+      status:
+        "JSON_PRESENT",
+
+      found:
+        true,
+
+      signal_match:
+        signalMatchName(signal),
+
+      signal_match_id:
+        signalId || null,
+
+      cloudbet_match:
+        displayMatch(
+          best.match
+        ),
+
+      cloudbet_id:
+        best.id || null,
+
+      cloudbet_home:
+        best.home,
+
+      cloudbet_away:
+        best.away,
+
+      cloudbet_status:
+        best.status,
+
+      cloudbet_state:
+        best.state,
+
+      live:
+        true,
+
+      direction:
+        best.direction,
+
+      home_score:
+        best.home_score,
+
+      away_score:
+        best.away_score,
+
+      combined_score:
+        best.combined_score,
+
+      raw_candidates_checked:
+        rawCloudbetMatches.length
+    };
+  }
+
+  return {
+    status:
+      "JSON_PRESENT_NOT_LIVE",
+
+    found:
+      true,
+
+    signal_match:
+      signalMatchName(signal),
+
+    signal_match_id:
+      signalId || null,
+
+    cloudbet_match:
+      displayMatch(
+        best.match
+      ),
+
+    cloudbet_id:
+      best.id || null,
+
+    cloudbet_home:
+      best.home,
+
+    cloudbet_away:
+      best.away,
+
+    cloudbet_status:
+      best.status,
+
+    cloudbet_state:
+      best.state,
+
+    live:
+      false,
+
+    direction:
+      best.direction,
+
+    home_score:
+      best.home_score,
+
+    away_score:
+      best.away_score,
+
+    combined_score:
+      best.combined_score,
+
+    raw_candidates_checked:
+      rawCloudbetMatches.length
+  };
+}
+
+// ============================================================
+// ODDS EXTRACTION — V5.5
 //
 // IMPORTANT:
 // Odds are NEVER invented.
@@ -1716,7 +1993,7 @@ function buildPreparedBet(
     },
 
     action:
-      "NO_BET_V5_4_DRY_RUN"
+      "NO_BET_V5_5_DRY_RUN"
   };
 }
 
@@ -1918,9 +2195,6 @@ function archiveKey(
 
 // ============================================================
 // ARCHIVE BATCH
-//
-// One D1 batch instead of one DB request per READY match.
-// INSERT OR IGNORE keeps execution idempotent.
 // ============================================================
 
 async function archiveReadyBets(
@@ -2210,7 +2484,7 @@ function buildNoMatch(
     },
 
     action:
-      "NO_BET_V5_4_DRY_RUN",
+      "NO_BET_V5_5_DRY_RUN",
 
     reason
   };
@@ -2326,6 +2600,23 @@ function emptyResponse(
         "NO_ACTIVE_HUNTER_ENTRIES"
     },
 
+    cloudbet_json_diagnostic: {
+      checked:
+        false,
+
+      hunter_matches_checked:
+        0,
+
+      missing_from_live_json:
+        0,
+
+      status:
+        "NO_ACTIVE_HUNTER_ENTRIES",
+
+      matches:
+        []
+    },
+
     archive: {
       table:
         ARCHIVE_TABLE,
@@ -2391,6 +2682,9 @@ function emptyResponse(
       archive_duplicates:
         0,
 
+      cloudbet_json_missing:
+        0,
+
       processing_ms:
         totalMs
     },
@@ -2402,7 +2696,7 @@ function emptyResponse(
     no_match: [],
 
     message:
-      "V5.4 DRY RUN. No active Hunter entries.",
+      "V5.5 DRY RUN. No active Hunter entries.",
 
     timestamp:
       new Date().toISOString()
@@ -2410,10 +2704,10 @@ function emptyResponse(
 }
 
 // ============================================================
-// RUN V5.4
+// RUN V5.5
 // ============================================================
 
-async function runV54(
+async function runV55(
   env: Env,
   request: Request
 ): Promise<Response> {
@@ -2522,12 +2816,80 @@ async function runV54(
       matcherData
     );
 
-  const liveCloudbet =
+  // ==========================================================
+  // IMPORTANT:
+  //
+  // rawCloudbetMatches = EVERYTHING returned by /live JSON
+  //
+  // liveCloudbet = only matches considered LIVE
+  //
+  // V5.5 diagnostic uses rawCloudbetMatches.
+  // ==========================================================
+
+  const rawCloudbetMatches =
     extractCloudbetMatches(
       cloudbetData
-    ).filter(
+    );
+
+  const liveCloudbet =
+    rawCloudbetMatches.filter(
       isCloudbetLive
     );
+
+  // ==========================================================
+  // V5.5 CLOUDABET RAW JSON DIAGNOSTIC
+  // ==========================================================
+
+  const cloudbetJsonDiagnostic:
+    AnyObj[] = [];
+
+  const cloudbetMissingFromLiveJson:
+    AnyObj[] = [];
+
+  const cloudbetJsonPresent:
+    AnyObj[] = [];
+
+  const cloudbetJsonPresentNotLive:
+    AnyObj[] = [];
+
+  for (const signal of hunterEntries) {
+    const presence =
+      findCloudbetRawJsonPresence(
+        signal,
+        rawCloudbetMatches
+      );
+
+    cloudbetJsonDiagnostic.push(
+      presence
+    );
+
+    if (
+      presence.status ===
+      "MISSING_FROM_LIVE_JSON"
+    ) {
+      cloudbetMissingFromLiveJson.push(
+        presence
+      );
+    }
+
+    if (
+      presence.status ===
+      "JSON_PRESENT"
+    ) {
+      cloudbetJsonPresent.push(
+        presence
+      );
+    }
+
+    if (
+      presence.status ===
+      "JSON_PRESENT_NOT_LIVE"
+    ) {
+      cloudbetJsonPresentNotLive.push(
+        presence
+      );
+    }
+  }
 
   // ==========================================================
   // LOCAL PROCESSING
@@ -2576,6 +2938,9 @@ async function runV54(
       matcher:
         null,
 
+      cloudbet_json:
+        null,
+
       cloudbet:
         null,
 
@@ -2585,6 +2950,16 @@ async function runV54(
       final:
         null
     };
+
+    // ========================================================
+    // RAW CLOUDBET JSON PRESENCE
+    // ========================================================
+
+    diagnostic.cloudbet_json =
+      findCloudbetRawJsonPresence(
+        signal,
+        rawCloudbetMatches
+      );
 
     // ========================================================
     // PRIMARY MATCHER
@@ -2937,6 +3312,9 @@ async function runV54(
             cloudbet_verification:
               verification,
 
+            cloudbet_json:
+              diagnostic.cloudbet_json,
+
             direct_fallback: {
               attempted:
                 true,
@@ -3139,6 +3517,9 @@ async function runV54(
                 .reason ??
               null
           },
+
+          cloudbet_json:
+            diagnostic.cloudbet_json,
 
           direct_cloudbet_fallback: {
             attempted:
@@ -3389,15 +3770,80 @@ async function runV54(
         true,
 
       raw_matches:
-        extractCloudbetMatches(
-          cloudbetData
-        ).length,
+        rawCloudbetMatches.length,
 
       live_matches:
         liveCloudbet.length,
 
       verified_matches:
-        cloudbetVerifiedMatches
+        cloudbetVerifiedMatches,
+
+      json_presence_checked:
+        true,
+
+      hunter_matches_checked:
+        hunterEntries.length,
+
+      json_present:
+        cloudbetJsonPresent.length,
+
+      json_present_not_live:
+        cloudbetJsonPresentNotLive.length,
+
+      missing_from_live_json:
+        cloudbetMissingFromLiveJson.length
+    },
+
+    // ========================================================
+    // V5.5 MAIN DIAGNOSTIC
+    //
+    // THIS IS THE IMPORTANT NEW SECTION.
+    // ========================================================
+
+    cloudbet_json_diagnostic: {
+      source:
+        "CLOUDBET /live RAW JSON",
+
+      checked_before_live_filter:
+        true,
+
+      raw_json_matches:
+        rawCloudbetMatches.length,
+
+      hunter_matches_checked:
+        hunterEntries.length,
+
+      json_present:
+        cloudbetJsonPresent.length,
+
+      json_present_not_live:
+        cloudbetJsonPresentNotLive.length,
+
+      missing_from_live_json:
+        cloudbetMissingFromLiveJson.length,
+
+      missing:
+        cloudbetMissingFromLiveJson,
+
+      present:
+        cloudbetJsonPresent,
+
+      present_not_live:
+        cloudbetJsonPresentNotLive,
+
+      all:
+        cloudbetJsonDiagnostic,
+
+      interpretation: {
+        JSON_PRESENT:
+          "Hunter match exists in raw Cloudbet /live JSON and is considered live.",
+
+        JSON_PRESENT_NOT_LIVE:
+          "Hunter match exists in raw Cloudbet /live JSON but isCloudbetLive() did not classify it as live.",
+
+        MISSING_FROM_LIVE_JSON:
+          "No strict two-sided team match was found anywhere in the raw Cloudbet /live JSON."
+      }
     },
 
     archive: {
@@ -3507,6 +3953,15 @@ async function runV54(
       archive_duplicates:
         archiveDuplicates,
 
+      cloudbet_json_present:
+        cloudbetJsonPresent.length,
+
+      cloudbet_json_present_not_live:
+        cloudbetJsonPresentNotLive.length,
+
+      cloudbet_json_missing:
+        cloudbetMissingFromLiveJson.length,
+
       processing_ms:
         totalMs
     },
@@ -3529,78 +3984,24 @@ async function runV54(
             cloudbetVerifiedMatches
         ),
 
+      cloudbet_missing_from_live_json:
+        cloudbetMissingFromLiveJson,
+
       signal_flow:
         signalDiagnostics,
 
-      v54_rules: {
-        archive:
-          "D1 hunter_bet_archive",
-
-        archive_binding:
-          "DB",
-
-        archive_duplicate_protection:
-          "INSERT OR IGNORE",
-
-        archive_write_mode:
-          "D1 BATCH",
-
-        archive_key:
-          "MATCH_ID OR NORMALIZED_HOME_AWAY",
-
-        betting:
-          "DISABLED",
-
-        mode:
-          "DRY_RUN",
-
-        market:
-          BET_MARKET,
-
-        selection:
-          BET_SELECTION,
-
-        stake_eur:
-          BET_STAKE_EUR,
-
-        betting_enabled:
-          false,
-
-        real_bet_execution:
-          false,
-
-        post_bet_request:
-          "NEVER",
-
-        test_bet_registration:
+      v55_rules: {
+        cloudbet_json_diagnostic:
           "ENABLED",
 
-        odds:
-          "READ FROM CLOUDBET /live ONLY",
+        cloudbet_json_source:
+          "RAW /live RESPONSE",
 
-        odds_missing:
-          "NULL",
+        cloudbet_json_checked_before_live_filter:
+          true,
 
-        odds_invented:
-          false,
-
-        matcher:
-          "PRIMARY MATCH SOURCE",
-
-        matcher_discovery_threshold:
-          MATCHER_THRESHOLD,
-
-        matcher_accept_min_score:
-          MIN_MATCHER_SCORE,
-
-        matcher_confident:
-          "NOT REQUIRED",
-
-        matcher_score:
-          "DISCOVERY / ASSOCIATION ONLY",
-
-        matcher_score_is_team_validation:
-          false,
+        missing_definition:
+          "NO STRICT TWO-SIDED TEAM MATCH IN RAW /live JSON",
 
         team_validation:
           "STRICT TWO SIDED",
@@ -3617,32 +4018,41 @@ async function runV54(
         token_minimum:
           TOKEN_MATCH_MIN_SCORE,
 
+        direction:
+          "NORMAL OR REVERSED",
+
+        cloudbet_live_filter:
+          "USED ONLY FOR BETTING VERIFICATION",
+
+        second_cloudbet_request:
+          false,
+
+        matcher:
+          "PRIMARY MATCH SOURCE",
+
+        matcher_discovery_threshold:
+          MATCHER_THRESHOLD,
+
+        matcher_accept_min_score:
+          MIN_MATCHER_SCORE,
+
+        matcher_score_is_team_validation:
+          false,
+
         score_only:
           "ALWAYS REJECT",
 
         exact_id:
           "NEVER ACCEPTED ALONE",
 
-        exact_id_zero_score:
-          "ALWAYS REJECT",
-
         direct_cloudbet_fallback:
           "ENABLED",
 
-        direct_team_requirement:
-          "BOTH HOME AND AWAY MUST PASS STRICT THRESHOLD",
+        betting:
+          "DISABLED",
 
-        direction:
-          "NORMAL OR REVERSED",
-
-        cloudbet:
-          "INDEPENDENT STRICT TWO SIDED VERIFICATION",
-
-        cloudbet_fetch:
-          "ONE /live CALL PER EXECUTION",
-
-        matcher_cloudbet_execution:
-          "PARALLEL"
+        mode:
+          "DRY_RUN"
       }
     },
 
@@ -3670,6 +4080,12 @@ async function runV54(
 
       direct_fallback_uses_existing_live_data:
         true,
+
+      raw_json_diagnostic_uses_existing_live_data:
+        true,
+
+      second_cloudbet_diagnostic_call:
+        false,
 
       archive_batch:
         true,
@@ -3705,7 +4121,9 @@ async function runV54(
       noMatch,
 
     message:
-      "V5.4 DRY RUN. READY Hunter matches become simulated BET_CANDIDATE records. No real bet is placed. Odds are read only from Cloudbet /live and are never invented.",
+      cloudbetMissingFromLiveJson.length > 0
+        ? `V5.5 DRY RUN. ${cloudbetMissingFromLiveJson.length} Hunter match(es) are missing from raw Cloudbet /live JSON.`
+        : "V5.5 DRY RUN. All Hunter matches were found in raw Cloudbet /live JSON.",
 
     timestamp:
       new Date().toISOString()
@@ -3779,7 +4197,7 @@ function health(): Response {
         false
     },
 
-    v54: {
+    v55: {
       archive_table:
         ARCHIVE_TABLE,
 
@@ -3811,6 +4229,18 @@ function health(): Response {
         BET_STAKE_EUR,
 
       real_bet_execution:
+        false,
+
+      cloudbet_json_diagnostic:
+        true,
+
+      cloudbet_json_source:
+        "RAW /live RESPONSE",
+
+      missing_from_live_json_detection:
+        true,
+
+      second_cloudbet_call:
         false
     },
 
@@ -3880,6 +4310,12 @@ function health(): Response {
       direct_fallback_uses_existing_live_data:
         true,
 
+      raw_json_diagnostic_uses_existing_live_data:
+        true,
+
+      second_cloudbet_diagnostic_call:
+        false,
+
       archive_batch:
         true,
 
@@ -3905,7 +4341,7 @@ function health(): Response {
     ],
 
     message:
-      "V5.4 DRY RUN worker is healthy. Real betting is permanently disabled.",
+      "V5.5 DRY RUN worker is healthy. Raw Cloudbet /live JSON presence diagnostic is enabled. Real betting is permanently disabled.",
 
     timestamp:
       new Date().toISOString()
@@ -3955,7 +4391,7 @@ export default {
       }
 
       // ------------------------------------------------------
-      // MAIN V5.4 EXECUTION
+      // MAIN V5.5 EXECUTION
       // ------------------------------------------------------
 
       if (
@@ -3965,7 +4401,7 @@ export default {
         path === "/diagnostic" ||
         path === "/diagnostics"
       ) {
-        return runV54(
+        return runV55(
           env,
           request
         );
