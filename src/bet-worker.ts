@@ -4,13 +4,16 @@
 // BETTING DISABLED
 //
 // V5.3
-// - V5.2 MATCHER / CLOUDBET LOGIC PRESERVED
+// - V5.2 MATCHER/CLOUDBET LOGIC PRESERVED
 // - D1 HUNTER ARCHIVE
-// - READY MATCHES ARCHIVED
+// - READY HUNTER MATCHES ARCHIVED
 // - IDEMPOTENT ARCHIVE
-// - D1 BATCH ARCHIVE
-// - /archive SINGLE QUERY
-// - DB BINDING MATCHES wrangler.json
+// - BATCH ARCHIVE WRITES
+// - /archive
+// - TRACKER 1 CALL
+// - MATCHER 1 CALL
+// - CLOUDBET /live 1 CALL
+// - MATCHER + CLOUDBET PARALLEL
 // - REDUCED DUPLICATED PROCESSING
 // ============================================================
 
@@ -47,13 +50,13 @@ const DIRECT_CLOUDBET_MIN_SCORE = TEAM_MATCH_MIN_SCORE;
 const REQUIRED_MATCH_CLASSIFICATION = "CONFIDENT_MATCH";
 
 const ALLOWED_SIGNAL_TYPE = "HUNTER_ENTRY";
+
 const TARGET_SPORT = "SOCCER";
 const TARGET_PERIOD = "FIRST_HALF";
 const TARGET_OUTCOME = "OVER";
 const TARGET_LINE = 0.5;
 
 const ARCHIVE_TABLE = "hunter_bet_archive";
-const ARCHIVE_LIMIT = 20;
 
 // ============================================================
 // TEAM ALIASES
@@ -86,31 +89,10 @@ const TEAM_ALIASES: Record<string, string> = {
 };
 
 const GENERIC_WORDS = new Set([
-  "fc",
-  "cf",
-  "sc",
-  "ac",
-  "afc",
-  "ca",
-  "cd",
-  "sd",
-  "ss",
-  "as",
-  "us",
-  "ud",
-  "aa",
-  "ad",
-  "rc",
-  "fk",
-  "sk",
-  "ks",
-  "sv",
-  "vfb",
-  "vfl",
-  "club",
-  "calcio",
-  "football",
-  "soccer"
+  "fc", "cf", "sc", "ac", "afc", "ca", "cd", "sd",
+  "ss", "as", "us", "ud", "aa", "ad", "rc", "fk",
+  "sk", "ks", "sv", "vfb", "vfl", "club", "calcio",
+  "football", "soccer"
 ]);
 
 // ============================================================
@@ -149,37 +131,28 @@ function normalizeText(v: any): string {
     .trim();
 }
 
-function applyAliases(v: any): string {
-  let result = normalizeText(v);
+function applyAliases(v: string): string {
+  let r = normalizeText(v);
 
-  if (!result) return "";
+  if (!r) return "";
 
-  const aliases = Object.keys(TEAM_ALIASES).sort(
-    (a, b) => b.length - a.length
-  );
-
-  for (const alias of aliases) {
+  for (const alias of Object.keys(TEAM_ALIASES)) {
     const escaped = alias.replace(
       /[.*+?^${}()|[\]\\]/g,
       "\\$&"
     );
 
-    result = result.replace(
-      new RegExp(
-        `(^|\\s)${escaped}(?=\\s|$)`,
-        "g"
-      ),
+    r = r.replace(
+      new RegExp(`(^|\\s)${escaped}(?=\\s|$)`, "g"),
       `$1${TEAM_ALIASES[alias]}`
     );
   }
 
-  return result
-    .replace(/\s+/g, " ")
-    .trim();
+  return r.replace(/\s+/g, " ").trim();
 }
 
 function normalizeTeam(v: any): string {
-  return applyAliases(v)
+  return applyAliases(safeString(v))
     .split(" ")
     .filter(Boolean)
     .filter(x => !GENERIC_WORDS.has(x))
@@ -200,19 +173,13 @@ function splitMatchName(v: any): {
 } {
   const text = safeString(v);
 
-  for (const sep of [
-    " - ",
-    " v ",
-    " vs ",
-    " VS ",
-    " @ "
-  ]) {
-    const index = text.indexOf(sep);
+  for (const sep of [" - ", " v ", " vs ", " VS ", " @ "]) {
+    const i = text.indexOf(sep);
 
-    if (index >= 0) {
+    if (i >= 0) {
       return {
-        home: text.slice(0, index).trim(),
-        away: text.slice(index + sep.length).trim()
+        home: text.slice(0, i).trim(),
+        away: text.slice(i + sep.length).trim()
       };
     }
   }
@@ -242,23 +209,18 @@ function extractHome(m: AnyObj): string {
     m?.teams?.home?.name
   ];
 
-  for (const value of values) {
-    if (
-      typeof value === "string" &&
-      value.trim()
-    ) {
-      return value.trim();
+  for (const v of values) {
+    if (typeof v === "string" && v.trim()) {
+      return v.trim();
     }
   }
 
-  return (
-    splitMatchName(
-      m?.match ??
-      m?.name ??
-      m?.event_name ??
-      ""
-    ).home ?? ""
-  );
+  return splitMatchName(
+    m?.match ??
+    m?.name ??
+    m?.event_name ??
+    ""
+  ).home ?? "";
 }
 
 function extractAway(m: AnyObj): string {
@@ -276,23 +238,18 @@ function extractAway(m: AnyObj): string {
     m?.teams?.away?.name
   ];
 
-  for (const value of values) {
-    if (
-      typeof value === "string" &&
-      value.trim()
-    ) {
-      return value.trim();
+  for (const v of values) {
+    if (typeof v === "string" && v.trim()) {
+      return v.trim();
     }
   }
 
-  return (
-    splitMatchName(
-      m?.match ??
-      m?.name ??
-      m?.event_name ??
-      ""
-    ).away ?? ""
-  );
+  return splitMatchName(
+    m?.match ??
+    m?.name ??
+    m?.event_name ??
+    ""
+  ).away ?? "";
 }
 
 function displayMatch(m: AnyObj): string {
@@ -302,9 +259,7 @@ function displayMatch(m: AnyObj): string {
     m?.event_name
   );
 
-  if (direct) return direct;
-
-  return `${extractHome(m)} - ${extractAway(m)}`;
+  return direct || `${extractHome(m)} - ${extractAway(m)}`;
 }
 
 function extractMatchId(m: AnyObj): string {
@@ -340,48 +295,36 @@ function levenshtein(
   if (!a.length) return b.length;
   if (!b.length) return a.length;
 
-  let previous = Array.from(
+  let prev = Array.from(
     { length: b.length + 1 },
     (_, i) => i
   );
 
-  let current =
-    new Array<number>(b.length + 1);
+  let curr = new Array<number>(
+    b.length + 1
+  );
 
-  for (
-    let i = 1;
-    i <= a.length;
-    i++
-  ) {
-    current[0] = i;
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
 
-    for (
-      let j = 1;
-      j <= b.length;
-      j++
-    ) {
+    for (let j = 1; j <= b.length; j++) {
       const cost =
         a[i - 1] === b[j - 1]
           ? 0
           : 1;
 
-      current[j] = Math.min(
-        current[j - 1] + 1,
-        previous[j] + 1,
-        previous[j - 1] + cost
+      curr[j] = Math.min(
+        curr[j - 1] + 1,
+        prev[j] + 1,
+        prev[j - 1] + cost
       );
     }
 
-    [previous, current] =
-      [current, previous];
+    [prev, curr] = [curr, prev];
   }
 
-  return previous[b.length];
+  return prev[b.length];
 }
-
-// ============================================================
-// TEAM MATCH
-// ============================================================
 
 function characterSimilarity(
   a: any,
@@ -400,6 +343,10 @@ function characterSimilarity(
       Math.max(A.length, B.length)
   );
 }
+
+// ============================================================
+// TEAM MATCH
+// ============================================================
 
 function teamMatchScore(
   a: any,
@@ -448,14 +395,11 @@ function teamMatchScore(
   const tokensA = teamTokens(A);
   const tokensB = teamTokens(B);
 
-  const common =
-    tokensA.filter(x =>
-      tokensB.includes(x)
-    );
+  const common = tokensA.filter(
+    x => tokensB.includes(x)
+  );
 
-  if (
-    common.length >= TOKEN_MIN_COMMON
-  ) {
+  if (common.length >= TOKEN_MIN_COMMON) {
     const score =
       common.length /
       Math.max(
@@ -495,43 +439,29 @@ function twoSidedTeamScore(
   homeB: any,
   awayB: any
 ): AnyObj {
-  const normalHome =
-    teamMatchScore(homeA, homeB);
+  const nH = teamMatchScore(homeA, homeB);
+  const nA = teamMatchScore(awayA, awayB);
 
-  const normalAway =
-    teamMatchScore(awayA, awayB);
+  const rH = teamMatchScore(homeA, awayB);
+  const rA = teamMatchScore(awayA, homeB);
 
-  const reversedHome =
-    teamMatchScore(homeA, awayB);
+  const normalScore =
+    Math.min(nH.score, nA.score);
 
-  const reversedAway =
-    teamMatchScore(awayA, homeB);
-
-  const normalScore = Math.min(
-    normalHome.score,
-    normalAway.score
-  );
-
-  const reversedScore = Math.min(
-    reversedHome.score,
-    reversedAway.score
-  );
+  const reversedScore =
+    Math.min(rH.score, rA.score);
 
   const normalValid =
-    normalHome.accepted &&
-    normalAway.accepted &&
-    normalHome.score >=
-      TEAM_MATCH_MIN_SCORE &&
-    normalAway.score >=
-      TEAM_MATCH_MIN_SCORE;
+    nH.accepted &&
+    nA.accepted &&
+    nH.score >= TEAM_MATCH_MIN_SCORE &&
+    nA.score >= TEAM_MATCH_MIN_SCORE;
 
   const reversedValid =
-    reversedHome.accepted &&
-    reversedAway.accepted &&
-    reversedHome.score >=
-      TEAM_MATCH_MIN_SCORE &&
-    reversedAway.score >=
-      TEAM_MATCH_MIN_SCORE;
+    rH.accepted &&
+    rA.accepted &&
+    rH.score >= TEAM_MATCH_MIN_SCORE &&
+    rA.score >= TEAM_MATCH_MIN_SCORE;
 
   if (
     normalValid &&
@@ -540,14 +470,14 @@ function twoSidedTeamScore(
     return {
       matched: true,
       direction: "NORMAL",
-      home_score: normalHome.score,
-      away_score: normalAway.score,
+      home_score: nH.score,
+      away_score: nA.score,
       combined_score: normalScore,
       both_teams_pass: true,
-      home_method: normalHome.method,
-      away_method: normalAway.method,
-      home_accepted: normalHome.accepted,
-      away_accepted: normalAway.accepted
+      home_method: nH.method,
+      away_method: nA.method,
+      home_accepted: nH.accepted,
+      away_accepted: nA.accepted
     };
   }
 
@@ -555,14 +485,14 @@ function twoSidedTeamScore(
     return {
       matched: true,
       direction: "REVERSED",
-      home_score: reversedHome.score,
-      away_score: reversedAway.score,
+      home_score: rH.score,
+      away_score: rA.score,
       combined_score: reversedScore,
       both_teams_pass: true,
-      home_method: reversedHome.method,
-      away_method: reversedAway.method,
-      home_accepted: reversedHome.accepted,
-      away_accepted: reversedAway.accepted
+      home_method: rH.method,
+      away_method: rA.method,
+      home_accepted: rH.accepted,
+      away_accepted: rA.accepted
     };
   }
 
@@ -577,12 +507,12 @@ function twoSidedTeamScore(
         : "REVERSED",
     home_score:
       normal
-        ? normalHome.score
-        : reversedHome.score,
+        ? nH.score
+        : rH.score,
     away_score:
       normal
-        ? normalAway.score
-        : reversedAway.score,
+        ? nA.score
+        : rA.score,
     combined_score:
       Math.max(
         normalScore,
@@ -591,25 +521,25 @@ function twoSidedTeamScore(
     both_teams_pass: false,
     home_method:
       normal
-        ? normalHome.method
-        : reversedHome.method,
+        ? nH.method
+        : rH.method,
     away_method:
       normal
-        ? normalAway.method
-        : reversedAway.method,
+        ? nA.method
+        : rA.method,
     home_accepted:
       normal
-        ? normalHome.accepted
-        : reversedHome.accepted,
+        ? nH.accepted
+        : rH.accepted,
     away_accepted:
       normal
-        ? normalAway.accepted
-        : reversedAway.accepted
+        ? nA.accepted
+        : rA.accepted
   };
 }
 
 // ============================================================
-// SERVICE
+// SERVICE FETCH
 // ============================================================
 
 async function fetchServiceJSON(
@@ -639,10 +569,7 @@ async function fetchServiceJSON(
 
   if (!response.ok) {
     throw new Error(
-      `HTTP ${response.status} ${path}: ${text.slice(
-        0,
-        500
-      )}`
+      `HTTP ${response.status} ${path}: ${text.slice(0, 500)}`
     );
   }
 
@@ -674,9 +601,7 @@ function extractSignals(
     return data.entries;
   }
 
-  if (
-    Array.isArray(data?.hunter_entries)
-  ) {
+  if (Array.isArray(data?.hunter_entries)) {
     return data.hunter_entries;
   }
 
@@ -699,50 +624,40 @@ function isHunterEntry(
 }
 
 function signalMatchId(
-  signal: AnyObj
+  s: AnyObj
 ): string {
   return safeString(
-    signal?.match_id ??
-    signal?.matchId ??
-    signal?.id ??
-    signal?.v27?.id
+    s?.match_id ??
+    s?.matchId ??
+    s?.id ??
+    s?.v27?.id
   );
 }
 
 function signalMatchName(
-  signal: AnyObj
+  s: AnyObj
 ): string {
   return safeString(
-    signal?.match ??
-    signal?.name ??
-    signal?.v27?.match
+    s?.match ??
+    s?.name ??
+    s?.v27?.match
   );
 }
 
 function signalHome(
-  signal: AnyObj
+  s: AnyObj
 ): string {
-  if (
-    typeof signal?.v27?.home ===
-    "string"
-  ) {
-    return signal.v27.home.trim();
-  }
-
-  return extractHome(signal);
+  return typeof s?.v27?.home === "string"
+    ? s.v27.home.trim()
+    : extractHome(s);
 }
 
 function signalAway(
-  signal: AnyObj
+  s: AnyObj
 ): string {
-  if (
-    typeof signal?.v27?.away ===
-    "string"
-  ) {
-    return signal.v27.away.trim();
-  }
-
-  return extractAway(signal);
+  return typeof s?.v27?.away === "string"
+    ? s.v27.away.trim()
+    : extractAway(s);
 }
 
 // ============================================================
@@ -774,15 +689,15 @@ function extractMatcherMatches(
 function getMatcherScore(
   item: AnyObj
 ): number {
-  const scoring =
+  const s =
     item?.scoring ??
     item?.matcher_scoring ??
     item?.score_details ??
     {};
 
   const score = Number(
-    scoring?.total ??
-    scoring?.score ??
+    s?.total ??
+    s?.score ??
     item?.matcher_score ??
     item?.match_score ??
     item?.score ??
@@ -854,7 +769,7 @@ function extractCloudbetFromMatcher(
 }
 
 // ============================================================
-// VALIDATE MATCHER CANDIDATE
+// MATCHER VALIDATION
 // ============================================================
 
 function validateMatcherCandidate(
@@ -897,10 +812,8 @@ function validateMatcherCandidate(
   const base = {
     classification,
     method,
-    matcher_score:
-      matcherScore,
-    secure_flag:
-      secureFlag
+    matcher_score: matcherScore,
+    secure_flag: secureFlag
   };
 
   if (scoreOnly) {
@@ -912,12 +825,7 @@ function validateMatcherCandidate(
     };
   }
 
-  if (
-    !teamsPresent(
-      vHome,
-      vAway
-    )
-  ) {
+  if (!teamsPresent(vHome, vAway)) {
     return {
       accepted: false,
       reason:
@@ -926,12 +834,7 @@ function validateMatcherCandidate(
     };
   }
 
-  if (
-    !teamsPresent(
-      sHome,
-      sAway
-    )
-  ) {
+  if (!teamsPresent(sHome, sAway)) {
     return {
       accepted: false,
       reason:
@@ -954,8 +857,7 @@ function validateMatcherCandidate(
       reason:
         "STRICT_SIGNAL_TEAMS_MISMATCH",
       ...base,
-      team_scores:
-        teamScore
+      team_scores: teamScore
     };
   }
 
@@ -968,8 +870,7 @@ function validateMatcherCandidate(
       reason:
         "EXACT_ID_WITH_ZERO_SCORE_REJECTED",
       ...base,
-      team_scores:
-        teamScore
+      team_scores: teamScore
     };
   }
 
@@ -982,8 +883,7 @@ function validateMatcherCandidate(
       reason:
         "MATCHER_SCORE_TOO_LOW",
       ...base,
-      team_scores:
-        teamScore
+      team_scores: teamScore
     };
   }
 
@@ -995,22 +895,19 @@ function validateMatcherCandidate(
     matcherScore >=
     STRONG_MATCHER_SCORE;
 
-  if (
-    !confident &&
-    !strongScore
-  ) {
+  if (!confident && !strongScore) {
     return {
       accepted: false,
       reason:
         "NOT_CONFIDENT_AND_SCORE_NOT_STRONG",
       ...base,
-      team_scores:
-        teamScore
+      team_scores: teamScore
     };
   }
 
   return {
     accepted: true,
+
     reason:
       confident
         ? "CONFIDENT_MATCH_ACCEPTED"
@@ -1092,9 +989,7 @@ function findBestMatcherCandidate(
   let best:
     AnyObj | null = null;
 
-  for (
-    const item of matches
-  ) {
+  for (const item of matches) {
     const result =
       validateMatcherCandidate(
         signal,
@@ -1118,8 +1013,7 @@ function findBestMatcherCandidate(
       "UNKNOWN";
 
     rejectionReasons[reason] =
-      (rejectionReasons[reason] ?? 0) +
-      1;
+      (rejectionReasons[reason] ?? 0) + 1;
   }
 
   if (!best) {
@@ -1184,18 +1078,18 @@ function extractCloudbetMatches(
 }
 
 function isCloudbetLive(
-  match: AnyObj
+  m: AnyObj
 ): boolean {
   const status =
     safeString(
-      match?.status
+      m?.status
     ).toUpperCase();
 
   return (
     status === "TRADING_LIVE" ||
-    match?.live === true ||
+    m?.live === true ||
     safeString(
-      match?.state
+      m?.state
     ).toUpperCase() === "LIVE"
   );
 }
@@ -1214,12 +1108,7 @@ function findDirectCloudbetFallback(
   const sAway =
     signalAway(signal);
 
-  if (
-    !teamsPresent(
-      sHome,
-      sAway
-    )
-  ) {
+  if (!teamsPresent(sHome, sAway)) {
     return {
       found: false,
       reason:
@@ -1232,15 +1121,10 @@ function findDirectCloudbetFallback(
   let best:
     AnyObj | null = null;
 
-  const rejected:
-    AnyObj[] = [];
+  const rejected: AnyObj[] = [];
+  const topCandidates: AnyObj[] = [];
 
-  const topCandidates:
-    AnyObj[] = [];
-
-  for (
-    const cb of cloudbetMatches
-  ) {
+  for (const cb of cloudbetMatches) {
     const cbHome =
       extractHome(cb);
 
@@ -1420,24 +1304,15 @@ function verifyCloudbetMatch(
   }
 
   const targetId =
-    safeString(
-      target?.id
-    );
+    safeString(target?.id);
 
   const targetHome =
-    normalizeTeam(
-      target?.home
-    );
+    normalizeTeam(target?.home);
 
   const targetAway =
-    normalizeTeam(
-      target?.away
-    );
+    normalizeTeam(target?.away);
 
-  if (
-    !targetHome ||
-    !targetAway
-  ) {
+  if (!targetHome || !targetAway) {
     return {
       verified: false,
       reason:
@@ -1446,9 +1321,7 @@ function verifyCloudbetMatch(
   }
 
   if (targetId) {
-    for (
-      const cb of cloudbetMatches
-    ) {
+    for (const cb of cloudbetMatches) {
       if (
         extractMatchId(cb) !==
         targetId
@@ -1499,9 +1372,7 @@ function verifyCloudbetMatch(
   let best:
     AnyObj | null = null;
 
-  for (
-    const cb of cloudbetMatches
-  ) {
+  for (const cb of cloudbetMatches) {
     const score =
       twoSidedTeamScore(
         targetHome,
@@ -1556,6 +1427,7 @@ function verifyCloudbetMatch(
 
   return {
     verified: false,
+
     reason:
       "CLOUDBET_STRICT_TEAM_MATCH_NOT_CONFIRMED"
   };
@@ -1599,24 +1471,19 @@ function buildPreparedBet(
         ),
 
       match:
-        signalMatchName(
-          signal
-        ),
+        signalMatchName(signal),
 
       match_id:
-        signalMatchId(
-          signal
-        ) || null,
+        signalMatchId(signal) ||
+        null,
 
       home:
-        signalHome(
-          signal
-        ) || null,
+        signalHome(signal) ||
+        null,
 
       away:
-        signalAway(
-          signal
-        ) || null,
+        signalAway(signal) ||
+        null,
 
       entry_minute:
         signal?.entry_minute ??
@@ -1800,6 +1667,9 @@ function archiveKey(
 
 // ============================================================
 // ARCHIVE BATCH
+//
+// One D1 batch instead of one DB request per READY match.
+// INSERT OR IGNORE keeps execution idempotent.
 // ============================================================
 
 async function archiveReadyBets(
@@ -1816,85 +1686,75 @@ async function archiveReadyBets(
     };
   }
 
-  const unique =
-    new Map<string, AnyObj>();
-
-  for (const bet of bets) {
-    const key =
-      archiveKey(bet);
-
-    if (!unique.has(key)) {
-      unique.set(key, bet);
-    }
-  }
+  const now =
+    new Date().toISOString();
 
   const statements =
-    Array.from(
-      unique.entries()
-    ).map(
-      ([key, bet]) =>
-        env.DB
-          .prepare(`
-            INSERT OR IGNORE INTO hunter_bet_archive (
-              archive_key,
-              match_id,
-              match,
-              home,
-              away,
-              entry_minute,
-              hunter_score,
-              cloudbet_id,
-              cloudbet_match,
-              matcher_source,
-              matcher_score,
-              cloudbet_combined_score,
-              direction,
-              created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-          `)
-          .bind(
-            key,
-
-            bet.signal?.match_id ??
-              null,
-
-            bet.signal?.match ??
-              null,
-
-            bet.signal?.home ??
-              null,
-
-            bet.signal?.away ??
-              null,
-
-            bet.signal?.entry_minute ??
-              null,
-
-            bet.signal?.hunter_score ??
-              null,
-
-            bet.cloudbet?.id ??
-              null,
-
-            bet.cloudbet?.match ??
-              null,
-
-            bet.matcher?.source ??
-              null,
-
-            bet.matcher?.matcher_score ??
-              null,
-
-            bet.security?.cloudbet_combined_score ??
-              null,
-
-            bet.security?.cloudbet_team_direction ??
-              null,
-
-            new Date().toISOString()
+    bets.map(bet => {
+      return env.DB
+        .prepare(`
+          INSERT OR IGNORE INTO hunter_bet_archive (
+            archive_key,
+            match_id,
+            match,
+            home,
+            away,
+            entry_minute,
+            hunter_score,
+            cloudbet_id,
+            cloudbet_match,
+            matcher_source,
+            matcher_score,
+            cloudbet_combined_score,
+            direction,
+            created_at
           )
-    );
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .bind(
+          archiveKey(bet),
+
+          bet.signal.match_id ??
+            null,
+
+          bet.signal.match ??
+            null,
+
+          bet.signal.home ??
+            null,
+
+          bet.signal.away ??
+            null,
+
+          bet.signal.entry_minute ??
+            null,
+
+          bet.signal.hunter_score ??
+            null,
+
+          bet.cloudbet.id ??
+            null,
+
+          bet.cloudbet.match ??
+            null,
+
+          bet.matcher.source ??
+            null,
+
+          bet.matcher.matcher_score ??
+            null,
+
+          bet.security
+            .cloudbet_combined_score ??
+            null,
+
+          bet.security
+            .cloudbet_team_direction ??
+            null,
+
+          now
+        );
+    });
 
   const results =
     await env.DB.batch(
@@ -1915,8 +1775,10 @@ async function archiveReadyBets(
     inserted,
 
     duplicates:
-      bets.length -
-      inserted
+      Math.max(
+        0,
+        bets.length - inserted
+      )
   };
 }
 
@@ -1927,133 +1789,78 @@ async function archiveReadyBets(
 async function archiveResponse(
   env: Env
 ): Promise<Response> {
-  try {
-    const result =
-      await env.DB
-        .prepare(`
-          SELECT
-            id,
-            match_id,
-            match,
-            home,
-            away,
-            entry_minute,
-            hunter_score,
-            cloudbet_id,
-            matcher_source,
-            matcher_score,
-            cloudbet_combined_score,
-            direction,
-            created_at,
-            COUNT(*) OVER() AS total_count
-          FROM hunter_bet_archive
-          ORDER BY id DESC
-          LIMIT ?
-        `)
-        .bind(
-          ARCHIVE_LIMIT
-        )
-        .all();
+  const count =
+    await env.DB
+      .prepare(`
+        SELECT COUNT(*) AS total
+        FROM hunter_bet_archive
+      `)
+      .first<{
+        total: number;
+      }>();
 
-    const rows =
-      result.results ?? [];
+  const recent =
+    await env.DB
+      .prepare(`
+        SELECT
+          id,
+          match_id,
+          match,
+          home,
+          away,
+          entry_minute,
+          hunter_score,
+          cloudbet_id,
+          matcher_source,
+          matcher_score,
+          cloudbet_combined_score,
+          direction,
+          created_at
+        FROM hunter_bet_archive
+        ORDER BY id DESC
+        LIMIT 20
+      `)
+      .all();
 
-    const total =
-      rows.length
-        ? Number(
-            rows[0]?.total_count ??
-            rows.length
-          )
-        : 0;
+  return json({
+    success: true,
 
-    return json({
-      success: true,
+    worker:
+      "cloudbet-bet-worker",
 
-      worker:
-        "cloudbet-bet-worker",
+    version:
+      VERSION,
 
-      version:
-        VERSION,
+    archive: {
+      table:
+        ARCHIVE_TABLE,
 
-      mode:
-        MODE,
+      total_confirmed_hunter_matches:
+        Number(
+          count?.total ??
+          0
+        ),
 
-      betting:
-        "DISABLED",
+      recent_count:
+        recent.results?.length ??
+        0,
 
-      archive: {
-        table:
-          ARCHIVE_TABLE,
+      recent:
+        recent.results ??
+        []
+    },
 
-        total_confirmed_hunter_matches:
-          total,
+    database: {
+      binding:
+        "DB",
 
-        recent_count:
-          rows.length,
+      status:
+        "OK"
+    },
 
-        recent:
-          rows
-      },
-
-      database: {
-        binding:
-          "DB",
-
-        status:
-          "OK"
-      },
-
-      timestamp:
-        new Date().toISOString()
-    });
-  } catch (error: any) {
-    return json(
-      {
-        success: false,
-
-        worker:
-          "cloudbet-bet-worker",
-
-        version:
-          VERSION,
-
-        mode:
-          MODE,
-
-        archive: {
-          table:
-            ARCHIVE_TABLE,
-
-          total_confirmed_hunter_matches:
-            null,
-
-          recent_count:
-            0,
-
-          recent: []
-        },
-
-        database: {
-          binding:
-            "DB",
-
-          status:
-            "ERROR"
-        },
-
-        error:
-          error?.message ??
-          String(error),
-
-        hint:
-          "Check that hunter_bet_archive exists in the D1 database bound as DB.",
-
-        timestamp:
-          new Date().toISOString()
-      },
-      500
-    );
-  }
+    timestamp:
+      new Date().toISOString()
+  });
 }
 
 // ============================================================
@@ -2063,8 +1870,7 @@ async function archiveResponse(
 function buildNoMatch(
   signal: AnyObj,
   reason: string,
-  matcherInfo:
-    AnyObj | null = null
+  matcherInfo: AnyObj | null = null
 ): AnyObj {
   return {
     status:
@@ -2093,24 +1899,19 @@ function buildNoMatch(
         ),
 
       match:
-        signalMatchName(
-          signal
-        ),
+        signalMatchName(signal),
 
       match_id:
-        signalMatchId(
-          signal
-        ) || null,
+        signalMatchId(signal) ||
+        null,
 
       home:
-        signalHome(
-          signal
-        ) || null,
+        signalHome(signal) ||
+        null,
 
       away:
-        signalAway(
-          signal
-        ) || null,
+        signalAway(signal) ||
+        null,
 
       normalized_home:
         normalizeTeam(
@@ -2174,12 +1975,10 @@ function emptyResponse(
   trackerMs: number
 ): Response {
   const totalMs =
-    Date.now() -
-    started;
+    Date.now() - started;
 
   return json({
-    success:
-      true,
+    success: true,
 
     worker:
       "cloudbet-bet-worker",
@@ -2194,17 +1993,10 @@ function emptyResponse(
       "DISABLED",
 
     bindings: {
-      TRACKER:
-        true,
-
-      MATCHER:
-        true,
-
-      CLOUDBET:
-        true,
-
-      DB:
-        true
+      TRACKER: true,
+      MATCHER: true,
+      CLOUDBET: true,
+      DB: true
     },
 
     target: {
@@ -2249,6 +2041,9 @@ function emptyResponse(
     },
 
     archive: {
+      table:
+        ARCHIVE_TABLE,
+
       called:
         false,
 
@@ -2427,18 +2222,15 @@ async function runV53(
       matcherData
     );
 
-  const rawCloudbetMatches =
+  const liveCloudbet =
     extractCloudbetMatches(
       cloudbetData
-    );
-
-  const liveCloudbet =
-    rawCloudbetMatches.filter(
+    ).filter(
       isCloudbetLive
     );
 
   // ==========================================================
-  // PROCESS
+  // LOCAL PROCESSING
   // ==========================================================
 
   const localStarted =
@@ -2469,34 +2261,28 @@ async function runV53(
   // PROCESS HUNTER ENTRIES
   // ==========================================================
 
-  for (
-    const signal of hunterEntries
-  ) {
-    const diagnostic:
-      AnyObj = {
-        signal:
-          signalMatchName(
-            signal
-          ),
+  for (const signal of hunterEntries) {
+    const diagnostic: AnyObj = {
+      signal:
+        signalMatchName(signal),
 
-        match_id:
-          signalMatchId(
-            signal
-          ) || null,
+      match_id:
+        signalMatchId(signal) ||
+        null,
 
-        matcher:
-          null,
+      matcher:
+        null,
 
-        cloudbet:
-          null,
+      cloudbet:
+        null,
 
-        final:
-          null
-      };
+      final:
+        null
+    };
 
-    // --------------------------------------------------------
+    // ========================================================
     // PRIMARY MATCHER
-    // --------------------------------------------------------
+    // ========================================================
 
     const matcherResult =
       findBestMatcherCandidate(
@@ -2513,12 +2299,14 @@ async function runV53(
         null,
 
       candidates_checked:
-        matcherResult.diagnostics
+        matcherResult
+          .diagnostics
           ?.candidates_checked ??
         matcherMatches.length,
 
       rejection_reasons:
-        matcherResult.diagnostics
+        matcherResult
+          .diagnostics
           ?.rejection_reasons ??
         {},
 
@@ -2526,43 +2314,48 @@ async function runV53(
         matcherResult.found
           ? {
               match:
-                matcherResult.v27?.match ??
+                matcherResult
+                  .v27?.match ??
                 null,
 
               home:
-                matcherResult.v27?.home ??
+                matcherResult
+                  .v27?.home ??
                 null,
 
               away:
-                matcherResult.v27?.away ??
+                matcherResult
+                  .v27?.away ??
                 null,
 
               matcher_score:
-                matcherResult.matcher_score ??
+                matcherResult
+                  .matcher_score ??
                 null,
 
               classification:
-                matcherResult.classification ??
+                matcherResult
+                  .classification ??
                 null,
 
               method:
-                matcherResult.method ??
+                matcherResult
+                  .method ??
                 null,
 
               team_scores:
-                matcherResult.team_scores ??
+                matcherResult
+                  .team_scores ??
                 null
             }
           : null
     };
 
-    // --------------------------------------------------------
+    // ========================================================
     // MATCHER ACCEPTED
-    // --------------------------------------------------------
+    // ========================================================
 
-    if (
-      matcherResult.found
-    ) {
+    if (matcherResult.found) {
       matcherSecureMatches++;
 
       const verification =
@@ -2599,17 +2392,18 @@ async function runV53(
             : null
       };
 
-      if (
-        verification.verified
-      ) {
+      if (verification.verified) {
         cloudbetVerifiedMatches++;
 
-        preparedBets.push(
+        const bet =
           buildPreparedBet(
             signal,
             matcherResult,
             verification
-          )
+          );
+
+        preparedBets.push(
+          bet
         );
 
         diagnostic.final = {
@@ -2630,9 +2424,9 @@ async function runV53(
         continue;
       }
 
-      // ------------------------------------------------------
+      // ======================================================
       // DIRECT FALLBACK
-      // ------------------------------------------------------
+      // ======================================================
 
       const fallback =
         findDirectCloudbetFallback(
@@ -2643,9 +2437,7 @@ async function runV53(
       diagnostic.cloudbet.direct_fallback =
         fallback;
 
-      if (
-        fallback.found
-      ) {
+      if (fallback.found) {
         directFallbackMatches++;
         cloudbetVerifiedMatches++;
 
@@ -2711,12 +2503,15 @@ async function runV53(
             fallback.match
         };
 
-        preparedBets.push(
+        const bet =
           buildPreparedBet(
             signal,
             fallbackMatcher,
             directVerification
-          )
+          );
+
+        preparedBets.push(
+          bet
         );
 
         diagnostic.final = {
@@ -2737,9 +2532,9 @@ async function runV53(
         continue;
       }
 
-      // ------------------------------------------------------
-      // FAILURE
-      // ------------------------------------------------------
+      // ======================================================
+      // MATCHER ACCEPTED BUT CLOUDBET FAILED
+      // ======================================================
 
       const reason =
         verification.reason ??
@@ -2758,22 +2553,28 @@ async function runV53(
               "MATCHER",
 
             classification:
-              matcherResult.classification,
+              matcherResult
+                .classification,
 
             match_method:
-              matcherResult.method,
+              matcherResult
+                .method,
 
             matcher_score:
-              matcherResult.matcher_score,
+              matcherResult
+                .matcher_score,
 
             matcher_reason:
-              matcherResult.reason,
+              matcherResult
+                .reason,
 
             v27:
-              matcherResult.v27,
+              matcherResult
+                .v27,
 
             cloudbet_target:
-              matcherResult.cloudbet,
+              matcherResult
+                .cloudbet,
 
             cloudbet_verification:
               verification,
@@ -2818,9 +2619,7 @@ async function runV53(
         fallback
     };
 
-    if (
-      fallback.found
-    ) {
+    if (fallback.found) {
       directFallbackMatches++;
       cloudbetVerifiedMatches++;
 
@@ -2930,17 +2729,20 @@ async function runV53(
         {
           matcher: {
             candidates_checked:
-              matcherResult.diagnostics
+              matcherResult
+                .diagnostics
                 ?.candidates_checked ??
               0,
 
             rejection_reasons:
-              matcherResult.diagnostics
+              matcherResult
+                .diagnostics
                 ?.rejection_reasons ??
               {},
 
             matcher_reason:
-              matcherResult.reason ??
+              matcherResult
+                .reason ??
               null
           },
 
@@ -2984,30 +2786,27 @@ async function runV53(
   }
 
   // ==========================================================
-  // ARCHIVE READY MATCHES — ONE D1 BATCH
+  // ARCHIVE — ONE D1 BATCH
   // ==========================================================
 
-  let archiveInserted =
-    0;
+  const archiveStarted =
+    Date.now();
 
-  let archiveDuplicates =
-    0;
+  const archiveResult =
+    await archiveReadyBets(
+      env,
+      preparedBets
+    );
 
-  if (
-    preparedBets.length
-  ) {
-    const archiveResult =
-      await archiveReadyBets(
-        env,
-        preparedBets
-      );
+  const archiveMs =
+    Date.now() -
+    archiveStarted;
 
-    archiveInserted =
-      archiveResult.inserted;
+  const archiveInserted =
+    archiveResult.inserted;
 
-    archiveDuplicates =
-      archiveResult.duplicates;
-  }
+  const archiveDuplicates =
+    archiveResult.duplicates;
 
   // ==========================================================
   // TIMING
@@ -3020,6 +2819,18 @@ async function runV53(
   const totalMs =
     Date.now() -
     started;
+
+  const sequentialEstimateMs =
+    trackerMs +
+    matcherMs +
+    cloudbetMs;
+
+  const parallelSavingEstimateMs =
+    Math.max(
+      0,
+      sequentialEstimateMs -
+        totalMs
+    );
 
   // ==========================================================
   // RESPONSE
@@ -3085,14 +2896,16 @@ async function runV53(
         true,
 
       success:
-        matcherData?.success === true,
+        matcherData?.success ===
+        true,
 
       version:
         matcherData?.version ??
         null,
 
       candidates_detected:
-        matcherData?.candidates_detected ??
+        matcherData
+          ?.candidates_detected ??
         matcherMatches.length,
 
       secure_matches:
@@ -3107,7 +2920,9 @@ async function runV53(
         true,
 
       raw_matches:
-        rawCloudbetMatches.length,
+        extractCloudbetMatches(
+          cloudbetData
+        ).length,
 
       live_matches:
         liveCloudbet.length,
@@ -3120,6 +2935,9 @@ async function runV53(
       table:
         ARCHIVE_TABLE,
 
+      binding:
+        "DB",
+
       ready_received:
         preparedBets.length,
 
@@ -3129,11 +2947,14 @@ async function runV53(
       duplicates:
         archiveDuplicates,
 
+      batch:
+        true,
+
       idempotent:
         true,
 
-      batch:
-        true
+      db_ms:
+        archiveMs
     },
 
     timing: {
@@ -3152,22 +2973,17 @@ async function runV53(
       local_processing_ms:
         localProcessingMs,
 
+      archive_ms:
+        archiveMs,
+
       total_ms:
         totalMs,
 
       sequential_estimate_ms:
-        trackerMs +
-        matcherMs +
-        cloudbetMs,
+        sequentialEstimateMs,
 
       parallel_saving_estimate_ms:
-        Math.max(
-          0,
-          trackerMs +
-          matcherMs +
-          cloudbetMs -
-          totalMs
-        ),
+        parallelSavingEstimateMs,
 
       matcher_cloudbet_overlap:
         true
@@ -3220,8 +3036,11 @@ async function runV53(
         directFallbackMatches,
 
       signals_with_cloudbet_failure:
-        hunterEntries.length -
-        cloudbetVerifiedMatches,
+        Math.max(
+          0,
+          hunterEntries.length -
+            cloudbetVerifiedMatches
+        ),
 
       signal_flow:
         signalDiagnostics,
@@ -3234,13 +3053,13 @@ async function runV53(
           "DB",
 
         archive_duplicate_protection:
-          "INSERT OR IGNORE + UNIQUE archive_key",
+          "INSERT OR IGNORE",
+
+        archive_write_mode:
+          "D1 BATCH",
 
         archive_key:
           "MATCH_ID OR NORMALIZED_HOME_AWAY",
-
-        archive_batch:
-          true,
 
         betting:
           "DISABLED",
@@ -3332,16 +3151,18 @@ async function runV53(
       direct_fallback_uses_existing_live_data:
         true,
 
-      archive_writes:
-        preparedBets.length,
-
       archive_batch:
         true,
 
-      archive_duplicate_protection:
-        true,
+      archive_writes:
+        preparedBets.length,
 
-      archive_unique_keys:
+      archive_database_calls:
+        preparedBets.length
+          ? 1
+          : 0,
+
+      duplicate_archive_writes_prevented:
         true
     },
 
@@ -3352,7 +3173,7 @@ async function runV53(
       noMatch,
 
     message:
-      "V5.3 TEST READ ONLY. V5.2 matching logic preserved. READY Hunter matches are archived in D1 with batch insert and duplicate protection.",
+      "V5.3 TEST READ ONLY. V5.2 matching logic preserved. READY Hunter matches are archived in D1 with batch INSERT OR IGNORE.",
 
     timestamp:
       new Date().toISOString()
@@ -3549,7 +3370,7 @@ export default {
       }
 
       // ------------------------------------------------------
-      // MAIN EXECUTION
+      // MAIN V5.3 EXECUTION
       // ------------------------------------------------------
 
       if (
@@ -3566,7 +3387,7 @@ export default {
       }
 
       // ------------------------------------------------------
-      // UNKNOWN
+      // UNKNOWN ENDPOINT
       // ------------------------------------------------------
 
       return json(
@@ -3599,9 +3420,8 @@ export default {
         },
         404
       );
-    } catch (
-      error: any
-    ) {
+
+    } catch (error: any) {
       return json(
         {
           success:
