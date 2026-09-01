@@ -1,29 +1,21 @@
 // ============================================================
-// CLOUDBET BET WORKER V5.2
+// CLOUDBET BET WORKER V5.3
 // READ ONLY — TEST MODE
 // BETTING DISABLED
 //
 // PURPOSE:
-// SECURE MATCHING + PERFORMANCE DIAGNOSTICS
+// SECURE MATCHING + PERFORMANCE DIAGNOSTICS + HUNTER ARCHIVE
 //
-// V5.2 CHANGES:
-// 1. TRACKER = 1 CALL
-// 2. MATCHER + CLOUDBET /live RUN IN PARALLEL
-// 3. EXACT TIMING FOR TRACKER / MATCHER / CLOUDBET
-// 4. LOCAL PROCESSING TIMING
-// 5. TOTAL EXECUTION TIMING
-// 6. V5.1 SECURITY LOGIC PRESERVED
-// 7. BETTING REMAINS DISABLED
-//
-// FLOW:
-//
-// TRACKER
-//    |
-//    +------ MATCHER
-//    |
-//    +------ CLOUDBET /live
-//
-// MATCHER + CLOUDBET RUN CONCURRENTLY
+// V5.3 CHANGES:
+// 1. V5.2 MATCHER LOGIC PRESERVED
+// 2. V5.2 CLOUDBET LOGIC PRESERVED
+// 3. V5.2 PARALLEL MATCHER + CLOUDBET PRESERVED
+// 4. NEW D1 bet_archive TABLE
+// 5. EVERY HUNTER_ENTRY IS ARCHIVED
+// 6. READY / NO_MATCH ARE STORED AS SEPARATE ROWS
+// 7. DUPLICATE SAME MATCH + SAME RESULT IS IGNORED
+// 8. /archive RETURNS ARCHIVE STATISTICS + MATCHES
+// 9. /archive/clear CLEARS ONLY bet_archive
 //
 // IMPORTANT:
 // NO BETS ARE PLACED.
@@ -34,6 +26,7 @@ interface Env {
   TRACKER: Fetcher;
   MATCHER: Fetcher;
   CLOUDBET: Fetcher;
+  DB: D1Database;
 }
 
 
@@ -44,7 +37,7 @@ type AnyObj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V5.2";
+const VERSION = "V5.3";
 
 const MODE = "READ_ONLY_TEST";
 
@@ -3033,7 +3026,7 @@ function buildPreparedBet(
 
 
     action:
-      "NO_BET_V5_2_TEST"
+      "NO_BET_V5_3_TEST"
   };
 }
 
@@ -3142,10 +3135,573 @@ function buildNoMatch(
 
 
     action:
-      "NO_BET_V5_2_TEST",
+      "NO_BET_V5_3_TEST",
 
     reason
   };
+}
+
+
+// ============================================================
+// ARCHIVE HELPERS
+// ============================================================
+
+function newExecutionId(): string {
+
+  return (
+    `${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2, 10)}`
+  );
+}
+
+
+function nullableNumber(
+  value: any
+): number | null {
+
+  const number =
+    Number(value);
+
+  return Number.isFinite(number)
+    ? number
+    : null;
+}
+
+
+function archiveMatchId(
+  item: AnyObj
+): string {
+
+  return safeString(
+    item?.signal?.match_id ??
+    item?.match_id ??
+    ""
+  );
+}
+
+
+function archiveMatchName(
+  item: AnyObj
+): string {
+
+  return safeString(
+    item?.signal?.match ??
+    item?.match ??
+    ""
+  );
+}
+
+
+function archiveHome(
+  item: AnyObj
+): string {
+
+  return safeString(
+    item?.signal?.home ??
+    item?.home ??
+    ""
+  );
+}
+
+
+function archiveAway(
+  item: AnyObj
+): string {
+
+  return safeString(
+    item?.signal?.away ??
+    item?.away ??
+    ""
+  );
+}
+
+
+function archiveEntryMinute(
+  item: AnyObj
+): number | null {
+
+  return nullableNumber(
+    item?.signal?.entry_minute ??
+    item?.entry_minute
+  );
+}
+
+
+function archiveHunterScore(
+  item: AnyObj
+): number | null {
+
+  return nullableNumber(
+    item?.signal?.hunter_score ??
+    item?.hunter_score
+  );
+}
+
+
+function archiveMatcherScore(
+  item: AnyObj
+): number | null {
+
+  return nullableNumber(
+    item?.matcher?.matcher_score ??
+    item?.matcher_score
+  );
+}
+
+
+function archiveMatcherSource(
+  item: AnyObj
+): string | null {
+
+  const source =
+    safeString(
+      item?.matcher?.source ??
+      item?.source ??
+      ""
+    );
+
+  return source || null;
+}
+
+
+function archiveCloudbetVerified(
+  item: AnyObj
+): number {
+
+  return (
+    item?.security?.cloudbet_verified === true ||
+    item?.cloudbet_verified === true
+  )
+    ? 1
+    : 0;
+}
+
+
+function archiveReason(
+  item: AnyObj
+): string | null {
+
+  const reason =
+    safeString(
+      item?.reason ??
+      item?.matcher?.reason ??
+      ""
+    );
+
+  return reason || null;
+}
+
+
+function archiveCloudbetMatchId(
+  item: AnyObj
+): string | null {
+
+  const id =
+    safeString(
+      item?.cloudbet?.id ??
+      item?.cloudbet_match_id ??
+      ""
+    );
+
+  return id || null;
+}
+
+
+function archiveCloudbetMatchName(
+  item: AnyObj
+): string | null {
+
+  const name =
+    safeString(
+      item?.cloudbet?.match ??
+      item?.cloudbet_match_name ??
+      ""
+    );
+
+  return name || null;
+}
+
+
+// ============================================================
+// ARCHIVE ONE RESULT
+//
+// IMPORTANT:
+// INSERT OR IGNORE means:
+//
+// same match + same result
+// = no duplicate.
+//
+// READY and NO_MATCH are allowed as separate results.
+// ============================================================
+
+async function archiveResult(
+  db: D1Database,
+  executionId: string,
+  timestamp: string,
+  item: AnyObj
+): Promise<boolean> {
+
+  const matchId =
+    archiveMatchId(item);
+
+
+  if (!matchId) {
+    return false;
+  }
+
+
+  const result =
+    safeString(
+      item?.status
+    ).toUpperCase();
+
+
+  if (
+    result !== "READY" &&
+    result !== "NO_MATCH"
+  ) {
+    return false;
+  }
+
+
+  await db.prepare(`
+    INSERT OR IGNORE INTO bet_archive (
+      execution_id,
+      timestamp,
+      match_id,
+      match_name,
+      home,
+      away,
+      entry_minute,
+      hunter_score,
+      matcher_score,
+      matcher_source,
+      cloudbet_verified,
+      result,
+      reason,
+      cloudbet_match_id,
+      cloudbet_match_name
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `)
+    .bind(
+      executionId,
+      timestamp,
+      matchId,
+      archiveMatchName(item) || null,
+      archiveHome(item) || null,
+      archiveAway(item) || null,
+      archiveEntryMinute(item),
+      archiveHunterScore(item),
+      archiveMatcherScore(item),
+      archiveMatcherSource(item),
+      archiveCloudbetVerified(item),
+      result,
+      archiveReason(item),
+      archiveCloudbetMatchId(item),
+      archiveCloudbetMatchName(item)
+    )
+    .run();
+
+
+  return true;
+}
+
+
+// ============================================================
+// ARCHIVE ALL RESULTS
+// ============================================================
+
+async function archiveResults(
+  db: D1Database,
+  executionId: string,
+  timestamp: string,
+  preparedBets: AnyObj[],
+  noMatch: AnyObj[]
+): Promise<AnyObj> {
+
+  let attempted = 0;
+  let archived = 0;
+
+
+  for (
+    const item
+    of preparedBets
+  ) {
+
+    attempted++;
+
+    try {
+
+      if (
+        await archiveResult(
+          db,
+          executionId,
+          timestamp,
+          item
+        )
+      ) {
+        archived++;
+      }
+
+    } catch {
+      // Archive failure must never stop Matcher/Cloudbet result.
+    }
+  }
+
+
+  for (
+    const item
+    of noMatch
+  ) {
+
+    attempted++;
+
+    try {
+
+      if (
+        await archiveResult(
+          db,
+          executionId,
+          timestamp,
+          item
+        )
+      ) {
+        archived++;
+      }
+
+    } catch {
+      // Archive failure must never stop Matcher/Cloudbet result.
+    }
+  }
+
+
+  return {
+
+    attempted,
+
+    archived
+  };
+}
+
+
+// ============================================================
+// ARCHIVE ENDPOINT
+// ============================================================
+
+async function getArchive(
+  db: D1Database
+): Promise<Response> {
+
+  const countResult =
+    await db.prepare(`
+      SELECT
+        COUNT(*) AS total,
+        SUM(
+          CASE
+            WHEN result = 'READY'
+            THEN 1
+            ELSE 0
+          END
+        ) AS ready,
+        SUM(
+          CASE
+            WHEN result = 'NO_MATCH'
+            THEN 1
+            ELSE 0
+          END
+        ) AS no_match,
+        SUM(
+          CASE
+            WHEN cloudbet_verified = 1
+            THEN 1
+            ELSE 0
+          END
+        ) AS cloudbet_verified,
+        SUM(
+          CASE
+            WHEN matcher_source = 'DIRECT_CLOUDBET_FALLBACK'
+            THEN 1
+            ELSE 0
+          END
+        ) AS fallback_matches
+      FROM bet_archive
+    `)
+    .first();
+
+
+  const rows =
+    await db.prepare(`
+      SELECT
+        id,
+        execution_id,
+        timestamp,
+        match_id,
+        match_name,
+        home,
+        away,
+        entry_minute,
+        hunter_score,
+        matcher_score,
+        matcher_source,
+        cloudbet_verified,
+        result,
+        reason,
+        cloudbet_match_id,
+        cloudbet_match_name
+      FROM bet_archive
+      ORDER BY timestamp DESC, id DESC
+    `)
+    .all();
+
+
+  const total =
+    Number(
+      countResult?.total ?? 0
+    );
+
+  const ready =
+    Number(
+      countResult?.ready ?? 0
+    );
+
+  const noMatch =
+    Number(
+      countResult?.no_match ?? 0
+    );
+
+  const cloudbetVerified =
+    Number(
+      countResult?.cloudbet_verified ?? 0
+    );
+
+  const fallbackMatches =
+    Number(
+      countResult?.fallback_matches ?? 0
+    );
+
+
+  return json({
+
+    success:
+      true,
+
+    worker:
+      "cloudbet-bet-worker",
+
+    version:
+      VERSION,
+
+    archive:
+      "bet_archive",
+
+    statistics: {
+
+      total_hunter_entries:
+        total,
+
+      ready,
+
+      no_match:
+        noMatch,
+
+      cloudbet_verified:
+        cloudbetVerified,
+
+      fallback_matches:
+        fallbackMatches
+    },
+
+
+    // Telegram-friendly summary
+    summary: [
+      "ARCHIVE",
+      "",
+      `Total Hunter entries: ${total}`,
+      `READY: ${ready}`,
+      `NO_MATCH: ${noMatch}`,
+      `Cloudbet verified: ${cloudbetVerified}`,
+      `Fallback matches: ${fallbackMatches}`
+    ].join("\n"),
+
+
+    matches:
+      rows.results ?? [],
+
+
+    count:
+      rows.results?.length ?? 0,
+
+    timestamp:
+      new Date().toISOString()
+  });
+}
+
+
+// ============================================================
+// ARCHIVE CLEAR
+//
+// IMPORTANT:
+// ONLY bet_archive IS TOUCHED.
+// TRACKER / MATCHER / CLOUDBET ARE NOT CALLED.
+// ============================================================
+
+async function clearArchive(
+  db: D1Database
+): Promise<Response> {
+
+  const before =
+    await db.prepare(`
+      SELECT COUNT(*) AS total
+      FROM bet_archive
+    `)
+    .first();
+
+
+  const deleted =
+    Number(
+      before?.total ?? 0
+    );
+
+
+  await db.prepare(`
+    DELETE FROM bet_archive
+  `)
+  .run();
+
+
+  return json({
+
+    success:
+      true,
+
+    worker:
+      "cloudbet-bet-worker",
+
+    version:
+      VERSION,
+
+    action:
+      "ARCHIVE_CLEAR",
+
+    archive:
+      "bet_archive",
+
+    deleted,
+
+    tracker:
+      "NOT TOUCHED",
+
+    matcher:
+      "NOT TOUCHED",
+
+    cloudbet:
+      "NOT TOUCHED",
+
+    timestamp:
+      new Date().toISOString()
+  });
 }
 
 
@@ -3191,6 +3747,9 @@ function emptyResponse(
         true,
 
       CLOUDBET:
+        true,
+
+      DB:
         true
     },
 
@@ -3208,64 +3767,6 @@ function emptyResponse(
 
       line:
         TARGET_LINE
-    },
-
-
-    security: {
-
-      test_mode:
-        true,
-
-      matcher_discovery_threshold:
-        MATCHER_THRESHOLD,
-
-      matcher_accept_min_score:
-        MIN_MATCHER_SCORE,
-
-      matcher_score_is_team_validation:
-        false,
-
-      matcher_team_minimum:
-        TEAM_MATCH_MIN_SCORE,
-
-      character_similarity_minimum:
-        CHARACTER_SIMILARITY_MIN_SCORE,
-
-      containment_minimum:
-        CONTAINMENT_MIN_SCORE,
-
-      token_minimum:
-        TOKEN_MATCH_MIN_SCORE,
-
-      confident_match_required:
-        false,
-
-      score_only_matching:
-        false,
-
-      exact_id_alone_is_not_secure:
-        true,
-
-      exact_id_requires_positive_matcher_score:
-        true,
-
-      two_sided_team_validation:
-        true,
-
-      strict_team_validation:
-        true,
-
-      reversed_direction_allowed:
-        true,
-
-      cloudbet_second_verification:
-        true,
-
-      direct_cloudbet_fallback:
-        true,
-
-      secure_flag_false_hard_rejection:
-        false
     },
 
 
@@ -3352,6 +3853,16 @@ function emptyResponse(
     },
 
 
+    archive: {
+
+      attempted:
+        0,
+
+      archived:
+        0
+    },
+
+
     prepared_bets:
       [],
 
@@ -3360,7 +3871,7 @@ function emptyResponse(
 
 
     message:
-      "V5.2 TEST READ ONLY. No active Hunter entries.",
+      "V5.3 TEST READ ONLY. No active Hunter entries.",
 
     timestamp:
       new Date().toISOString()
@@ -3369,16 +3880,24 @@ function emptyResponse(
 
 
 // ============================================================
-// RUN V5.2
+// RUN V5.3
 // ============================================================
 
-async function runV52(
+async function runV53(
   env: Env,
   request: Request
 ): Promise<Response> {
 
   const started =
     Date.now();
+
+
+  const executionId =
+    newExecutionId();
+
+
+  const executionTimestamp =
+    new Date().toISOString();
 
 
   // ==========================================================
@@ -3428,8 +3947,7 @@ async function runV52(
   // ==========================================================
   // MATCHER + CLOUDBET
   //
-  // IMPORTANT:
-  // THESE TWO CALLS ARE NOW PARALLEL.
+  // V5.2 LOGIC PRESERVED.
   // ==========================================================
 
   const parallelStarted =
@@ -4170,6 +4688,25 @@ async function runV52(
     localProcessingStarted;
 
 
+  // ==========================================================
+  // V5.3 ARCHIVE
+  //
+  // IMPORTANT:
+  // Archive is AFTER all matching is complete.
+  //
+  // It does NOT change the matching decision.
+  // ==========================================================
+
+  const archive =
+    await archiveResults(
+      env.DB,
+      executionId,
+      executionTimestamp,
+      preparedBets,
+      noMatch
+    );
+
+
   const totalMs =
     Date.now() -
     started;
@@ -4197,6 +4734,10 @@ async function runV52(
       "DISABLED",
 
 
+    execution_id:
+      executionId,
+
+
     bindings: {
 
       TRACKER:
@@ -4206,6 +4747,9 @@ async function runV52(
         true,
 
       CLOUDBET:
+        true,
+
+      DB:
         true
     },
 
@@ -4337,10 +4881,6 @@ async function runV52(
     },
 
 
-    // ========================================================
-    // V5.2 TIMING
-    // ========================================================
-
     timing: {
 
       tracker_ms:
@@ -4413,6 +4953,28 @@ async function runV52(
     },
 
 
+    archive: {
+
+      table:
+        "bet_archive",
+
+      execution_id:
+        executionId,
+
+      attempted:
+        archive.attempted,
+
+      archived:
+        archive.archived,
+
+      duplicate_policy:
+        "SAME MATCH + SAME RESULT = IGNORE",
+
+      results:
+        "READY + NO_MATCH"
+    },
+
+
     diagnostics: {
 
       rejection_reasons:
@@ -4434,82 +4996,34 @@ async function runV52(
         signalDiagnostics,
 
 
-      v52_rules: {
+      v53_rules: {
 
-        mode:
-          "TEST",
+        archive:
+          "D1 bet_archive",
+
+        archive_ready:
+          true,
+
+        archive_no_match:
+          true,
+
+        archive_duplicate_policy:
+          "UNIQUE MATCH_ID + RESULT",
+
+        archive_clear:
+          "ONLY bet_archive",
 
         matcher:
           "PRIMARY MATCH SOURCE",
 
-        matcher_discovery_threshold:
-          MATCHER_THRESHOLD,
-
-        matcher_accept_min_score:
-          MIN_MATCHER_SCORE,
-
-        matcher_confident:
-          "NOT REQUIRED",
-
-        matcher_score:
-          "DISCOVERY / ASSOCIATION ONLY",
-
-        matcher_score_is_team_validation:
-          false,
-
-        team_validation:
-          "STRICT TWO SIDED",
-
-        team_minimum:
-          TEAM_MATCH_MIN_SCORE,
-
-        character_similarity_minimum:
-          CHARACTER_SIMILARITY_MIN_SCORE,
-
-        containment_minimum:
-          CONTAINMENT_MIN_SCORE,
-
-        token_minimum:
-          TOKEN_MATCH_MIN_SCORE,
-
-        secure_match_false:
-          "NOT AUTOMATICALLY REJECTED",
-
-        score_only:
-          "ALWAYS REJECT",
-
-        exact_id:
-          "NEVER ACCEPTED ALONE",
-
-        exact_id_zero_score:
-          "ALWAYS REJECT",
-
         direct_cloudbet_fallback:
           "ENABLED",
-
-        direct_team_matching:
-          "EXACT + TOKEN + CONTAINMENT + CHARACTER SIMILARITY",
-
-        direct_team_requirement:
-          "BOTH HOME AND AWAY MUST PASS STRICT THRESHOLD",
-
-        direct_minimum_team_score:
-          DIRECT_CLOUDBET_MIN_SCORE,
-
-        direction:
-          "NORMAL OR REVERSED",
 
         cloudbet:
           "INDEPENDENT STRICT TWO SIDED VERIFICATION",
 
-        cloudbet_fetch:
-          "ONE /live CALL PER EXECUTION",
-
         matcher_cloudbet_execution:
           "PARALLEL",
-
-        timing:
-          "TRACKER + MATCHER + CLOUDBET TIMED",
 
         betting:
           "DISABLED"
@@ -4553,7 +5067,7 @@ async function runV52(
 
 
     message:
-      "V5.2 TEST READ ONLY. Matcher and Cloudbet /live now execute in parallel after the single Tracker call. Exact timing is reported for Tracker, Matcher, Cloudbet, parallel external work, local processing and total execution. Security rules remain unchanged.",
+      "V5.3 TEST READ ONLY. V5.2 Matcher/Cloudbet logic preserved. Hunter results are archived in D1 bet_archive.",
 
 
     timestamp:
@@ -4595,6 +5109,9 @@ function health(): Response {
         true,
 
       CLOUDBET:
+        true,
+
+      DB:
         true
     },
 
@@ -4660,7 +5177,7 @@ function health(): Response {
     },
 
 
-    v52: {
+    v53: {
 
       mode:
         "TEST",
@@ -4720,7 +5237,16 @@ function health(): Response {
         false,
 
       exact_id_alone:
-        false
+        false,
+
+      archive:
+        "D1 bet_archive",
+
+      archive_duplicate_policy:
+        "UNIQUE MATCH_ID + RESULT",
+
+      archive_clear:
+        "ONLY bet_archive"
     },
 
 
@@ -4746,11 +5272,6 @@ function health(): Response {
     },
 
 
-    timing:
-
-      "V5.2 reports tracker_ms, matcher_ms, cloudbet_ms, parallel_external_ms, local_processing_ms and total_ms.",
-
-
     endpoints: {
 
       tracker:
@@ -4760,7 +5281,13 @@ function health(): Response {
         "/match",
 
       cloudbet:
-        "/live"
+        "/live",
+
+      archive:
+        "/archive",
+
+      archive_clear:
+        "/archive/clear"
     },
 
 
@@ -4773,7 +5300,7 @@ function health(): Response {
         "PRIMARY MATCH SOURCE",
 
       matcher_confident:
-        "NOT REQUIRED IN V5.2 TEST",
+        "NOT REQUIRED IN V5.3 TEST",
 
       matcher_score:
         `DISCOVERY SCORE >= ${STRONG_MATCHER_SCORE}`,
@@ -4823,6 +5350,15 @@ function health(): Response {
       matcher_cloudbet:
         "RUN IN PARALLEL",
 
+      archive:
+        "Every HUNTER_ENTRY is archived",
+
+      archive_duplicate:
+        "Same match + same result is ignored",
+
+      archive_clear:
+        "Only bet_archive is deleted",
+
       timing:
         "ENABLED",
 
@@ -4832,7 +5368,7 @@ function health(): Response {
 
 
     message:
-      "V5.2 TEST worker is healthy. Matcher and Cloudbet now run in parallel and execution timing is measured.",
+      "V5.3 TEST worker is healthy. Matcher and Cloudbet logic are preserved. D1 Hunter archive is enabled.",
 
 
     timestamp:
@@ -4883,6 +5419,34 @@ export default {
 
 
       // ======================================================
+      // ARCHIVE
+      // ======================================================
+
+      if (
+        path === "/archive"
+      ) {
+
+        return getArchive(
+          env.DB
+        );
+      }
+
+
+      // ======================================================
+      // ARCHIVE CLEAR
+      // ======================================================
+
+      if (
+        path === "/archive/clear"
+      ) {
+
+        return clearArchive(
+          env.DB
+        );
+      }
+
+
+      // ======================================================
       // MATCH / LIVE / BET
       // ======================================================
 
@@ -4892,7 +5456,7 @@ export default {
         path === "/bet"
       ) {
 
-        return runV52(
+        return runV53(
           env,
           request
         );
@@ -4908,7 +5472,7 @@ export default {
         path === "/diagnostics"
       ) {
 
-        return runV52(
+        return runV53(
           env,
           request
         );
@@ -4952,7 +5516,11 @@ export default {
 
             "/diagnostic",
 
-            "/diagnostics"
+            "/diagnostics",
+
+            "/archive",
+
+            "/archive/clear"
           ]
         },
 
