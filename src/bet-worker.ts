@@ -1,11 +1,11 @@
 // ============================================================
-// CLOUDBET BET WORKER V5.3
-// READ ONLY — TEST MODE
-// BETTING DISABLED
+// CLOUDBET BET WORKER V5.4
+// DRY RUN — TEST BETTING PIPELINE
+// REAL BETTING DISABLED
 //
-// V5.3
-// - V5.2 MATCHER/CLOUDBET LOGIC PRESERVED
-// - D1 HUNTER ARCHIVE
+// V5.4
+// - V5.3 MATCHER/CLOUDBET LOGIC PRESERVED
+// - D1 HUNTER ARCHIVE PRESERVED
 // - READY HUNTER MATCHES ARCHIVED
 // - IDEMPOTENT ARCHIVE
 // - BATCH ARCHIVE WRITES
@@ -15,6 +15,19 @@
 // - CLOUDBET /live 1 CALL
 // - MATCHER + CLOUDBET PARALLEL
 // - REDUCED DUPLICATED PROCESSING
+//
+// NEW V5.4
+// - DRY_RUN BETTING PIPELINE
+// - READY -> BET_CANDIDATE
+// - MARKET: 1H Total Goals
+// - SELECTION: OVER 0.5
+// - STAKE: EUR 10
+// - ODDS READ ONLY FROM CLOUDBET /live
+// - NO ODDS INVENTION
+// - NO POST BET REQUEST
+// - BETTING_ENABLED HARD FALSE
+// - BET_PLACED ALWAYS FALSE
+// - TEST BET CANDIDATES COUNTED
 // ============================================================
 
 interface Env {
@@ -30,9 +43,16 @@ type AnyObj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V5.3";
-const MODE = "READ_ONLY_TEST";
+const VERSION = "V5.4";
+const MODE = "DRY_RUN";
+
 const BETTING_ENABLED = false;
+const DRY_RUN = true;
+
+const BET_STAKE_EUR = 10;
+
+const BET_MARKET = "1H Total Goals";
+const BET_SELECTION = "OVER 0.5";
 
 const MATCHER_THRESHOLD = 0.20;
 const STRONG_MATCHER_SCORE = 0.20;
@@ -89,10 +109,31 @@ const TEAM_ALIASES: Record<string, string> = {
 };
 
 const GENERIC_WORDS = new Set([
-  "fc", "cf", "sc", "ac", "afc", "ca", "cd", "sd",
-  "ss", "as", "us", "ud", "aa", "ad", "rc", "fk",
-  "sk", "ks", "sv", "vfb", "vfl", "club", "calcio",
-  "football", "soccer"
+  "fc",
+  "cf",
+  "sc",
+  "ac",
+  "afc",
+  "ca",
+  "cd",
+  "sd",
+  "ss",
+  "as",
+  "us",
+  "ud",
+  "aa",
+  "ad",
+  "rc",
+  "fk",
+  "sk",
+  "ks",
+  "sv",
+  "vfb",
+  "vfl",
+  "club",
+  "calcio",
+  "football",
+  "soccer"
 ]);
 
 // ============================================================
@@ -1095,6 +1136,46 @@ function isCloudbetLive(
 }
 
 // ============================================================
+// ODDS EXTRACTION — V5.4
+//
+// IMPORTANT:
+// Odds are NEVER invented.
+// If /live does not expose a usable decimal price,
+// odds = null.
+// ============================================================
+
+function extractOdds(
+  m: AnyObj
+): number | null {
+  const values = [
+    m?.odds,
+    m?.price,
+    m?.decimal_odds,
+    m?.decimalOdds,
+
+    m?.markets?.["1H Total Goals"]?.odds,
+    m?.markets?.["1H Total Goals"]?.over_0_5,
+
+    m?.markets?.first_half_total_goals?.over_0_5,
+
+    m?.market?.odds
+  ];
+
+  for (const value of values) {
+    const n = Number(value);
+
+    if (
+      Number.isFinite(n) &&
+      n > 1
+    ) {
+      return n;
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
 // DIRECT CLOUDBET FALLBACK
 // ============================================================
 
@@ -1537,7 +1618,10 @@ function buildPreparedBet(
 
       competition:
         cb?.competition ??
-        null
+        null,
+
+      odds:
+        extractOdds(cb)
     },
 
     matcher: {
@@ -1632,7 +1716,174 @@ function buildPreparedBet(
     },
 
     action:
-      "NO_BET_V5_3_TEST"
+      "NO_BET_V5_4_DRY_RUN"
+  };
+}
+
+// ============================================================
+// DRY RUN BET CANDIDATE
+// ============================================================
+
+function buildDryRunCandidate(
+  bet: AnyObj
+): AnyObj {
+  const odds =
+    extractOdds(
+      bet?.cloudbet
+    );
+
+  const oddsAvailable =
+    odds !== null;
+
+  return {
+    status:
+      "BET_CANDIDATE",
+
+    mode:
+      "DRY_RUN",
+
+    betting_enabled:
+      false,
+
+    dry_run:
+      true,
+
+    bet_placed:
+      false,
+
+    bet_action:
+      "NOT_PLACED",
+
+    simulated:
+      true,
+
+    simulated_result:
+      "TEST_BET_REGISTERED",
+
+    market:
+      BET_MARKET,
+
+    selection:
+      BET_SELECTION,
+
+    stake_eur:
+      BET_STAKE_EUR,
+
+    odds,
+
+    odds_available:
+      oddsAvailable,
+
+    candidate_complete:
+      oddsAvailable,
+
+    signal: {
+      match:
+        bet?.signal?.match ??
+        null,
+
+      match_id:
+        bet?.signal?.match_id ??
+        null,
+
+      home:
+        bet?.signal?.home ??
+        null,
+
+      away:
+        bet?.signal?.away ??
+        null,
+
+      entry_minute:
+        bet?.signal?.entry_minute ??
+        null,
+
+      hunter_score:
+        bet?.signal?.hunter_score ??
+        null
+    },
+
+    matcher: {
+      score:
+        bet?.matcher?.matcher_score ??
+        null,
+
+      source:
+        bet?.matcher?.source ??
+        null,
+
+      classification:
+        bet?.matcher?.classification ??
+        null,
+
+      match_method:
+        bet?.matcher?.match_method ??
+        null
+    },
+
+    cloudbet: {
+      verified:
+        bet?.security?.cloudbet_verified ??
+        false,
+
+      id:
+        bet?.cloudbet?.id ??
+        null,
+
+      key:
+        bet?.cloudbet?.key ??
+        null,
+
+      match:
+        bet?.cloudbet?.match ??
+        null,
+
+      home:
+        bet?.cloudbet?.home ??
+        null,
+
+      away:
+        bet?.cloudbet?.away ??
+        null,
+
+      status:
+        bet?.cloudbet?.status ??
+        null,
+
+      live:
+        bet?.cloudbet?.live ??
+        null,
+
+      score:
+        bet?.cloudbet?.score ??
+        null,
+
+      minute:
+        bet?.cloudbet?.minute ??
+        null,
+
+      odds
+    },
+
+    security: {
+      dry_run:
+        true,
+
+      betting_disabled:
+        true,
+
+      real_bet_allowed:
+        false,
+
+      odds_from_cloudbet_only:
+        true,
+
+      odds_invented:
+        false,
+
+      real_post_executed:
+        false
+    }
   };
 }
 
@@ -1959,7 +2210,7 @@ function buildNoMatch(
     },
 
     action:
-      "NO_BET_V5_3_TEST",
+      "NO_BET_V5_4_DRY_RUN",
 
     reason
   };
@@ -2011,6 +2262,41 @@ function emptyResponse(
 
       line:
         TARGET_LINE
+    },
+
+    dry_run: {
+      enabled:
+        true,
+
+      betting_enabled:
+        false,
+
+      candidates:
+        0,
+
+      complete_candidates:
+        0,
+
+      incomplete_candidates:
+        0,
+
+      bets_placed:
+        0,
+
+      bets_not_placed:
+        0,
+
+      simulated_bets:
+        0,
+
+      stake_eur:
+        BET_STAKE_EUR,
+
+      market:
+        BET_MARKET,
+
+      selection:
+        BET_SELECTION
     },
 
     tracker: {
@@ -2084,6 +2370,18 @@ function emptyResponse(
       bets_ready:
         0,
 
+      bet_candidates:
+        0,
+
+      complete_bet_candidates:
+        0,
+
+      incomplete_bet_candidates:
+        0,
+
+      simulated_bets:
+        0,
+
       no_match:
         0,
 
@@ -2099,10 +2397,12 @@ function emptyResponse(
 
     prepared_bets: [],
 
+    bet_candidates: [],
+
     no_match: [],
 
     message:
-      "V5.3 TEST READ ONLY. No active Hunter entries.",
+      "V5.4 DRY RUN. No active Hunter entries.",
 
     timestamp:
       new Date().toISOString()
@@ -2110,10 +2410,10 @@ function emptyResponse(
 }
 
 // ============================================================
-// RUN V5.3
+// RUN V5.4
 // ============================================================
 
-async function runV53(
+async function runV54(
   env: Env,
   request: Request
 ): Promise<Response> {
@@ -2239,6 +2539,9 @@ async function runV53(
   const preparedBets:
     AnyObj[] = [];
 
+  const dryRunCandidates:
+    AnyObj[] = [];
+
   const noMatch:
     AnyObj[] = [];
 
@@ -2274,6 +2577,9 @@ async function runV53(
         null,
 
       cloudbet:
+        null,
+
+      betting:
         null,
 
       final:
@@ -2406,6 +2712,32 @@ async function runV53(
           bet
         );
 
+        const candidate =
+          buildDryRunCandidate(
+            bet
+          );
+
+        dryRunCandidates.push(
+          candidate
+        );
+
+        diagnostic.betting = {
+          result:
+            "BET_CANDIDATE",
+
+          mode:
+            "DRY_RUN",
+
+          odds:
+            candidate.odds,
+
+          candidate_complete:
+            candidate.candidate_complete,
+
+          bet_placed:
+            false
+        };
+
         diagnostic.final = {
           result:
             "READY",
@@ -2514,6 +2846,32 @@ async function runV53(
           bet
         );
 
+        const candidate =
+          buildDryRunCandidate(
+            bet
+          );
+
+        dryRunCandidates.push(
+          candidate
+        );
+
+        diagnostic.betting = {
+          result:
+            "BET_CANDIDATE",
+
+          mode:
+            "DRY_RUN",
+
+          odds:
+            candidate.odds,
+
+          candidate_complete:
+            candidate.candidate_complete,
+
+          bet_placed:
+            false
+        };
+
         diagnostic.final = {
           result:
             "READY",
@@ -2589,6 +2947,13 @@ async function runV53(
           }
         )
       );
+
+      diagnostic.betting = {
+        result:
+          "NOT_A_CANDIDATE",
+
+        reason
+      };
 
       diagnostic.final = {
         result:
@@ -2685,13 +3050,42 @@ async function runV53(
           fallback.match
       };
 
-      preparedBets.push(
+      const bet =
         buildPreparedBet(
           signal,
           fallbackMatcher,
           directVerification
-        )
+        );
+
+      preparedBets.push(
+        bet
       );
+
+      const candidate =
+        buildDryRunCandidate(
+          bet
+        );
+
+      dryRunCandidates.push(
+        candidate
+      );
+
+      diagnostic.betting = {
+        result:
+          "BET_CANDIDATE",
+
+        mode:
+          "DRY_RUN",
+
+        odds:
+          candidate.odds,
+
+        candidate_complete:
+          candidate.candidate_complete,
+
+        bet_placed:
+          false
+      };
 
       diagnostic.final = {
         result:
@@ -2773,6 +3167,13 @@ async function runV53(
       )
     );
 
+    diagnostic.betting = {
+      result:
+        "NOT_A_CANDIDATE",
+
+      reason
+    };
+
     diagnostic.final = {
       result:
         "NO_MATCH",
@@ -2807,6 +3208,27 @@ async function runV53(
 
   const archiveDuplicates =
     archiveResult.duplicates;
+
+  // ==========================================================
+  // DRY RUN STATS
+  // ==========================================================
+
+  const completeBetCandidates =
+    dryRunCandidates.filter(
+      candidate =>
+        candidate.candidate_complete ===
+        true
+    ).length;
+
+  const incompleteBetCandidates =
+    dryRunCandidates.filter(
+      candidate =>
+        candidate.candidate_complete !==
+        true
+    ).length;
+
+  const simulatedBets =
+    dryRunCandidates.length;
 
   // ==========================================================
   // TIMING
@@ -2878,6 +3300,53 @@ async function runV53(
 
       line:
         TARGET_LINE
+    },
+
+    dry_run: {
+      enabled:
+        DRY_RUN,
+
+      betting_enabled:
+        BETTING_ENABLED,
+
+      real_bet_execution:
+        false,
+
+      candidates:
+        dryRunCandidates.length,
+
+      complete_candidates:
+        completeBetCandidates,
+
+      incomplete_candidates:
+        incompleteBetCandidates,
+
+      simulated_bets:
+        simulatedBets,
+
+      bets_placed:
+        0,
+
+      bets_not_placed:
+        dryRunCandidates.length,
+
+      stake_eur:
+        BET_STAKE_EUR,
+
+      market:
+        BET_MARKET,
+
+      selection:
+        BET_SELECTION,
+
+      odds_source:
+        "CLOUDBET /live ONLY",
+
+      odds_invented:
+        false,
+
+      test_result:
+        "TEST_BET_REGISTERED"
     },
 
     tracker: {
@@ -3008,6 +3477,24 @@ async function runV53(
       bets_ready:
         preparedBets.length,
 
+      bet_candidates:
+        dryRunCandidates.length,
+
+      complete_bet_candidates:
+        completeBetCandidates,
+
+      incomplete_bet_candidates:
+        incompleteBetCandidates,
+
+      simulated_bets:
+        simulatedBets,
+
+      bets_placed:
+        0,
+
+      bets_not_placed:
+        dryRunCandidates.length,
+
       no_match:
         noMatch.length,
 
@@ -3045,7 +3532,7 @@ async function runV53(
       signal_flow:
         signalDiagnostics,
 
-      v53_rules: {
+      v54_rules: {
         archive:
           "D1 hunter_bet_archive",
 
@@ -3063,6 +3550,39 @@ async function runV53(
 
         betting:
           "DISABLED",
+
+        mode:
+          "DRY_RUN",
+
+        market:
+          BET_MARKET,
+
+        selection:
+          BET_SELECTION,
+
+        stake_eur:
+          BET_STAKE_EUR,
+
+        betting_enabled:
+          false,
+
+        real_bet_execution:
+          false,
+
+        post_bet_request:
+          "NEVER",
+
+        test_bet_registration:
+          "ENABLED",
+
+        odds:
+          "READ FROM CLOUDBET /live ONLY",
+
+        odds_missing:
+          "NULL",
+
+        odds_invented:
+          false,
 
         matcher:
           "PRIMARY MATCH SOURCE",
@@ -3163,17 +3683,29 @@ async function runV53(
           : 0,
 
       duplicate_archive_writes_prevented:
-        true
+        true,
+
+      dry_run_bet_execution:
+        false,
+
+      real_bet_execution:
+        false,
+
+      test_bet_candidates_generated:
+        dryRunCandidates.length
     },
 
     prepared_bets:
       preparedBets,
 
+    bet_candidates:
+      dryRunCandidates,
+
     no_match:
       noMatch,
 
     message:
-      "V5.3 TEST READ ONLY. V5.2 matching logic preserved. READY Hunter matches are archived in D1 with batch INSERT OR IGNORE.",
+      "V5.4 DRY RUN. READY Hunter matches become simulated BET_CANDIDATE records. No real bet is placed. Odds are read only from Cloudbet /live and are never invented.",
 
     timestamp:
       new Date().toISOString()
@@ -3215,7 +3747,39 @@ function health(): Response {
         true
     },
 
-    v53: {
+    dry_run: {
+      enabled:
+        DRY_RUN,
+
+      betting_enabled:
+        BETTING_ENABLED,
+
+      real_bet_execution:
+        false,
+
+      market:
+        BET_MARKET,
+
+      selection:
+        BET_SELECTION,
+
+      stake_eur:
+        BET_STAKE_EUR,
+
+      bet_placed:
+        false,
+
+      test_bet_registration:
+        true,
+
+      odds_source:
+        "CLOUDBET /live ONLY",
+
+      odds_invented:
+        false
+    },
+
+    v54: {
       archive_table:
         ARCHIVE_TABLE,
 
@@ -3232,6 +3796,21 @@ function health(): Response {
         true,
 
       betting_enabled:
+        false,
+
+      dry_run:
+        true,
+
+      market:
+        BET_MARKET,
+
+      selection:
+        BET_SELECTION,
+
+      stake_eur:
+        BET_STAKE_EUR,
+
+      real_bet_execution:
         false
     },
 
@@ -3305,7 +3884,13 @@ function health(): Response {
         true,
 
       archive_duplicate_protection:
-        true
+        true,
+
+      dry_run_betting:
+        true,
+
+      real_betting:
+        false
     },
 
     endpoints: [
@@ -3320,7 +3905,7 @@ function health(): Response {
     ],
 
     message:
-      "V5.3 TEST worker is healthy.",
+      "V5.4 DRY RUN worker is healthy. Real betting is permanently disabled.",
 
     timestamp:
       new Date().toISOString()
@@ -3370,7 +3955,7 @@ export default {
       }
 
       // ------------------------------------------------------
-      // MAIN V5.3 EXECUTION
+      // MAIN V5.4 EXECUTION
       // ------------------------------------------------------
 
       if (
@@ -3380,7 +3965,7 @@ export default {
         path === "/diagnostic" ||
         path === "/diagnostics"
       ) {
-        return runV53(
+        return runV54(
           env,
           request
         );
@@ -3438,6 +4023,12 @@ export default {
 
           betting:
             "DISABLED",
+
+          dry_run:
+            true,
+
+          real_bet_execution:
+            false,
 
           error:
             error?.message ??
