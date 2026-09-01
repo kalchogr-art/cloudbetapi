@@ -18,5 +18,12 @@
       "binding": "CLOUDBET",
       "service": "cloudbetapi"
     }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_id": "379c05b1-2779-4c26-b07e-f6cf05675d62",
+      "database_name": "d1-template-database"
+    }
   ]
 }
