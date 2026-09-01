@@ -1,15 +1,17 @@
 // ============================================================
-// CLOUDBET — FAST LIVE SOCCER DETECTOR V2
+// CLOUDBET — FAST LIVE SOCCER DETECTOR V3
 // READ ONLY
 //
-// V2 FIX:
-// - Добавен /search endpoint
-// - Търсене на САМИЯ МАЧ по HOME + AWAY
-// - НЕ търси резултат
-// - НЕ изисква мачът да е live за да бъде намерен
-// - След намиране връща status/live/minute/score
-// - Не прави request към всеки event
-// - Съществуващият /live остава същият
+// V3 FIX:
+// - /search остава търсене на САМИЯ МАЧ по HOME + AWAY
+// - /live вече НЕ ограничава броя на competitions чрез limit
+// - /live проверява ВСИЧКИ активни soccer competitions
+// - limit вече е лимит само на ВЪРНАТИТЕ live мачове
+// - Това прави /live консистентен със /search
+//
+// ДОКАЗАН ПРОБЛЕМ:
+// /search намира Al-Orobah v AL Zulfi сред 1448 events,
+// докато старият /live проверяваше само първите competitions.
 //
 // БЕЗ:
 // - HT OVER 0.5
@@ -860,6 +862,25 @@ function buildMatch(
 
 // ============================================================
 // /LIVE SCAN
+//
+// V3 FIX:
+//
+// Старо:
+// competitions -> slice(0, limit)
+//
+// Това означаваше, че limit=100 ограничаваше
+// броя на ПРОВЕРЕНИТЕ COMPETITIONS.
+//
+// Ново:
+// проверяваме ВСИЧКИ активни competitions.
+//
+// limit вече ограничава само броя на върнатите
+// live matches.
+//
+// Това е критично за Hunter:
+// мач, който е в competition #300,
+// вече няма да бъде пропуснат само защото
+// сме спрели след първите competitions.
 // ============================================================
 
 async function scan(
@@ -898,16 +919,22 @@ async function scan(
       )
     );
 
+  // ----------------------------------------------------------
+  // ВАЖНО:
+  // НЕ използваме .slice(0, limit) тук.
+  //
+  // /live трябва да провери всички активни
+  // Cloudbet soccer competitions.
+  // ----------------------------------------------------------
+
   const selected =
-    competitions
-      .filter(
-        c =>
-          Number(
-            c.eventCount ||
-            0
-          ) > 0
-      )
-      .slice(0, limit);
+    competitions.filter(
+      c =>
+        Number(
+          c.eventCount ||
+          0
+        ) > 0
+    );
 
   const matches = [];
   const errors = [];
@@ -1009,6 +1036,10 @@ async function scan(
     }
   }
 
+  // ----------------------------------------------------------
+  // Сортиране на ВСИЧКИ намерени live matches
+  // ----------------------------------------------------------
+
   matches.sort(
     (a, b) => {
 
@@ -1026,11 +1057,23 @@ async function scan(
     }
   );
 
+  // ----------------------------------------------------------
+  // limit се прилага САМО върху резултата.
+  //
+  // Всички competitions са проверени преди това.
+  // ----------------------------------------------------------
+
+  const limitedMatches =
+    matches.slice(0, limit);
+
   return {
     success: true,
 
     test:
       "CLOUDBET ALL LIVE SOCCER",
+
+    version:
+      "V3",
 
     filter:
       "SOCCER + LIVE ONLY",
@@ -1045,6 +1088,9 @@ async function scan(
       competition_count:
         competitions.length,
 
+      competitions_with_events:
+        selected.length,
+
       competitions_checked:
         selected.length,
 
@@ -1054,14 +1100,21 @@ async function scan(
       live_events_detected:
         liveEvents,
 
-      live_matches:
+      live_matches_found:
         matches.length,
+
+      live_matches_returned:
+        limitedMatches.length,
+
+      result_limit:
+        limit,
 
       errors:
         errors.length
     },
 
-    matches,
+    matches:
+      limitedMatches,
 
     errors,
 
@@ -1382,8 +1435,6 @@ async function searchMatch(
     matching_candidates:
       candidates.length,
 
-    // Показваме ограничен брой
-    // алтернативни съвпадения
     candidates:
       candidates
         .slice(0, 5)
@@ -1447,7 +1498,7 @@ function health(env) {
       "cloudbet-live-soccer",
 
     version:
-      "V2",
+      "V3",
 
     mode:
       "READ ONLY",
@@ -1469,6 +1520,14 @@ function health(env) {
       "/live?limit=100",
       "/search?home=TEAM&away=TEAM"
     ],
+
+    live: {
+      scans:
+        "ALL_ACTIVE_SOCCER_COMPETITIONS",
+
+      limit:
+        "RESULT_LIMIT_ONLY"
+    },
 
     search: {
       enabled: true,
@@ -1596,6 +1655,9 @@ export default {
 
           worker:
             "cloudbet-live-soccer",
+
+          version:
+            "V3",
 
           error:
             error?.message ||
