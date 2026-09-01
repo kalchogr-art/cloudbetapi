@@ -1,34 +1,41 @@
 // ============================================================
-// CLOUDBET BET WORKER V5.7
+// CLOUDBET BET WORKER V5.8
 // DRY RUN — OPTIMIZED TEST BETTING PIPELINE
 //
-// V5.7
-// - V5.6 LOGIC PRESERVED
+// V5.8
+// - V5.7 LOGIC PRESERVED
 // - 1 TRACKER CALL
 // - 1 MATCHER CALL
 // - 1 CLOUDBET /live CALL
-// - MATCHER + CLOUDBET PARALLEL
+// - MATCHER + CLOUDBET /live PARALLEL
 // - RAW CLOUDBET JSON DIAGNOSTIC
 // - STRICT TWO-SIDED TEAM MATCH
 // - DIRECT CLOUDBET LIVE FALLBACK
-// - ADDITIONAL RAW CLOUDBET MATCH SEARCH
 // - D1 HUNTER ARCHIVE
 // - IDEMPOTENT ARCHIVE
 // - BATCH ARCHIVE
 // - DRY RUN ONLY
 //
-// NEW V5.7:
-// If Matcher fails OR Cloudbet live verification fails,
-// search the ENTIRE raw Cloudbet /live JSON for the same
-// two-sided team matchup.
+// V5.8 FIX:
+// If Hunter match is NOT found in /live:
+//   1. Request Cloudbet soccer catalogue
+//   2. Inspect competitions
+//   3. Search by BOTH team names
+//   4. Do NOT search by score/result
+//   5. Find concrete Cloudbet event
+//   6. Request concrete /event?id=...
+//   7. Confirm BOTH teams strictly
+//   8. Confirm TRADING_LIVE
+//   9. Only then continue to READY
 //
-// IMPORTANT:
-// - No second Cloudbet request.
-// - Uses already downloaded rawCloudbetMatches.
-// - Raw search is performed after liveCloudbet search.
-// - Result can be READY even when Cloudbet item was not
-//   classified as live, but ONLY if strict two-sided teams
-//   are confirmed.
+// SECURITY:
+// - score-only match = REJECT
+// - one-team match = REJECT
+// - result-only match = REJECT
+// - non-live event = PRESENT_NOT_LIVE
+// - both teams + live = VERIFIED
+// - no invented odds
+// - no real bet
 // ============================================================
 
 interface Env {
@@ -44,7 +51,7 @@ type AnyObj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V5.7";
+const VERSION = "V5.8";
 const MODE = "DRY_RUN";
 
 const BETTING_ENABLED = false;
@@ -74,6 +81,17 @@ const TARGET_OUTCOME = "OVER";
 const TARGET_LINE = 0.5;
 
 const ARCHIVE_TABLE = "hunter_bet_archive";
+
+// Maximum number of competitions inspected during
+// catalogue fallback.
+//
+// This is deliberately higher than the old /live limit.
+// The search is based on team names, NOT scores.
+const CATALOGUE_COMPETITION_LIMIT = 500;
+
+// Maximum number of event candidates requested in detail
+// for one Hunter signal.
+const MAX_EVENT_DETAIL_CANDIDATES = 5;
 
 // ============================================================
 // ALIASES
@@ -117,13 +135,18 @@ const GENERIC_WORDS = new Set([
 // ============================================================
 
 function json(data: any, status = 200): Response {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=UTF-8",
-      "cache-control": "no-store"
+  return new Response(
+    JSON.stringify(data, null, 2),
+    {
+      status,
+      headers: {
+        "content-type":
+          "application/json; charset=UTF-8",
+        "cache-control":
+          "no-store"
+      }
     }
-  });
+  );
 }
 
 function safeString(v: any): string {
@@ -152,12 +175,17 @@ function applyAliases(v: string): string {
     );
 
     r = r.replace(
-      new RegExp(`(^|\\s)${escaped}(?=\\s|$)`, "g"),
+      new RegExp(
+        `(^|\\s)${escaped}(?=\\s|$)`,
+        "g"
+      ),
       `$1${TEAM_ALIASES[alias]}`
     );
   }
 
-  return r.replace(/\s+/g, " ").trim();
+  return r
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function normalizeTeam(v: any): string {
@@ -179,13 +207,25 @@ function teamTokens(v: any): string[] {
 function splitMatchName(v: any) {
   const text = safeString(v);
 
-  for (const sep of [" - ", " v ", " vs ", " VS ", " @ "]) {
+  for (
+    const sep of [
+      " - ",
+      " v ",
+      " vs ",
+      " VS ",
+      " @ "
+    ]
+  ) {
     const i = text.indexOf(sep);
 
     if (i >= 0) {
       return {
-        home: text.slice(0, i).trim(),
-        away: text.slice(i + sep.length).trim()
+        home:
+          text.slice(0, i).trim(),
+        away:
+          text.slice(
+            i + sep.length
+          ).trim()
       };
     }
   }
@@ -214,13 +254,28 @@ function extractHome(m: AnyObj): string {
   ];
 
   for (const v of values) {
-    if (typeof v === "string" && v.trim()) {
+    if (
+      typeof v === "string" &&
+      v.trim()
+    ) {
       return v.trim();
+    }
+
+    if (
+      v &&
+      typeof v === "object" &&
+      typeof v.name === "string" &&
+      v.name.trim()
+    ) {
+      return v.name.trim();
     }
   }
 
   return splitMatchName(
-    m?.match ?? m?.name ?? m?.event_name ?? ""
+    m?.match ??
+    m?.name ??
+    m?.event_name ??
+    ""
   ).home ?? "";
 }
 
@@ -238,20 +293,40 @@ function extractAway(m: AnyObj): string {
   ];
 
   for (const v of values) {
-    if (typeof v === "string" && v.trim()) {
+    if (
+      typeof v === "string" &&
+      v.trim()
+    ) {
       return v.trim();
+    }
+
+    if (
+      v &&
+      typeof v === "object" &&
+      typeof v.name === "string" &&
+      v.name.trim()
+    ) {
+      return v.name.trim();
     }
   }
 
   return splitMatchName(
-    m?.match ?? m?.name ?? m?.event_name ?? ""
+    m?.match ??
+    m?.name ??
+    m?.event_name ??
+    ""
   ).away ?? "";
 }
 
 function displayMatch(m: AnyObj): string {
-  return safeString(
-    m?.match ?? m?.name ?? m?.event_name
-  ) || `${extractHome(m)} - ${extractAway(m)}`;
+  return (
+    safeString(
+      m?.match ??
+      m?.name ??
+      m?.event_name
+    ) ||
+    `${extractHome(m)} - ${extractAway(m)}`
+  );
 }
 
 function extractMatchId(m: AnyObj): string {
@@ -265,58 +340,96 @@ function extractMatchId(m: AnyObj): string {
   );
 }
 
-function teamsPresent(home: any, away: any): boolean {
-  return !!normalizeTeam(home) && !!normalizeTeam(away);
+function teamsPresent(
+  home: any,
+  away: any
+): boolean {
+  return (
+    !!normalizeTeam(home) &&
+    !!normalizeTeam(away)
+  );
 }
 
 // ============================================================
 // LEVENSHTEIN
 // ============================================================
 
-function levenshtein(a: string, b: string): number {
+function levenshtein(
+  a: string,
+  b: string
+): number {
   if (a === b) return 0;
   if (!a.length) return b.length;
   if (!b.length) return a.length;
 
-  let prev = Array.from(
-    { length: b.length + 1 },
-    (_, i) => i
-  );
+  let prev =
+    Array.from(
+      {
+        length:
+          b.length + 1
+      },
+      (_, i) => i
+    );
 
-  let curr = new Array<number>(b.length + 1);
+  let curr =
+    new Array<number>(
+      b.length + 1
+    );
 
-  for (let i = 1; i <= a.length; i++) {
+  for (
+    let i = 1;
+    i <= a.length;
+    i++
+  ) {
     curr[0] = i;
 
-    for (let j = 1; j <= b.length; j++) {
+    for (
+      let j = 1;
+      j <= b.length;
+      j++
+    ) {
       const cost =
-        a[i - 1] === b[j - 1] ? 0 : 1;
+        a[i - 1] === b[j - 1]
+          ? 0
+          : 1;
 
-      curr[j] = Math.min(
-        curr[j - 1] + 1,
-        prev[j] + 1,
-        prev[j - 1] + cost
-      );
+      curr[j] =
+        Math.min(
+          curr[j - 1] + 1,
+          prev[j] + 1,
+          prev[j - 1] + cost
+        );
     }
 
-    [prev, curr] = [curr, prev];
+    [prev, curr] =
+      [curr, prev];
   }
 
   return prev[b.length];
 }
 
-function characterSimilarity(a: any, b: any): number {
-  const A = normalizeTeam(a);
-  const B = normalizeTeam(b);
+function characterSimilarity(
+  a: any,
+  b: any
+): number {
+  const A =
+    normalizeTeam(a);
+
+  const B =
+    normalizeTeam(b);
 
   if (!A || !B) return 0;
+
   if (A === B) return 1;
 
   return Math.max(
     0,
     1 -
       levenshtein(A, B) /
-      Math.max(A.length, B.length)
+        Math.max(
+          A.length,
+          B.length
+        )
   );
 }
 
@@ -324,9 +437,15 @@ function characterSimilarity(a: any, b: any): number {
 // TEAM MATCH
 // ============================================================
 
-function teamMatchScore(a: any, b: any): AnyObj {
-  const A = normalizeTeam(a);
-  const B = normalizeTeam(b);
+function teamMatchScore(
+  a: any,
+  b: any
+): AnyObj {
+  const A =
+    normalizeTeam(a);
+
+  const B =
+    normalizeTeam(b);
 
   if (!A || !B) {
     return {
@@ -338,31 +457,51 @@ function teamMatchScore(a: any, b: any): AnyObj {
 
   if (A === B) {
     return {
-      score: EXACT_TEAM_SCORE,
+      score:
+        EXACT_TEAM_SCORE,
       method: "EXACT",
       accepted: true
     };
   }
 
-  if (A.includes(B) || B.includes(A)) {
-    const score = Math.max(
-      CONTAINMENT_MIN_SCORE,
-      Math.min(A.length, B.length) /
-        Math.max(A.length, B.length)
-    );
+  if (
+    A.includes(B) ||
+    B.includes(A)
+  ) {
+    const score =
+      Math.max(
+        CONTAINMENT_MIN_SCORE,
+        Math.min(
+          A.length,
+          B.length
+        ) /
+          Math.max(
+            A.length,
+            B.length
+          )
+      );
 
     return {
       score,
-      method: "CONTAINMENT",
-      accepted: score >= CONTAINMENT_MIN_SCORE
+      method:
+        "CONTAINMENT",
+      accepted:
+        score >=
+        CONTAINMENT_MIN_SCORE
     };
   }
 
-  const common = teamTokens(A).filter(
-    x => teamTokens(B).includes(x)
-  );
+  const common =
+    teamTokens(A).filter(
+      x =>
+        teamTokens(B)
+          .includes(x)
+    );
 
-  if (common.length >= TOKEN_MIN_COMMON) {
+  if (
+    common.length >=
+    TOKEN_MIN_COMMON
+  ) {
     const score =
       common.length /
       Math.max(
@@ -370,23 +509,34 @@ function teamMatchScore(a: any, b: any): AnyObj {
         teamTokens(B).length
       );
 
-    if (score >= TOKEN_MATCH_MIN_SCORE) {
+    if (
+      score >=
+      TOKEN_MATCH_MIN_SCORE
+    ) {
       return {
         score,
-        method: "TOKEN_STRONG",
+        method:
+          "TOKEN_STRONG",
         accepted: true,
-        common_tokens: common
+        common_tokens:
+          common
       };
     }
   }
 
-  const score = characterSimilarity(A, B);
+  const score =
+    characterSimilarity(
+      A,
+      B
+    );
 
   return {
     score,
-    method: "CHARACTER_SIMILARITY",
+    method:
+      "CHARACTER_SIMILARITY",
     accepted:
-      score >= CHARACTER_SIMILARITY_MIN_SCORE
+      score >=
+      CHARACTER_SIMILARITY_MIN_SCORE
   };
 }
 
@@ -396,76 +546,125 @@ function twoSidedTeamScore(
   homeB: any,
   awayB: any
 ): AnyObj {
-  const nh = teamMatchScore(homeA, homeB);
-  const na = teamMatchScore(awayA, awayB);
+  const nh =
+    teamMatchScore(
+      homeA,
+      homeB
+    );
 
-  const rh = teamMatchScore(homeA, awayB);
-  const ra = teamMatchScore(awayA, homeB);
+  const na =
+    teamMatchScore(
+      awayA,
+      awayB
+    );
+
+  const rh =
+    teamMatchScore(
+      homeA,
+      awayB
+    );
+
+  const ra =
+    teamMatchScore(
+      awayA,
+      homeB
+    );
 
   const normalScore =
-    Math.min(nh.score, na.score);
+    Math.min(
+      nh.score,
+      na.score
+    );
 
   const reversedScore =
-    Math.min(rh.score, ra.score);
+    Math.min(
+      rh.score,
+      ra.score
+    );
 
   const normalValid =
     nh.accepted &&
     na.accepted &&
-    nh.score >= TEAM_MATCH_MIN_SCORE &&
-    na.score >= TEAM_MATCH_MIN_SCORE;
+    nh.score >=
+      TEAM_MATCH_MIN_SCORE &&
+    na.score >=
+      TEAM_MATCH_MIN_SCORE;
 
   const reversedValid =
     rh.accepted &&
     ra.accepted &&
-    rh.score >= TEAM_MATCH_MIN_SCORE &&
-    ra.score >= TEAM_MATCH_MIN_SCORE;
+    rh.score >=
+      TEAM_MATCH_MIN_SCORE &&
+    ra.score >=
+      TEAM_MATCH_MIN_SCORE;
 
   if (
     normalValid &&
-    normalScore >= reversedScore
+    normalScore >=
+      reversedScore
   ) {
     return {
       matched: true,
       direction: "NORMAL",
-      home_score: nh.score,
-      away_score: na.score,
-      combined_score: normalScore,
-      both_teams_pass: true,
-      home_method: nh.method,
-      away_method: na.method
+      home_score:
+        nh.score,
+      away_score:
+        na.score,
+      combined_score:
+        normalScore,
+      both_teams_pass:
+        true,
+      home_method:
+        nh.method,
+      away_method:
+        na.method
     };
   }
 
   if (reversedValid) {
     return {
       matched: true,
-      direction: "REVERSED",
-      home_score: rh.score,
-      away_score: ra.score,
-      combined_score: reversedScore,
-      both_teams_pass: true,
-      home_method: rh.method,
-      away_method: ra.method
+      direction:
+        "REVERSED",
+      home_score:
+        rh.score,
+      away_score:
+        ra.score,
+      combined_score:
+        reversedScore,
+      both_teams_pass:
+        true,
+      home_method:
+        rh.method,
+      away_method:
+        ra.method
     };
   }
 
   return {
     matched: false,
     direction:
-      normalScore >= reversedScore
+      normalScore >=
+      reversedScore
         ? "NORMAL"
         : "REVERSED",
     home_score:
-      normalScore >= reversedScore
+      normalScore >=
+      reversedScore
         ? nh.score
         : rh.score,
     away_score:
-      normalScore >= reversedScore
+      normalScore >=
+      reversedScore
         ? na.score
         : ra.score,
     combined_score:
-      Math.max(normalScore, reversedScore),
-    both_teams_pass: false
+      Math.max(
+        normalScore,
+        reversedScore
+      ),
+    both_teams_pass:
+      false
   };
 }
 
@@ -477,29 +676,42 @@ async function fetchServiceJSON(
   service: Fetcher,
   path: string
 ): Promise<AnyObj> {
-  const response = await service.fetch(
-    new Request(`https://service${path}`, {
-      method: "GET",
-      headers: {
-        accept: "application/json"
-      }
-    })
-  );
+  const response =
+    await service.fetch(
+      new Request(
+        `https://service${path}`,
+        {
+          method: "GET",
+          headers: {
+            accept:
+              "application/json"
+          }
+        }
+      )
+    );
 
-  const text = await response.text();
+  const text =
+    await response.text();
 
   if (!response.ok) {
     throw new Error(
-      `HTTP ${response.status} ${path}: ${text.slice(0, 500)}`
+      `HTTP ${response.status} ${path}: ${text.slice(
+        0,
+        500
+      )}`
     );
   }
 
-  if (!text.trim()) return {};
+  if (!text.trim()) {
+    return {};
+  }
 
   try {
     return JSON.parse(text);
   } catch {
-    throw new Error(`Invalid JSON from ${path}`);
+    throw new Error(
+      `Invalid JSON from ${path}`
+    );
   }
 }
 
@@ -507,25 +719,38 @@ async function fetchServiceJSON(
 // TRACKER
 // ============================================================
 
-function extractSignals(data: AnyObj): AnyObj[] {
+function extractSignals(
+  data: AnyObj
+): AnyObj[] {
   return (
     data?.signals ??
     data?.entries ??
     data?.hunter_entries ??
     data?.data ??
     []
-  ).filter((x: any) => x && typeof x === "object");
+  ).filter(
+    (x: any) =>
+      x &&
+      typeof x === "object"
+  );
 }
 
-function isHunterEntry(signal: AnyObj): boolean {
-  return safeString(
-    signal?.type ??
-    signal?.signal_type ??
-    signal?.signalType
-  ).toUpperCase() === ALLOWED_SIGNAL_TYPE;
+function isHunterEntry(
+  signal: AnyObj
+): boolean {
+  return (
+    safeString(
+      signal?.type ??
+      signal?.signal_type ??
+      signal?.signalType
+    ).toUpperCase() ===
+    ALLOWED_SIGNAL_TYPE
+  );
 }
 
-function signalMatchId(s: AnyObj): string {
+function signalMatchId(
+  s: AnyObj
+): string {
   return safeString(
     s?.match_id ??
     s?.matchId ??
@@ -534,7 +759,9 @@ function signalMatchId(s: AnyObj): string {
   );
 }
 
-function signalMatchName(s: AnyObj): string {
+function signalMatchName(
+  s: AnyObj
+): string {
   return safeString(
     s?.match ??
     s?.name ??
@@ -542,14 +769,18 @@ function signalMatchName(s: AnyObj): string {
   );
 }
 
-function signalHome(s: AnyObj): string {
+function signalHome(
+  s: AnyObj
+): string {
   return safeString(
     s?.v27?.home ??
     extractHome(s)
   );
 }
 
-function signalAway(s: AnyObj): string {
+function signalAway(
+  s: AnyObj
+): string {
   return safeString(
     s?.v27?.away ??
     extractAway(s)
@@ -560,7 +791,9 @@ function signalAway(s: AnyObj): string {
 // MATCHER
 // ============================================================
 
-function extractMatcherMatches(data: AnyObj): AnyObj[] {
+function extractMatcherMatches(
+  data: AnyObj
+): AnyObj[] {
   return (
     data?.matches ??
     data?.results ??
@@ -570,26 +803,33 @@ function extractMatcherMatches(data: AnyObj): AnyObj[] {
   );
 }
 
-function getMatcherScore(item: AnyObj): number {
+function getMatcherScore(
+  item: AnyObj
+): number {
   const s =
     item?.scoring ??
     item?.matcher_scoring ??
     item?.score_details ??
     {};
 
-  const score = Number(
-    s?.total ??
-    s?.score ??
-    item?.matcher_score ??
-    item?.match_score ??
-    item?.score ??
-    0
-  );
+  const score =
+    Number(
+      s?.total ??
+      s?.score ??
+      item?.matcher_score ??
+      item?.match_score ??
+      item?.score ??
+      0
+    );
 
-  return Number.isFinite(score) ? score : 0;
+  return Number.isFinite(score)
+    ? score
+    : 0;
 }
 
-function getClassification(item: AnyObj): string {
+function getClassification(
+  item: AnyObj
+): string {
   return safeString(
     item?.classification ??
     item?.match_classification ??
@@ -597,7 +837,9 @@ function getClassification(item: AnyObj): string {
   ).toUpperCase();
 }
 
-function getMatchMethod(item: AnyObj): string {
+function getMatchMethod(
+  item: AnyObj
+): string {
   return safeString(
     item?.match_method ??
     item?.method ??
@@ -605,8 +847,14 @@ function getMatchMethod(item: AnyObj): string {
   ).toUpperCase();
 }
 
-function extractV27FromMatcher(item: AnyObj): AnyObj {
-  return item?.v27 ?? item?.source ?? item;
+function extractV27FromMatcher(
+  item: AnyObj
+): AnyObj {
+  return (
+    item?.v27 ??
+    item?.source ??
+    item
+  );
 }
 
 function extractCloudbetFromMatcher(
@@ -624,54 +872,100 @@ function validateMatcherCandidate(
   signal: AnyObj,
   item: AnyObj
 ): AnyObj {
-  const v27 = extractV27FromMatcher(item);
-  const cloudbet = extractCloudbetFromMatcher(item);
+  const v27 =
+    extractV27FromMatcher(
+      item
+    );
 
-  const classification = getClassification(item);
-  const method = getMatchMethod(item);
-  const matcherScore = getMatcherScore(item);
+  const cloudbet =
+    extractCloudbetFromMatcher(
+      item
+    );
+
+  const classification =
+    getClassification(
+      item
+    );
+
+  const method =
+    getMatchMethod(
+      item
+    );
+
+  const matcherScore =
+    getMatcherScore(
+      item
+    );
 
   if (
-    item?.security?.score_only_match === true ||
-    item?.score_only_match === true
+    item?.security
+      ?.score_only_match ===
+      true ||
+    item?.score_only_match ===
+      true
   ) {
     return {
       accepted: false,
-      reason: "SCORE_ONLY_MATCH_REJECTED"
+      reason:
+        "SCORE_ONLY_MATCH_REJECTED"
     };
   }
 
-  const sHome = signalHome(signal);
-  const sAway = signalAway(signal);
-  const vHome = extractHome(v27);
-  const vAway = extractAway(v27);
+  const sHome =
+    signalHome(signal);
 
-  if (!teamsPresent(sHome, sAway)) {
+  const sAway =
+    signalAway(signal);
+
+  const vHome =
+    extractHome(v27);
+
+  const vAway =
+    extractAway(v27);
+
+  if (
+    !teamsPresent(
+      sHome,
+      sAway
+    )
+  ) {
     return {
       accepted: false,
-      reason: "SIGNAL_TEAMS_EMPTY"
+      reason:
+        "SIGNAL_TEAMS_EMPTY"
     };
   }
 
-  if (!teamsPresent(vHome, vAway)) {
+  if (
+    !teamsPresent(
+      vHome,
+      vAway
+    )
+  ) {
     return {
       accepted: false,
-      reason: "V27_TEAMS_EMPTY"
+      reason:
+        "V27_TEAMS_EMPTY"
     };
   }
 
-  const teamScore = twoSidedTeamScore(
-    sHome,
-    sAway,
-    vHome,
-    vAway
-  );
+  const teamScore =
+    twoSidedTeamScore(
+      sHome,
+      sAway,
+      vHome,
+      vAway
+    );
 
-  if (!teamScore.matched) {
+  if (
+    !teamScore.matched
+  ) {
     return {
       accepted: false,
-      reason: "STRICT_SIGNAL_TEAMS_MISMATCH",
-      team_scores: teamScore
+      reason:
+        "STRICT_SIGNAL_TEAMS_MISMATCH",
+      team_scores:
+        teamScore
     };
   }
 
@@ -681,14 +975,19 @@ function validateMatcherCandidate(
   ) {
     return {
       accepted: false,
-      reason: "EXACT_ID_WITH_ZERO_SCORE_REJECTED"
+      reason:
+        "EXACT_ID_WITH_ZERO_SCORE_REJECTED"
     };
   }
 
-  if (matcherScore < MIN_MATCHER_SCORE) {
+  if (
+    matcherScore <
+    MIN_MATCHER_SCORE
+  ) {
     return {
       accepted: false,
-      reason: "MATCHER_SCORE_TOO_LOW"
+      reason:
+        "MATCHER_SCORE_TOO_LOW"
     };
   }
 
@@ -697,9 +996,13 @@ function validateMatcherCandidate(
     REQUIRED_MATCH_CLASSIFICATION;
 
   const strong =
-    matcherScore >= STRONG_MATCHER_SCORE;
+    matcherScore >=
+    STRONG_MATCHER_SCORE;
 
-  if (!confident && !strong) {
+  if (
+    !confident &&
+    !strong
+  ) {
     return {
       accepted: false,
       reason:
@@ -709,33 +1012,63 @@ function validateMatcherCandidate(
 
   return {
     accepted: true,
+
     reason:
       confident
         ? "CONFIDENT_MATCH_ACCEPTED"
         : "STRICT_TWO_SIDED_MATCH_ACCEPTED",
 
-    source: "MATCHER",
+    source:
+      "MATCHER",
+
     classification,
+
     method,
-    matcher_score: matcherScore,
+
+    matcher_score:
+      matcherScore,
 
     v27: {
-      id: extractMatchId(v27),
-      match: displayMatch(v27),
-      home: vHome,
-      away: vAway
+      id:
+        extractMatchId(v27),
+
+      match:
+        displayMatch(v27),
+
+      home:
+        vHome,
+
+      away:
+        vAway
     },
 
-    cloudbet: cloudbet
-      ? {
-          id: extractMatchId(cloudbet),
-          match: displayMatch(cloudbet),
-          home: extractHome(cloudbet),
-          away: extractAway(cloudbet)
-        }
-      : null,
+    cloudbet:
+      cloudbet
+        ? {
+            id:
+              extractMatchId(
+                cloudbet
+              ),
 
-    team_scores: teamScore
+            match:
+              displayMatch(
+                cloudbet
+              ),
+
+            home:
+              extractHome(
+                cloudbet
+              ),
+
+            away:
+              extractAway(
+                cloudbet
+              )
+          }
+        : null,
+
+    team_scores:
+      teamScore
   };
 }
 
@@ -744,16 +1077,28 @@ function findBestMatcherCandidate(
   matcherData: AnyObj
 ): AnyObj {
   const matches =
-    extractMatcherMatches(matcherData);
+    extractMatcherMatches(
+      matcherData
+    );
 
-  let best: AnyObj | null = null;
-  const rejectionReasons: Record<string, number> = {};
+  let best:
+    AnyObj | null = null;
 
-  for (const item of matches) {
+  const rejectionReasons:
+    Record<string, number> = {};
+
+  for (
+    const item of matches
+  ) {
     const result =
-      validateMatcherCandidate(signal, item);
+      validateMatcherCandidate(
+        signal,
+        item
+      );
 
-    if (result.accepted) {
+    if (
+      result.accepted
+    ) {
       if (
         !best ||
         result.matcher_score >
@@ -763,10 +1108,12 @@ function findBestMatcherCandidate(
       }
     } else {
       const r =
-        result.reason ?? "UNKNOWN";
+        result.reason ??
+        "UNKNOWN";
 
       rejectionReasons[r] =
-        (rejectionReasons[r] ?? 0) + 1;
+        (rejectionReasons[r] ??
+          0) + 1;
     }
   }
 
@@ -776,8 +1123,11 @@ function findBestMatcherCandidate(
       reason:
         "NO_ACCEPTABLE_MATCHER_CANDIDATE",
       diagnostics: {
-        candidates_checked: matches.length,
-        rejection_reasons: rejectionReasons
+        candidates_checked:
+          matches.length,
+
+        rejection_reasons:
+          rejectionReasons
       }
     };
   }
@@ -785,9 +1135,13 @@ function findBestMatcherCandidate(
   return {
     found: true,
     ...best,
+
     diagnostics: {
-      candidates_checked: matches.length,
-      rejection_reasons: rejectionReasons
+      candidates_checked:
+        matches.length,
+
+      rejection_reasons:
+        rejectionReasons
     }
   };
 }
@@ -808,30 +1162,54 @@ function extractCloudbetMatches(
   );
 }
 
-function isCloudbetLive(m: AnyObj): boolean {
+function isCloudbetLive(
+  m: AnyObj
+): boolean {
   return (
-    safeString(m?.status).toUpperCase() ===
+    safeString(
+      m?.status
+    ).toUpperCase() ===
       "TRADING_LIVE" ||
     m?.live === true ||
-    safeString(m?.state).toUpperCase() ===
-      "LIVE"
+    m?.isLive === true ||
+    m?.inPlay === true ||
+    m?.in_play === true ||
+    safeString(
+      m?.state
+    ).toUpperCase() ===
+      "LIVE" ||
+    safeString(
+      m?.state
+    ).toUpperCase() ===
+      "IN_PLAY"
   );
 }
 
-function extractOdds(m: AnyObj): number | null {
+function extractOdds(
+  m: AnyObj
+): number | null {
   const values = [
     m?.odds,
     m?.price,
     m?.decimal_odds,
     m?.decimalOdds,
-    m?.markets?.["1H Total Goals"]?.odds,
-    m?.markets?.["1H Total Goals"]?.over_0_5,
-    m?.markets?.first_half_total_goals?.over_0_5,
+    m?.markets?.[
+      "1H Total Goals"
+    ]?.odds,
+    m?.markets?.[
+      "1H Total Goals"
+    ]?.over_0_5,
+    m?.markets
+      ?.first_half_total_goals
+      ?.over_0_5,
     m?.market?.odds
   ];
 
-  for (const value of values) {
-    const n = Number(value);
+  for (
+    const value of values
+  ) {
+    const n =
+      Number(value);
 
     if (
       Number.isFinite(n) &&
@@ -852,26 +1230,57 @@ function findCloudbetRawJsonPresence(
   signal: AnyObj,
   raw: AnyObj[]
 ): AnyObj {
-  const sh = signalHome(signal);
-  const sa = signalAway(signal);
+  const sh =
+    signalHome(signal);
 
-  if (!teamsPresent(sh, sa)) {
+  const sa =
+    signalAway(signal);
+
+  if (
+    !teamsPresent(
+      sh,
+      sa
+    )
+  ) {
     return {
-      status: "CANNOT_CHECK",
-      reason: "SIGNAL_TEAMS_EMPTY",
-      signal_match: signalMatchName(signal),
+      status:
+        "CANNOT_CHECK",
+
+      reason:
+        "SIGNAL_TEAMS_EMPTY",
+
+      signal_match:
+        signalMatchName(
+          signal
+        ),
+
       signal_match_id:
-        signalMatchId(signal) || null
+        signalMatchId(
+          signal
+        ) || null
     };
   }
 
-  let best: AnyObj | null = null;
+  let best:
+    AnyObj | null = null;
 
-  for (const cb of raw) {
-    const ch = extractHome(cb);
-    const ca = extractAway(cb);
+  for (
+    const cb of raw
+  ) {
+    const ch =
+      extractHome(cb);
 
-    if (!teamsPresent(ch, ca)) continue;
+    const ca =
+      extractAway(cb);
+
+    if (
+      !teamsPresent(
+        ch,
+        ca
+      )
+    ) {
+      continue;
+    }
 
     const score =
       twoSidedTeamScore(
@@ -883,24 +1292,46 @@ function findCloudbetRawJsonPresence(
 
     if (
       !score.matched ||
-      score.home_score < TEAM_MATCH_MIN_SCORE ||
-      score.away_score < TEAM_MATCH_MIN_SCORE
+      score.home_score <
+        TEAM_MATCH_MIN_SCORE ||
+      score.away_score <
+        TEAM_MATCH_MIN_SCORE
     ) {
       continue;
     }
 
     const candidate = {
       match: cb,
-      id: extractMatchId(cb),
+
+      id:
+        extractMatchId(cb),
+
       home: ch,
+
       away: ca,
-      direction: score.direction,
-      home_score: score.home_score,
-      away_score: score.away_score,
-      combined_score: score.combined_score,
-      live: isCloudbetLive(cb),
-      status: cb?.status ?? null,
-      state: cb?.state ?? null
+
+      direction:
+        score.direction,
+
+      home_score:
+        score.home_score,
+
+      away_score:
+        score.away_score,
+
+      combined_score:
+        score.combined_score,
+
+      live:
+        isCloudbetLive(cb),
+
+      status:
+        cb?.status ??
+        null,
+
+      state:
+        cb?.state ??
+        null
     };
 
     if (
@@ -914,15 +1345,29 @@ function findCloudbetRawJsonPresence(
 
   if (!best) {
     return {
-      status: "MISSING_FROM_LIVE_JSON",
+      status:
+        "MISSING_FROM_LIVE_JSON",
+
       found: false,
+
       signal_match:
-        signalMatchName(signal),
+        signalMatchName(
+          signal
+        ),
+
       signal_match_id:
-        signalMatchId(signal) || null,
-      signal_home: sh,
-      signal_away: sa,
-      raw_candidates_checked: raw.length
+        signalMatchId(
+          signal
+        ) || null,
+
+      signal_home:
+        sh,
+
+      signal_away:
+        sa,
+
+      raw_candidates_checked:
+        raw.length
     };
   }
 
@@ -935,13 +1380,19 @@ function findCloudbetRawJsonPresence(
     found: true,
 
     signal_match:
-      signalMatchName(signal),
+      signalMatchName(
+        signal
+      ),
 
     signal_match_id:
-      signalMatchId(signal) || null,
+      signalMatchId(
+        signal
+      ) || null,
 
     cloudbet_match:
-      displayMatch(best.match),
+      displayMatch(
+        best.match
+      ),
 
     cloudbet_id:
       best.id || null,
@@ -986,12 +1437,18 @@ function findDirectCloudbet(
   signal: AnyObj,
   matches: AnyObj[]
 ): AnyObj {
-  const sh = signalHome(signal);
-  const sa = signalAway(signal);
+  const sh =
+    signalHome(signal);
 
-  let best: AnyObj | null = null;
+  const sa =
+    signalAway(signal);
 
-  for (const cb of matches) {
+  let best:
+    AnyObj | null = null;
+
+  for (
+    const cb of matches
+  ) {
     const score =
       twoSidedTeamScore(
         sh,
@@ -1002,8 +1459,10 @@ function findDirectCloudbet(
 
     if (
       !score.matched ||
-      score.home_score < TEAM_MATCH_MIN_SCORE ||
-      score.away_score < TEAM_MATCH_MIN_SCORE
+      score.home_score <
+        TEAM_MATCH_MIN_SCORE ||
+      score.away_score <
+        TEAM_MATCH_MIN_SCORE
     ) {
       continue;
     }
@@ -1015,9 +1474,16 @@ function findDirectCloudbet(
     ) {
       best = {
         match: cb,
-        direction: score.direction,
-        home_score: score.home_score,
-        away_score: score.away_score,
+
+        direction:
+          score.direction,
+
+        home_score:
+          score.home_score,
+
+        away_score:
+          score.away_score,
+
         combined_score:
           score.combined_score
       };
@@ -1027,8 +1493,10 @@ function findDirectCloudbet(
   if (!best) {
     return {
       found: false,
+
       reason:
         "DIRECT_CLOUDBET_STRICT_TEAMS_NOT_CONFIRMED",
+
       candidates_checked:
         matches.length
     };
@@ -1036,48 +1504,137 @@ function findDirectCloudbet(
 
   return {
     found: true,
+
     source:
       "DIRECT_CLOUDBET_FALLBACK",
+
     ...best
   };
 }
 
 // ============================================================
-// V5.7 NEW:
-// ADDITIONAL RAW CLOUDBET MATCH SEARCH
-//
-// Searches the COMPLETE raw /live response.
-// This is deliberately separate from findDirectCloudbet(),
-// which searches only liveCloudbet.
-//
-// NO NETWORK REQUEST HERE.
-// Uses the already downloaded raw array.
+// V5.8 CATALOGUE EXTRACTION
 // ============================================================
 
-function findRawCloudbetMatch(
-  signal: AnyObj,
-  rawMatches: AnyObj[]
-): AnyObj {
-  const sh = signalHome(signal);
-  const sa = signalAway(signal);
+function extractCatalogueCompetitions(
+  data: AnyObj
+): AnyObj[] {
+  const direct =
+    data?.competitions;
 
-  if (!teamsPresent(sh, sa)) {
-    return {
-      found: false,
-      reason:
-        "RAW_SEARCH_SIGNAL_TEAMS_EMPTY",
-      candidates_checked:
-        rawMatches.length
-    };
+  if (
+    Array.isArray(direct)
+  ) {
+    return direct;
   }
 
-  let best: AnyObj | null = null;
+  const categories =
+    Array.isArray(
+      data?.categories
+    )
+      ? data.categories
+      : [];
 
-  for (const cb of rawMatches) {
-    const ch = extractHome(cb);
-    const ca = extractAway(cb);
+  const result:
+    AnyObj[] = [];
 
-    if (!teamsPresent(ch, ca)) {
+  for (
+    const category of categories
+  ) {
+    const competitions =
+      Array.isArray(
+        category?.competitions
+      )
+        ? category.competitions
+        : [];
+
+    for (
+      const competition
+      of competitions
+    ) {
+      result.push(
+        competition
+      );
+    }
+  }
+
+  return result;
+}
+
+// ============================================================
+// V5.8 COMPETITION EVENT EXTRACTION
+// ============================================================
+
+function extractCompetitionEvents(
+  data: AnyObj
+): AnyObj[] {
+  return (
+    data?.events ??
+    data?.matches ??
+    data?.data ??
+    []
+  ).filter(
+    (x: any) =>
+      x &&
+      typeof x === "object"
+  );
+}
+
+// ============================================================
+// V5.8 EVENT CANDIDATE SEARCH
+//
+// IMPORTANT:
+// Searches ONLY team names.
+//
+// NEVER uses:
+// - score
+// - result
+// - minute
+// - odds
+// ============================================================
+
+function findCatalogueEventCandidates(
+  signal: AnyObj,
+  events: AnyObj[]
+): AnyObj[] {
+  const sh =
+    signalHome(signal);
+
+  const sa =
+    signalAway(signal);
+
+  if (
+    !teamsPresent(
+      sh,
+      sa
+    )
+  ) {
+    return [];
+  }
+
+  const candidates:
+    AnyObj[] = [];
+
+  for (
+    const event of events
+  ) {
+    const eh =
+      extractHome(event);
+
+    const ea =
+      extractAway(event);
+
+    // --------------------------------------------------------
+    // HARD SECURITY:
+    // Both sides MUST EXIST.
+    // --------------------------------------------------------
+
+    if (
+      !teamsPresent(
+        eh,
+        ea
+      )
+    ) {
       continue;
     }
 
@@ -1085,20 +1642,39 @@ function findRawCloudbetMatch(
       twoSidedTeamScore(
         sh,
         sa,
-        ch,
-        ca
+        eh,
+        ea
       );
+
+    // --------------------------------------------------------
+    // HARD SECURITY:
+    // BOTH teams must pass.
+    // --------------------------------------------------------
 
     if (
       !score.matched ||
-      score.home_score < TEAM_MATCH_MIN_SCORE ||
-      score.away_score < TEAM_MATCH_MIN_SCORE
+      !score.both_teams_pass ||
+      score.home_score <
+        TEAM_MATCH_MIN_SCORE ||
+      score.away_score <
+        TEAM_MATCH_MIN_SCORE
     ) {
       continue;
     }
 
-    const candidate = {
-      match: cb,
+    candidates.push({
+      event,
+
+      id:
+        extractMatchId(
+          event
+        ),
+
+      home:
+        eh,
+
+      away:
+        ea,
 
       direction:
         score.direction,
@@ -1110,166 +1686,814 @@ function findRawCloudbetMatch(
         score.away_score,
 
       combined_score:
-        score.combined_score,
-
-      live:
-        isCloudbetLive(cb),
-
-      id:
-        extractMatchId(cb),
-
-      home:
-        ch,
-
-      away:
-        ca
-    };
-
-    if (
-      !best ||
-      candidate.combined_score >
-        best.combined_score
-    ) {
-      best = candidate;
-    }
+        score.combined_score
+    });
   }
 
-  if (!best) {
+  candidates.sort(
+    (a, b) =>
+      b.combined_score -
+      a.combined_score
+  );
+
+  return candidates.slice(
+    0,
+    MAX_EVENT_DETAIL_CANDIDATES
+  );
+}
+
+// ============================================================
+// V5.8 CONCRETE EVENT VERIFICATION
+//
+// Request:
+//   CLOUDBET /event?id=<EVENT_ID>
+//
+// The event detail is the final authority for live status.
+//
+// Security:
+// BOTH teams + event identity + live status required.
+// ============================================================
+
+async function verifyConcreteCloudbetEvent(
+  candidate: AnyObj
+): Promise<AnyObj> {
+  const eventId =
+    safeString(
+      candidate?.id
+    );
+
+  if (!eventId) {
     return {
       found: false,
 
       reason:
-        "RAW_CLOUDBET_STRICT_TWO_SIDED_MATCH_NOT_FOUND",
+        "CATALOGUE_EVENT_ID_EMPTY"
+    };
+  }
 
-      candidates_checked:
-        rawMatches.length
+  let data:
+    AnyObj;
+
+  try {
+    data =
+      await fetchServiceJSON(
+        currentCloudbetService,
+        `/event?id=${encodeURIComponent(
+          eventId
+        )}`
+      );
+  } catch (error: any) {
+    return {
+      found: false,
+
+      reason:
+        "CLOUDBET_EVENT_REQUEST_FAILED",
+
+      error:
+        error?.message ??
+        String(error)
+    };
+  }
+
+  const event =
+    data?.event ??
+    data?.data ??
+    data;
+
+  if (
+    !event ||
+    typeof event !==
+      "object"
+  ) {
+    return {
+      found: false,
+
+      reason:
+        "CLOUDBET_EVENT_EMPTY"
+    };
+  }
+
+  const eventHome =
+    extractHome(event);
+
+  const eventAway =
+    extractAway(event);
+
+  // ----------------------------------------------------------
+  // HARD REJECT:
+  // no two-sided teams
+  // ----------------------------------------------------------
+
+  if (
+    !teamsPresent(
+      eventHome,
+      eventAway
+    )
+  ) {
+    return {
+      found: false,
+
+      reason:
+        "EVENT_TWO_SIDED_TEAMS_MISSING",
+
+      event_id:
+        eventId
+    };
+  }
+
+  const teamScore =
+    twoSidedTeamScore(
+      candidate.home,
+      candidate.away,
+      eventHome,
+      eventAway
+    );
+
+  if (
+    !teamScore.matched ||
+    !teamScore.both_teams_pass ||
+    teamScore.home_score <
+      TEAM_MATCH_MIN_SCORE ||
+    teamScore.away_score <
+      TEAM_MATCH_MIN_SCORE
+  ) {
+    return {
+      found: false,
+
+      reason:
+        "EVENT_STRICT_TWO_SIDED_TEAM_MISMATCH",
+
+      event_id:
+        eventId,
+
+      event_home:
+        eventHome,
+
+      event_away:
+        eventAway,
+
+      team_scores:
+        teamScore
+    };
+  }
+
+  const live =
+    isCloudbetLive(
+      event
+    );
+
+  if (!live) {
+    return {
+      found: true,
+
+      verified: false,
+
+      status:
+        "PRESENT_NOT_LIVE",
+
+      reason:
+        "CLOUDBET_EVENT_FOUND_BUT_NOT_LIVE",
+
+      event_id:
+        extractMatchId(
+          event
+        ) || eventId,
+
+      match:
+        displayMatch(
+          event
+        ),
+
+      home:
+        eventHome,
+
+      away:
+        eventAway,
+
+      cloudbet_status:
+        event?.status ??
+        null,
+
+      cloudbet_state:
+        event?.state ??
+        null,
+
+      team_scores:
+        teamScore,
+
+      event
     };
   }
 
   return {
     found: true,
 
-    source:
-      "RAW_CLOUDBET_ADDITIONAL_SEARCH",
+    verified: true,
+
+    status:
+      "LIVE_VERIFIED",
 
     method:
-      "RAW_JSON_STRICT_TWO_SIDED_TEAM_MATCH",
+      "CATALOGUE_EVENT_DETAIL_STRICT_TWO_SIDED_LIVE",
 
-    ...best
+    event_id:
+      extractMatchId(
+        event
+      ) || eventId,
+
+    match:
+      event,
+
+    home:
+      eventHome,
+
+    away:
+      eventAway,
+
+    direction:
+      teamScore.direction,
+
+    home_score:
+      teamScore.home_score,
+
+    away_score:
+      teamScore.away_score,
+
+    combined_score:
+      teamScore.combined_score,
+
+    cloudbet_status:
+      event?.status ??
+      null,
+
+    cloudbet_state:
+      event?.state ??
+      null
   };
 }
 
 // ============================================================
-// VERIFY CLOUDBET
+// CURRENT CLOUDBET SERVICE
+//
+// Used only by the V5.8 concrete event helper.
+//
+// Assigned immediately before catalogue/event fallback.
 // ============================================================
 
-function verifyCloudbet(
-  matcher: AnyObj,
-  liveMatches: AnyObj[]
-): AnyObj {
-  const target = matcher?.cloudbet;
+let currentCloudbetService:
+  Fetcher;
 
-  if (!target) {
+// ============================================================
+// V5.8 CATALOGUE FALLBACK
+//
+// Flow:
+//   /sports/soccer
+//       ↓
+//   competitions
+//       ↓
+//   /competitions/{key}
+//       ↓
+//   search BOTH team names
+//       ↓
+//   concrete event ID
+//       ↓
+//   /event?id=...
+//       ↓
+//   BOTH teams
+//       ↓
+//   TRADING_LIVE
+// ============================================================
+
+async function findCloudbetByCatalogue(
+  env: Env,
+  signal: AnyObj
+): Promise<AnyObj> {
+  currentCloudbetService =
+    env.CLOUDBET;
+
+  const sh =
+    signalHome(signal);
+
+  const sa =
+    signalAway(signal);
+
+  if (
+    !teamsPresent(
+      sh,
+      sa
+    )
+  ) {
     return {
+      found: false,
+
       verified: false,
+
+      status:
+        "REJECTED",
+
       reason:
-        "MATCHER_DID_NOT_RETURN_CLOUDBET_MATCH"
+        "CATALOGUE_SIGNAL_TWO_SIDED_TEAMS_EMPTY"
     };
   }
 
-  const targetId =
-    safeString(target.id);
+  // ----------------------------------------------------------
+  // CATALOGUE
+  // ----------------------------------------------------------
 
-  const th =
-    normalizeTeam(target.home);
+  let catalogue:
+    AnyObj;
 
-  const ta =
-    normalizeTeam(target.away);
-
-  if (!th || !ta) {
+  try {
+    catalogue =
+      await fetchServiceJSON(
+        env.CLOUDBET,
+        "/catalogue"
+      );
+  } catch (error: any) {
     return {
+      found: false,
+
       verified: false,
+
+      status:
+        "CATALOGUE_ERROR",
+
       reason:
-        "MATCHER_CLOUDBET_TEAMS_EMPTY"
+        "CLOUDBET_CATALOGUE_REQUEST_FAILED",
+
+      error:
+        error?.message ??
+        String(error)
     };
   }
 
-  if (targetId) {
-    for (const cb of liveMatches) {
-      if (
-        extractMatchId(cb) !==
-        targetId
-      ) {
-        continue;
-      }
+  const allCompetitions =
+    extractCatalogueCompetitions(
+      catalogue
+    );
 
-      const score =
-        twoSidedTeamScore(
-          th,
-          ta,
-          extractHome(cb),
-          extractAway(cb)
-        );
-
-      if (
-        score.matched &&
-        score.home_score >= TEAM_MATCH_MIN_SCORE &&
-        score.away_score >= TEAM_MATCH_MIN_SCORE
-      ) {
-        return {
-          verified: true,
-          method:
-            "CLOUDBET_ID_AND_STRICT_TEAMS",
-          ...score,
-          match: cb
-        };
-      }
-    }
-  }
-
-  let best: AnyObj | null = null;
-
-  for (const cb of liveMatches) {
-    const score =
-      twoSidedTeamScore(
-        th,
-        ta,
-        extractHome(cb),
-        extractAway(cb)
+  const competitions =
+    allCompetitions
+      .filter(
+        c =>
+          safeString(
+            c?.key
+          )
+      )
+      .filter(
+        c =>
+          Number(
+            c?.eventCount ??
+            1
+          ) > 0
+      )
+      .slice(
+        0,
+        CATALOGUE_COMPETITION_LIMIT
       );
 
+  // ----------------------------------------------------------
+  // SEARCH COMPETITIONS
+  // ----------------------------------------------------------
+
+  const competitionResults =
+    await Promise.all(
+      competitions.map(
+        async competition => {
+          try {
+            const data =
+              await fetchServiceJSON(
+                env.CLOUDBET,
+                `/competition?key=${encodeURIComponent(
+                  safeString(
+                    competition.key
+                  )
+                )}`
+              );
+
+            const events =
+              extractCompetitionEvents(
+                data
+              );
+
+            const candidates =
+              findCatalogueEventCandidates(
+                signal,
+                events
+              );
+
+            return {
+              competition,
+              candidates,
+              events_count:
+                events.length,
+              error:
+                null
+            };
+          } catch (error: any) {
+            return {
+              competition,
+              candidates: [],
+              events_count: 0,
+              error:
+                error?.message ??
+                String(error)
+            };
+          }
+        }
+      )
+    );
+
+  const allCandidates:
+    AnyObj[] = [];
+
+  const competitionErrors:
+    AnyObj[] = [];
+
+  let competitionsWithTeamCandidate =
+    0;
+
+  for (
+    const result
+    of competitionResults
+  ) {
     if (
-      !score.matched ||
-      score.home_score < TEAM_MATCH_MIN_SCORE ||
-      score.away_score < TEAM_MATCH_MIN_SCORE
+      result.error
     ) {
+      competitionErrors.push({
+        key:
+          result.competition.key,
+
+        name:
+          result.competition.name ??
+          null,
+
+        error:
+          result.error
+      });
+
       continue;
     }
 
     if (
-      !best ||
-      score.combined_score >
-        best.combined_score
+      result.candidates.length
     ) {
-      best = {
-        match: cb,
-        ...score
+      competitionsWithTeamCandidate++;
+
+      for (
+        const candidate
+        of result.candidates
+      ) {
+        allCandidates.push({
+          ...candidate,
+
+          competition: {
+            key:
+              result.competition.key,
+
+            name:
+              result.competition.name ??
+              null
+          }
+        });
+      }
+    }
+  }
+
+  allCandidates.sort(
+    (a, b) =>
+      b.combined_score -
+      a.combined_score
+  );
+
+  const uniqueCandidates:
+    AnyObj[] = [];
+
+  const seenIds =
+    new Set<string>();
+
+  for (
+    const candidate
+    of allCandidates
+  ) {
+    const id =
+      safeString(
+        candidate.id
+      );
+
+    if (
+      id &&
+      seenIds.has(id)
+    ) {
+      continue;
+    }
+
+    if (id) {
+      seenIds.add(id);
+    }
+
+    uniqueCandidates.push(
+      candidate
+    );
+
+    if (
+      uniqueCandidates.length >=
+      MAX_EVENT_DETAIL_CANDIDATES
+    ) {
+      break;
+    }
+  }
+
+  // ----------------------------------------------------------
+  // NO EVENT FOUND
+  // ----------------------------------------------------------
+
+  if (
+    !uniqueCandidates.length
+  ) {
+    return {
+      found: false,
+
+      verified: false,
+
+      status:
+        "MISSING",
+
+      reason:
+        "CLOUDBET_CATALOGUE_BOTH_TEAM_EVENT_NOT_FOUND",
+
+      search: {
+        home:
+          sh,
+
+        away:
+          sa,
+
+        competitions_checked:
+          competitions.length,
+
+        competitions_total:
+          allCompetitions.length,
+
+        competitions_with_team_candidate:
+          competitionsWithTeamCandidate,
+
+        event_candidates:
+          0,
+
+        competition_errors:
+          competitionErrors.length
+      },
+
+      competition_errors:
+        competitionErrors
+    };
+  }
+
+  // ----------------------------------------------------------
+  // CONCRETE EVENT DETAIL
+  // ----------------------------------------------------------
+
+  const eventChecks:
+    AnyObj[] = [];
+
+  for (
+    const candidate
+    of uniqueCandidates
+  ) {
+    const verified =
+      await verifyConcreteCloudbetEvent(
+        candidate
+      );
+
+    eventChecks.push({
+      candidate: {
+        id:
+          candidate.id,
+
+        home:
+          candidate.home,
+
+        away:
+          candidate.away,
+
+        direction:
+          candidate.direction,
+
+        home_score:
+          candidate.home_score,
+
+        away_score:
+          candidate.away_score,
+
+        combined_score:
+          candidate.combined_score,
+
+        competition:
+          candidate.competition
+      },
+
+      verification:
+        verified
+    });
+
+    if (
+      verified.verified
+    ) {
+      return {
+        found: true,
+
+        verified: true,
+
+        status:
+          "LIVE_VERIFIED",
+
+        source:
+          "CLOUDBET_CATALOGUE_EVENT_SEARCH",
+
+        method:
+          "CATALOGUE_TEAMS_THEN_EVENT_DETAIL",
+
+        event_id:
+          verified.event_id,
+
+        match:
+          verified.match,
+
+        home:
+          verified.home,
+
+        away:
+          verified.away,
+
+        direction:
+          verified.direction,
+
+        home_score:
+          verified.home_score,
+
+        away_score:
+          verified.away_score,
+
+        combined_score:
+          verified.combined_score,
+
+        cloudbet_status:
+          verified.cloudbet_status,
+
+        cloudbet_state:
+          verified.cloudbet_state,
+
+        search: {
+          home:
+            sh,
+
+          away:
+            sa,
+
+          competitions_checked:
+            competitions.length,
+
+          competitions_total:
+            allCompetitions.length,
+
+          competitions_with_team_candidate:
+            competitionsWithTeamCandidate,
+
+          event_candidates:
+            uniqueCandidates.length
+        },
+
+        event_checks:
+          eventChecks
       };
     }
   }
 
-  return best
-    ? {
-        verified: true,
-        method:
-          "CLOUDBET_STRICT_TWO_SIDED_TEAMS",
-        ...best
-      }
-    : {
-        verified: false,
-        reason:
-          "CLOUDBET_STRICT_TEAM_MATCH_NOT_CONFIRMED"
-      };
+  // ----------------------------------------------------------
+  // PRESENT BUT NOT LIVE
+  // ----------------------------------------------------------
+
+  const notLive =
+    eventChecks.find(
+      x =>
+        x?.verification
+          ?.status ===
+        "PRESENT_NOT_LIVE"
+    );
+
+  if (notLive) {
+    const v =
+      notLive.verification;
+
+    return {
+      found: true,
+
+      verified: false,
+
+      status:
+        "PRESENT_NOT_LIVE",
+
+      reason:
+        "CLOUDBET_EVENT_FOUND_BUT_NOT_LIVE",
+
+      event_id:
+        v.event_id ??
+        null,
+
+      match:
+        v.match ??
+        null,
+
+      home:
+        v.home ??
+        null,
+
+      away:
+        v.away ??
+        null,
+
+      cloudbet_status:
+        v.cloudbet_status ??
+        null,
+
+      cloudbet_state:
+        v.cloudbet_state ??
+        null,
+
+      direction:
+        v.team_scores
+          ?.direction ??
+        null,
+
+      combined_score:
+        v.team_scores
+          ?.combined_score ??
+        null,
+
+      search: {
+        home:
+          sh,
+
+        away:
+          sa,
+
+        competitions_checked:
+          competitions.length,
+
+        competitions_total:
+          allCompetitions.length,
+
+        competitions_with_team_candidate:
+          competitionsWithTeamCandidate,
+
+        event_candidates:
+          uniqueCandidates.length
+      },
+
+      event_checks:
+        eventChecks
+    };
+  }
+
+  // ----------------------------------------------------------
+  // FOUND CANDIDATES BUT NONE VERIFIED
+  // ----------------------------------------------------------
+
+  return {
+    found: true,
+
+    verified: false,
+
+    status:
+      "REJECTED",
+
+    reason:
+      "CLOUDBET_EVENT_CANDIDATES_FAILED_FINAL_STRICT_VALIDATION",
+
+    search: {
+      home:
+        sh,
+
+      away:
+        sa,
+
+      competitions_checked:
+        competitions.length,
+
+      competitions_total:
+        allCompetitions.length,
+
+      competitions_with_team_candidate:
+        competitionsWithTeamCandidate,
+
+      event_candidates:
+        uniqueCandidates.length
+    },
+
+    event_checks:
+      eventChecks
+  };
 }
 
 // ============================================================
@@ -1281,16 +2505,27 @@ function buildPreparedBet(
   matcher: AnyObj,
   verification: AnyObj
 ): AnyObj {
-  const cb = verification.match;
+  const cb =
+    verification.match;
 
   return {
-    status: "READY",
-    betting: "DISABLED",
+    status:
+      "READY",
 
-    sport: TARGET_SPORT,
-    period: TARGET_PERIOD,
-    outcome: TARGET_OUTCOME,
-    line: TARGET_LINE,
+    betting:
+      "DISABLED",
+
+    sport:
+      TARGET_SPORT,
+
+    period:
+      TARGET_PERIOD,
+
+    outcome:
+      TARGET_OUTCOME,
+
+    line:
+      TARGET_LINE,
 
     signal: {
       type:
@@ -1300,16 +2535,24 @@ function buildPreparedBet(
         ),
 
       match:
-        signalMatchName(signal),
+        signalMatchName(
+          signal
+        ),
 
       match_id:
-        signalMatchId(signal) || null,
+        signalMatchId(
+          signal
+        ) || null,
 
       home:
-        signalHome(signal) || null,
+        signalHome(
+          signal
+        ) || null,
 
       away:
-        signalAway(signal) || null,
+        signalAway(
+          signal
+        ) || null,
 
       entry_minute:
         signal?.entry_minute ??
@@ -1325,10 +2568,12 @@ function buildPreparedBet(
 
     cloudbet: {
       id:
-        extractMatchId(cb) || null,
+        extractMatchId(cb) ||
+        null,
 
       key:
-        cb?.key ?? null,
+        cb?.key ??
+        null,
 
       match:
         displayMatch(cb),
@@ -1340,19 +2585,23 @@ function buildPreparedBet(
         extractAway(cb),
 
       status:
-        cb?.status ?? null,
+        cb?.status ??
+        null,
 
       live:
-        cb?.live ?? null,
+        isCloudbetLive(cb),
 
       score:
-        cb?.score ?? null,
+        cb?.score ??
+        null,
 
       minute:
-        cb?.minute ?? null,
+        cb?.minute ??
+        null,
 
       competition:
-        cb?.competition ?? null,
+        cb?.competition ??
+        null,
 
       odds:
         extractOdds(cb)
@@ -1360,50 +2609,66 @@ function buildPreparedBet(
 
     matcher: {
       source:
-        matcher.source ?? null,
+        matcher.source ??
+        null,
 
       classification:
-        matcher.classification ?? null,
+        matcher.classification ??
+        null,
 
       match_method:
-        matcher.method ?? null,
+        matcher.method ??
+        null,
 
       matcher_score:
-        matcher.matcher_score ?? null,
+        matcher.matcher_score ??
+        null,
 
       reason:
-        matcher.reason ?? null,
+        matcher.reason ??
+        null,
 
       fallback:
         matcher.source ===
-        "DIRECT_CLOUDBET_FALLBACK" ||
+          "DIRECT_CLOUDBET_FALLBACK" ||
         matcher.source ===
-        "RAW_CLOUDBET_ADDITIONAL_SEARCH"
+          "CLOUDBET_CATALOGUE_EVENT_SEARCH"
     },
 
     security: {
-      secure_match: true,
-      score_only_match: false,
-      strict_two_sided_team_validation: true,
+      secure_match:
+        true,
+
+      score_only_match:
+        false,
+
+      strict_two_sided_team_validation:
+        true,
+
       team_minimum_score:
         TEAM_MATCH_MIN_SCORE,
 
-      cloudbet_verified: true,
+      cloudbet_verified:
+        true,
 
       cloudbet_verification_method:
-        verification.method,
+        verification.method ??
+        null,
 
       cloudbet_team_direction:
-        verification.direction ?? null,
+        verification.direction ??
+        null,
 
       cloudbet_combined_score:
-        verification.combined_score ?? null,
+        verification.combined_score ??
+        null,
 
-      test_mode: true
+      test_mode:
+        true
     },
 
     action:
-      "NO_BET_V5_7_DRY_RUN"
+      "NO_BET_V5_8_DRY_RUN"
   };
 }
 
@@ -1415,12 +2680,16 @@ function buildDryRunCandidate(
   bet: AnyObj
 ): AnyObj {
   const odds =
-    extractOdds(bet.cloudbet);
+    extractOdds(
+      bet.cloudbet
+    );
 
   return {
-    status: "BET_CANDIDATE",
+    status:
+      "BET_CANDIDATE",
 
-    mode: MODE,
+    mode:
+      MODE,
 
     betting_enabled:
       BETTING_ENABLED,
@@ -1469,12 +2738,23 @@ function buildDryRunCandidate(
     },
 
     security: {
-      dry_run: true,
-      betting_disabled: true,
-      real_bet_allowed: false,
-      odds_from_cloudbet_only: true,
-      odds_invented: false,
-      real_post_executed: false
+      dry_run:
+        true,
+
+      betting_disabled:
+        true,
+
+      real_bet_allowed:
+        false,
+
+      odds_from_cloudbet_only:
+        true,
+
+      odds_invented:
+        false,
+
+      real_post_executed:
+        false
     }
   };
 }
@@ -1483,13 +2763,17 @@ function buildDryRunCandidate(
 // ARCHIVE
 // ============================================================
 
-function archiveKey(bet: AnyObj): string {
+function archiveKey(
+  bet: AnyObj
+): string {
   const id =
     safeString(
       bet?.signal?.match_id
     );
 
-  if (id) return `id:${id}`;
+  if (id) {
+    return `id:${id}`;
+  }
 
   return `teams:${normalizeTeam(
     bet?.signal?.home
@@ -1513,60 +2797,82 @@ async function archiveReadyBets(
     new Date().toISOString();
 
   const statements =
-    bets.map(bet =>
-      env.DB.prepare(`
-        INSERT OR IGNORE INTO hunter_bet_archive (
-          archive_key,
-          match_id,
-          match,
-          home,
-          away,
-          entry_minute,
-          hunter_score,
-          cloudbet_id,
-          cloudbet_match,
-          matcher_source,
-          matcher_score,
-          cloudbet_combined_score,
-          direction,
-          created_at
+    bets.map(
+      bet =>
+        env.DB.prepare(`
+          INSERT OR IGNORE INTO hunter_bet_archive (
+            archive_key,
+            match_id,
+            match,
+            home,
+            away,
+            entry_minute,
+            hunter_score,
+            cloudbet_id,
+            cloudbet_match,
+            matcher_source,
+            matcher_score,
+            cloudbet_combined_score,
+            direction,
+            created_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).bind(
+          archiveKey(bet),
+          bet.signal.match_id ??
+            null,
+          bet.signal.match ??
+            null,
+          bet.signal.home ??
+            null,
+          bet.signal.away ??
+            null,
+          bet.signal.entry_minute ??
+            null,
+          bet.signal.hunter_score ??
+            null,
+          bet.cloudbet.id ??
+            null,
+          bet.cloudbet.match ??
+            null,
+          bet.matcher.source ??
+            null,
+          bet.matcher.matcher_score ??
+            null,
+          bet.security
+            .cloudbet_combined_score ??
+            null,
+          bet.security
+            .cloudbet_team_direction ??
+            null,
+          now
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).bind(
-        archiveKey(bet),
-        bet.signal.match_id ?? null,
-        bet.signal.match ?? null,
-        bet.signal.home ?? null,
-        bet.signal.away ?? null,
-        bet.signal.entry_minute ?? null,
-        bet.signal.hunter_score ?? null,
-        bet.cloudbet.id ?? null,
-        bet.cloudbet.match ?? null,
-        bet.matcher.source ?? null,
-        bet.matcher.matcher_score ?? null,
-        bet.security.cloudbet_combined_score ?? null,
-        bet.security.cloudbet_team_direction ?? null,
-        now
-      )
     );
 
   const results =
-    await env.DB.batch(statements);
+    await env.DB.batch(
+      statements
+    );
 
   const inserted =
     results.reduce(
       (sum, r) =>
         sum +
-        Number(r?.meta?.changes ?? 0),
+        Number(
+          r?.meta?.changes ??
+          0
+        ),
       0
     );
 
   return {
     inserted,
+
     duplicates:
       Math.max(
         0,
-        bets.length - inserted
+        bets.length -
+          inserted
       )
   };
 }
@@ -1606,18 +2912,28 @@ async function archiveResponse(
     `).all();
 
   return json({
-    success: true,
-    worker: "cloudbet-bet-worker",
-    version: VERSION,
+    success:
+      true,
+
+    worker:
+      "cloudbet-bet-worker",
+
+    version:
+      VERSION,
 
     archive: {
-      table: ARCHIVE_TABLE,
+      table:
+        ARCHIVE_TABLE,
 
       total_confirmed_hunter_matches:
-        Number(count?.total ?? 0),
+        Number(
+          count?.total ??
+          0
+        ),
 
       recent:
-        recent.results ?? []
+        recent.results ??
+        []
     },
 
     timestamp:
@@ -1635,21 +2951,32 @@ function buildNoMatch(
   matcher: AnyObj | null = null
 ): AnyObj {
   return {
-    status: "NO_MATCH",
-    betting: "DISABLED",
+    status:
+      "NO_MATCH",
+
+    betting:
+      "DISABLED",
 
     signal: {
       match:
-        signalMatchName(signal),
+        signalMatchName(
+          signal
+        ),
 
       match_id:
-        signalMatchId(signal) || null,
+        signalMatchId(
+          signal
+        ) || null,
 
       home:
-        signalHome(signal) || null,
+        signalHome(
+          signal
+        ) || null,
 
       away:
-        signalAway(signal) || null,
+        signalAway(
+          signal
+        ) || null,
 
       entry_minute:
         signal?.entry_minute ??
@@ -1666,14 +2993,21 @@ function buildNoMatch(
     matcher,
 
     security: {
-      secure_match: false,
-      cloudbet_verified: false,
-      strict_two_sided_team_validation: true,
-      test_mode: true
+      secure_match:
+        false,
+
+      cloudbet_verified:
+        false,
+
+      strict_two_sided_team_validation:
+        true,
+
+      test_mode:
+        true
     },
 
     action:
-      "NO_BET_V5_7_DRY_RUN",
+      "NO_BET_V5_8_DRY_RUN",
 
     reason
   };
@@ -1683,10 +3017,11 @@ function buildNoMatch(
 // MAIN
 // ============================================================
 
-async function runV57(
+async function runV58(
   env: Env
 ): Promise<Response> {
-  const started = Date.now();
+  const started =
+    Date.now();
 
   // ----------------------------------------------------------
   // TRACKER — 1 CALL
@@ -1706,47 +3041,70 @@ async function runV57(
     trackerStarted;
 
   const allSignals =
-    extractSignals(trackerData);
+    extractSignals(
+      trackerData
+    );
 
   const hunterEntries =
     allSignals.filter(
       isHunterEntry
     );
 
-  if (!hunterEntries.length) {
+  if (
+    !hunterEntries.length
+  ) {
     return json({
-      success: true,
+      success:
+        true,
+
       worker:
         "cloudbet-bet-worker",
-      version: VERSION,
-      mode: MODE,
-      betting: "DISABLED",
+
+      version:
+        VERSION,
+
+      mode:
+        MODE,
+
+      betting:
+        "DISABLED",
 
       tracker: {
         calls: 1,
+
         total_signals:
           allSignals.length,
-        hunter_entries: 0,
-        ms: trackerMs
+
+        hunter_entries:
+          0,
+
+        ms:
+          trackerMs
       },
 
       matcher: {
-        called: false
+        called:
+          false
       },
 
       cloudbet: {
-        called: false
+        called:
+          false
       },
 
       archive: {
-        inserted: 0,
-        duplicates: 0
+        inserted:
+          0,
+
+        duplicates:
+          0
       },
 
-      bet_candidates: [],
+      bet_candidates:
+        [],
 
       message:
-        "V5.7 DRY RUN. No active Hunter entries.",
+        "V5.8 DRY RUN. No active Hunter entries.",
 
       timestamp:
         new Date().toISOString()
@@ -1754,7 +3112,7 @@ async function runV57(
   }
 
   // ----------------------------------------------------------
-  // MATCHER + CLOUDBET — PARALLEL
+  // MATCHER + CLOUDBET /live — PARALLEL
   // ----------------------------------------------------------
 
   const parallelStarted =
@@ -1770,23 +3128,29 @@ async function runV57(
     fetchServiceJSON(
       env.MATCHER,
       `/match?threshold=${MATCHER_THRESHOLD}`
-    ).then(data => ({
-      data,
-      ms:
-        Date.now() -
-        matcherStarted
-    }));
+    ).then(
+      data => ({
+        data,
+
+        ms:
+          Date.now() -
+          matcherStarted
+      })
+    );
 
   const cloudbetPromise =
     fetchServiceJSON(
       env.CLOUDBET,
       "/live"
-    ).then(data => ({
-      data,
-      ms:
-        Date.now() -
-        cloudbetStarted
-    }));
+    ).then(
+      data => ({
+        data,
+
+        ms:
+          Date.now() -
+          cloudbetStarted
+      })
+    );
 
   const [
     matcherResult,
@@ -1827,16 +3191,22 @@ async function runV57(
     );
 
   // ----------------------------------------------------------
-  // RAW DIAGNOSTIC — CALCULATE ONCE
+  // RAW DIAGNOSTIC
   // ----------------------------------------------------------
 
   const diagnosticMap =
-    new Map<string, AnyObj>();
+    new Map<
+      string,
+      AnyObj
+    >();
 
   const cloudbetJsonDiagnostic:
     AnyObj[] = [];
 
-  for (const signal of hunterEntries) {
+  for (
+    const signal
+    of hunterEntries
+  ) {
     const diagnostic =
       findCloudbetRawJsonPresence(
         signal,
@@ -1844,8 +3214,12 @@ async function runV57(
       );
 
     const key =
-      signalMatchId(signal) ||
-      signalMatchName(signal);
+      signalMatchId(
+        signal
+      ) ||
+      signalMatchName(
+        signal
+      );
 
     diagnosticMap.set(
       key,
@@ -1859,19 +3233,22 @@ async function runV57(
 
   const jsonPresent =
     cloudbetJsonDiagnostic.filter(
-      x => x.status ===
+      x =>
+        x.status ===
         "JSON_PRESENT"
     );
 
   const jsonPresentNotLive =
     cloudbetJsonDiagnostic.filter(
-      x => x.status ===
+      x =>
+        x.status ===
         "JSON_PRESENT_NOT_LIVE"
     );
 
   const missing =
     cloudbetJsonDiagnostic.filter(
-      x => x.status ===
+      x =>
+        x.status ===
         "MISSING_FROM_LIVE_JSON"
     );
 
@@ -1891,21 +3268,47 @@ async function runV57(
   const flow:
     AnyObj[] = [];
 
-  let matcherMatchesCount = 0;
-  let directFallbackMatches = 0;
-  let rawAdditionalMatches = 0;
-  let cloudbetVerified = 0;
+  let matcherMatchesCount =
+    0;
+
+  let directFallbackMatches =
+    0;
+
+  let catalogueFallbackMatches =
+    0;
+
+  let cataloguePresentNotLive =
+    0;
+
+  let cloudbetVerified =
+    0;
 
   const rejectionReasons:
     Record<string, number> = {};
 
-  for (const signal of hunterEntries) {
+  const catalogueDiagnostics:
+    AnyObj[] = [];
+
+  // ----------------------------------------------------------
+  // PER HUNTER SIGNAL
+  // ----------------------------------------------------------
+
+  for (
+    const signal
+    of hunterEntries
+  ) {
     const key =
-      signalMatchId(signal) ||
-      signalMatchName(signal);
+      signalMatchId(
+        signal
+      ) ||
+      signalMatchName(
+        signal
+      );
 
     const rawDiagnostic =
-      diagnosticMap.get(key) ?? null;
+      diagnosticMap.get(
+        key
+      ) ?? null;
 
     const matcher =
       findBestMatcherCandidate(
@@ -1914,11 +3317,15 @@ async function runV57(
       );
 
     matcherMatchesCount +=
-      matcher.found ? 1 : 0;
+      matcher.found
+        ? 1
+        : 0;
 
     let verification:
       AnyObj = {
-        verified: false,
+        verified:
+          false,
+
         reason:
           "NO_MATCHER_CANDIDATE"
       };
@@ -1927,47 +3334,63 @@ async function runV57(
       "NONE";
 
     // --------------------------------------------------------
-    // MATCHER FIRST
+    // 1. MATCHER FIRST
     // --------------------------------------------------------
 
-    if (matcher.found) {
+    if (
+      matcher.found
+    ) {
       verification =
         verifyCloudbet(
           matcher,
           liveCloudbet
         );
 
-      if (verification.verified) {
-        source = "MATCHER";
+      if (
+        verification.verified
+      ) {
+        source =
+          "MATCHER";
       }
     }
 
     // --------------------------------------------------------
-    // DIRECT LIVE CLOUDBET FALLBACK
+    // 2. DIRECT LIVE CLOUDBET FALLBACK
     // --------------------------------------------------------
 
-    if (!verification.verified) {
+    if (
+      !verification.verified
+    ) {
       const fallback =
         findDirectCloudbet(
           signal,
           liveCloudbet
         );
 
-      if (fallback.found) {
+      if (
+        fallback.found
+      ) {
         directFallbackMatches++;
 
         verification = {
-          verified: true,
+          verified:
+            true,
+
           method:
             "DIRECT_CLOUDBET_STRICT_TWO_SIDED_TEAMS",
+
           direction:
             fallback.direction,
+
           home_score:
             fallback.home_score,
+
           away_score:
             fallback.away_score,
+
           combined_score:
             fallback.combined_score,
+
           match:
             fallback.match
         };
@@ -1978,49 +3401,98 @@ async function runV57(
     }
 
     // --------------------------------------------------------
-    // V5.7 ADDITIONAL RAW CLOUDBET SEARCH
+    // 3. V5.8 REAL CATALOGUE EVENT SEARCH
     //
     // IMPORTANT:
-    // Only runs if matcher + live fallback both failed.
+    // This is NOT another /live request.
     //
-    // Searches ALL raw /live matches.
-    // No second Cloudbet request.
+    // It searches:
+    // catalogue -> competitions -> event -> live status
+    //
+    // Search key:
+    // BOTH TEAM NAMES.
+    //
+    // NOT:
+    // score
+    // result
+    // minute
+    // odds
     // --------------------------------------------------------
 
-    if (!verification.verified) {
-      const rawFallback =
-        findRawCloudbetMatch(
-          signal,
-          rawCloudbetMatches
+    if (
+      !verification.verified
+    ) {
+      const catalogueFallback =
+        await findCloudbetByCatalogue(
+          env,
+          signal
         );
 
-      if (rawFallback.found) {
-        rawAdditionalMatches++;
+      catalogueDiagnostics.push({
+        signal:
+          signalMatchName(
+            signal
+          ),
+
+        match_id:
+          signalMatchId(
+            signal
+          ) || null,
+
+        result:
+          catalogueFallback
+      });
+
+      if (
+        catalogueFallback.verified
+      ) {
+        catalogueFallbackMatches++;
 
         verification = {
-          verified: true,
+          verified:
+            true,
 
           method:
-            "RAW_CLOUDBET_ADDITIONAL_SEARCH",
+            "CLOUDBET_CATALOGUE_EVENT_SEARCH",
 
           direction:
-            rawFallback.direction,
+            catalogueFallback.direction,
 
           home_score:
-            rawFallback.home_score,
+            catalogueFallback.home_score,
 
           away_score:
-            rawFallback.away_score,
+            catalogueFallback.away_score,
 
           combined_score:
-            rawFallback.combined_score,
+            catalogueFallback.combined_score,
 
           match:
-            rawFallback.match
+            catalogueFallback.match,
+
+          event_id:
+            catalogueFallback.event_id,
+
+          cloudbet_status:
+            catalogueFallback.cloudbet_status,
+
+          cloudbet_state:
+            catalogueFallback.cloudbet_state,
+
+          search:
+            catalogueFallback.search,
+
+          event_checks:
+            catalogueFallback.event_checks
         };
 
         source =
-          "RAW_CLOUDBET_ADDITIONAL_SEARCH";
+          "CLOUDBET_CATALOGUE_EVENT_SEARCH";
+      } else if (
+        catalogueFallback.status ===
+        "PRESENT_NOT_LIVE"
+      ) {
+        cataloguePresentNotLive++;
       }
     }
 
@@ -2028,13 +3500,20 @@ async function runV57(
     // READY
     // --------------------------------------------------------
 
-    if (verification.verified) {
+    if (
+      verification.verified
+    ) {
       cloudbetVerified++;
 
-      let matcherForBet: AnyObj;
+      let matcherForBet:
+        AnyObj;
 
-      if (source === "MATCHER") {
-        matcherForBet = matcher;
+      if (
+        source ===
+        "MATCHER"
+      ) {
+        matcherForBet =
+          matcher;
       } else if (
         source ===
         "DIRECT_CLOUDBET_FALLBACK"
@@ -2043,7 +3522,8 @@ async function runV57(
           source:
             "DIRECT_CLOUDBET_FALLBACK",
 
-          classification: null,
+          classification:
+            null,
 
           method:
             "DIRECT_STRICT_TEAM_MATCH",
@@ -2079,18 +3559,19 @@ async function runV57(
       } else {
         matcherForBet = {
           source:
-            "RAW_CLOUDBET_ADDITIONAL_SEARCH",
+            "CLOUDBET_CATALOGUE_EVENT_SEARCH",
 
-          classification: null,
+          classification:
+            null,
 
           method:
-            "RAW_JSON_STRICT_TEAM_MATCH",
+            "CATALOGUE_TEAMS_THEN_EVENT_DETAIL",
 
           matcher_score:
             verification.combined_score,
 
           reason:
-            "RAW_CLOUDBET_ADDITIONAL_SEARCH_CONFIRMED",
+            "CLOUDBET_CATALOGUE_EVENT_LIVE_CONFIRMED",
 
           cloudbet: {
             id:
@@ -2128,16 +3609,24 @@ async function runV57(
           bet
         );
 
-      preparedBets.push(bet);
-      candidates.push(candidate);
+      preparedBets.push(
+        bet
+      );
+
+      candidates.push(
+        candidate
+      );
 
       flow.push({
         signal:
-          signalMatchName(signal),
+          signalMatchName(
+            signal
+          ),
 
         match_id:
-          signalMatchId(signal) ||
-          null,
+          signalMatchId(
+            signal
+          ) || null,
 
         cloudbet_json:
           rawDiagnostic,
@@ -2167,7 +3656,11 @@ async function runV57(
           candidate.odds,
 
         candidate_complete:
-          candidate.candidate_complete
+          candidate.candidate_complete,
+
+        catalogue_event_id:
+          verification.event_id ??
+          null
       });
 
       continue;
@@ -2182,7 +3675,10 @@ async function runV57(
       "NO_ACCEPTABLE_MATCHER_OR_CLOUDBET_MATCH";
 
     rejectionReasons[reason] =
-      (rejectionReasons[reason] ?? 0) + 1;
+      (
+        rejectionReasons[reason] ??
+        0
+      ) + 1;
 
     noMatch.push(
       buildNoMatch(
@@ -2215,11 +3711,14 @@ async function runV57(
 
     flow.push({
       signal:
-        signalMatchName(signal),
+        signalMatchName(
+          signal
+        ),
 
       match_id:
-        signalMatchId(signal) ||
-        null,
+        signalMatchId(
+          signal
+        ) || null,
 
       cloudbet_json:
         rawDiagnostic,
@@ -2227,7 +3726,10 @@ async function runV57(
       result:
         "NO_MATCH",
 
-      reason
+      reason,
+
+      catalogue_search:
+        "EXECUTED_IF_LIVE_NOT_FOUND"
     });
   }
 
@@ -2267,8 +3769,13 @@ async function runV57(
     Date.now() -
     started;
 
+  // ----------------------------------------------------------
+  // RESULT
+  // ----------------------------------------------------------
+
   return json({
-    success: true,
+    success:
+      true,
 
     worker:
       "cloudbet-bet-worker",
@@ -2297,15 +3804,29 @@ async function runV57(
     },
 
     calls: {
-      tracker: 1,
-      matcher: 1,
-      cloudbet_live: 1,
+      tracker:
+        1,
+
+      matcher:
+        1,
+
+      cloudbet_live:
+        1,
 
       matcher_cloudbet_parallel:
         true,
 
-      additional_cloudbet_request:
-        false
+      additional_cloudbet_live_request:
+        false,
+
+      catalogue_fallback:
+        true,
+
+      competition_search:
+        true,
+
+      concrete_event_search:
+        true
     },
 
     tracker: {
@@ -2347,15 +3868,18 @@ async function runV57(
       direct_live_fallback:
         directFallbackMatches,
 
-      raw_additional_search:
-        rawAdditionalMatches,
+      catalogue_event_fallback:
+        catalogueFallbackMatches,
+
+      catalogue_present_not_live:
+        cataloguePresentNotLive,
 
       ms:
         cloudbetResult.ms
     },
 
     // --------------------------------------------------------
-    // MAIN DIAGNOSTIC
+    // RAW LIVE DIAGNOSTIC
     // --------------------------------------------------------
 
     cloudbet_json_diagnostic: {
@@ -2390,7 +3914,52 @@ async function runV57(
     },
 
     // --------------------------------------------------------
-    // BETTING
+    // V5.8 CATALOGUE DIAGNOSTIC
+    // --------------------------------------------------------
+
+    cloudbet_catalogue_diagnostic: {
+      enabled:
+        true,
+
+      search_method:
+        "TEAM_NAMES_ONLY",
+
+      score_search:
+        false,
+
+      result_search:
+        false,
+
+      minute_search:
+        false,
+
+      odds_search:
+        false,
+
+      strict_two_sided:
+        true,
+
+      team_minimum:
+        TEAM_MATCH_MIN_SCORE,
+
+      event_detail_verification:
+        true,
+
+      live_status_required:
+        true,
+
+      present_not_live_count:
+        cataloguePresentNotLive,
+
+      fallback_matches:
+        catalogueFallbackMatches,
+
+      details:
+        catalogueDiagnostics
+    },
+
+    // --------------------------------------------------------
+    // DRY RUN
     // --------------------------------------------------------
 
     dry_run: {
@@ -2431,7 +4000,7 @@ async function runV57(
         BET_SELECTION,
 
       odds_source:
-        "CLOUDBET /live ONLY",
+        "CLOUDBET ONLY",
 
       odds_invented:
         false
@@ -2481,8 +4050,11 @@ async function runV57(
       direct_fallback:
         directFallbackMatches,
 
-      raw_additional_search:
-        rawAdditionalMatches,
+      catalogue_fallback:
+        catalogueFallbackMatches,
+
+      catalogue_present_not_live:
+        cataloguePresentNotLive,
 
       cloudbet_verified:
         cloudbetVerified,
@@ -2518,6 +4090,10 @@ async function runV57(
         missing.length
     },
 
+    // --------------------------------------------------------
+    // DIAGNOSTICS
+    // --------------------------------------------------------
+
     diagnostics: {
       rejection_reasons:
         rejectionReasons,
@@ -2550,13 +4126,37 @@ async function runV57(
         direct_cloudbet_fallback:
           true,
 
-        raw_json_additional_search:
+        catalogue_search:
           true,
 
-        raw_json_search_uses_existing_response:
+        competition_search:
           true,
 
-        second_cloudbet_request:
+        event_detail_search:
+          true,
+
+        team_names_only:
+          true,
+
+        score_based_search:
+          false,
+
+        result_based_search:
+          false,
+
+        one_team_match:
+          "REJECTED",
+
+        missing_team_match:
+          "REJECTED",
+
+        non_live_event:
+          "PRESENT_NOT_LIVE",
+
+        both_teams_plus_live:
+          "VERIFIED",
+
+        second_cloudbet_live_request:
           false
       }
     },
@@ -2591,11 +4191,13 @@ async function runV57(
       noMatch,
 
     message:
-      rawAdditionalMatches > 0
-        ? `V5.7 DRY RUN. ${rawAdditionalMatches} match(es) found by additional raw Cloudbet JSON search.`
-        : missing.length > 0
-          ? `V5.7 DRY RUN. ${missing.length} Hunter match(es) missing from raw Cloudbet /live JSON.`
-          : "V5.7 DRY RUN. All Hunter matches found in raw Cloudbet /live JSON.",
+      catalogueFallbackMatches > 0
+        ? `V5.8 DRY RUN. ${catalogueFallbackMatches} Hunter match(es) confirmed through Cloudbet catalogue -> competition -> concrete event -> LIVE verification.`
+        : cataloguePresentNotLive > 0
+          ? `V5.8 DRY RUN. ${cataloguePresentNotLive} Hunter match(es) found in Cloudbet catalogue but event was not LIVE.`
+          : missing.length > 0
+            ? `V5.8 DRY RUN. ${missing.length} Hunter match(es) were not found in the initial Cloudbet /live response. Catalogue fallback executed.`
+            : "V5.8 DRY RUN. Initial Cloudbet /live verification completed.",
 
     timestamp:
       new Date().toISOString()
@@ -2608,7 +4210,8 @@ async function runV57(
 
 function health(): Response {
   return json({
-    success: true,
+    success:
+      true,
 
     worker:
       "cloudbet-bet-worker",
@@ -2666,10 +4269,28 @@ function health(): Response {
       missing_detection:
         true,
 
-      additional_raw_match_search:
+      catalogue_fallback:
         true,
 
-      second_cloudbet_request:
+      competition_search:
+        true,
+
+      concrete_event_search:
+        true,
+
+      team_names_only:
+        true,
+
+      score_based_search:
+        false,
+
+      result_based_search:
+        false,
+
+      event_live_verification:
+        true,
+
+      second_cloudbet_live_request:
         false
     },
 
@@ -2707,7 +4328,16 @@ function health(): Response {
       direct_cloudbet_fallback:
         true,
 
-      raw_cloudbet_additional_search:
+      catalogue_event_fallback:
+        true,
+
+      one_team_rejected:
+        true,
+
+      result_only_rejected:
+        true,
+
+      non_live_event_rejected:
         true
     },
 
@@ -2727,13 +4357,19 @@ function health(): Response {
       raw_diagnostic_reused:
         true,
 
-      cloudbet_data_reused:
+      cloudbet_live_data_reused:
         true,
 
-      additional_raw_search:
+      catalogue_fallback:
         true,
 
-      additional_cloudbet_network_request:
+      competition_search:
+        true,
+
+      concrete_event_search:
+        true,
+
+      additional_raw_live_request:
         false,
 
       archive_batch:
@@ -2755,7 +4391,7 @@ function health(): Response {
     ],
 
     message:
-      "V5.7 DRY RUN worker healthy. Additional raw Cloudbet match search enabled. Real betting disabled.",
+      "V5.8 DRY RUN worker healthy. Cloudbet catalogue -> competition -> concrete event fallback enabled. Real betting disabled.",
 
     timestamp:
       new Date().toISOString()
@@ -2772,7 +4408,9 @@ export default {
     env: Env
   ): Promise<Response> {
     const url =
-      new URL(request.url);
+      new URL(
+        request.url
+      );
 
     const path =
       url.pathname.replace(
@@ -2791,7 +4429,9 @@ export default {
       if (
         path === "/archive"
       ) {
-        return archiveResponse(env);
+        return archiveResponse(
+          env
+        );
       }
 
       if (
@@ -2801,18 +4441,25 @@ export default {
         path === "/diagnostic" ||
         path === "/diagnostics"
       ) {
-        return runV57(env);
+        return runV58(
+          env
+        );
       }
 
       return json(
         {
-          success: false,
+          success:
+            false,
+
           worker:
             "cloudbet-bet-worker",
+
           version:
             VERSION,
+
           error:
             "Unknown endpoint",
+
           available_endpoints: [
             "/",
             "/health",
@@ -2827,10 +4474,13 @@ export default {
         404
       );
 
-    } catch (error: any) {
+    } catch (
+      error: any
+    ) {
       return json(
         {
-          success: false,
+          success:
+            false,
 
           worker:
             "cloudbet-bet-worker",
