@@ -9,8 +9,16 @@
 // - limit вече е лимит само на ВЪРНАТИТЕ live мачове
 // - Това прави /live консистентен със /search
 //
+// V3 TEST:
+// - Добавен /event?id=EVENT_ID
+// - Връща директно Cloudbet event-а с markets/odds
+// - НЕ променя /live
+// - НЕ променя /search
+// - НЕ променя matcher логиката
+// - READ ONLY
+//
 // ДОКАЗАН ПРОБЛЕМ:
-// /search намира Al-Orobah v AL Zulfi сред 1448 events,
+// /search намира мачове сред всички competitions,
 // докато старият /live проверяваше само първите competitions.
 //
 // БЕЗ:
@@ -541,6 +549,43 @@ async function getCompetition(
 
 
 // ============================================================
+// EVENT TEST
+//
+// TEST ONLY:
+//
+// /event?id=36106008
+//
+// Това извиква:
+//
+// GET /v2/odds/events/{id}
+//
+// и връща директно целия Cloudbet event.
+//
+// Целта е да видим реалната структура:
+//
+// event
+//   └── markets
+//        └── submarkets
+//             └── selections
+//                  └── price
+//
+// НЕ се използва от /live.
+// НЕ се използва от /search.
+// НЕ поставя залог.
+// ============================================================
+
+async function getEvent(
+  env,
+  id
+) {
+  return cloudbetFetch(
+    `/events/${encodeURIComponent(id)}`,
+    env
+  );
+}
+
+
+// ============================================================
 // LIVE
 // ============================================================
 
@@ -876,11 +921,6 @@ function buildMatch(
 //
 // limit вече ограничава само броя на върнатите
 // live matches.
-//
-// Това е критично за Hunter:
-// мач, който е в competition #300,
-// вече няма да бъде пропуснат само защото
-// сме спрели след първите competitions.
 // ============================================================
 
 async function scan(
@@ -1131,8 +1171,6 @@ async function scan(
 // Търси САМИЯ EVENT / МАЧ.
 // НЕ търси резултат.
 //
-// Използване:
-//
 // /search?home=Fakel%20Voronezh&away=Krasnodar
 //
 // /search?home=LSK%20Kvinner%20W&away=Bodo-Glimt%20W
@@ -1197,11 +1235,6 @@ async function searchMatch(
   const errors = [];
 
   let totalEventsChecked = 0;
-
-  // ----------------------------------------------------------
-  // Първо търсим нормалната посока.
-  // След това допускаме reversed.
-  // ----------------------------------------------------------
 
   const results =
     await Promise.all(
@@ -1518,7 +1551,8 @@ function health(env) {
       "/health",
       "/live",
       "/live?limit=100",
-      "/search?home=TEAM&away=TEAM"
+      "/search?home=TEAM&away=TEAM",
+      "/event?id=EVENT_ID"
     ],
 
     live: {
@@ -1542,6 +1576,19 @@ function health(env) {
         false,
 
       live_required:
+        false
+    },
+
+    event_test: {
+      enabled: true,
+
+      endpoint:
+        "/event?id=EVENT_ID",
+
+      purpose:
+        "RAW CLOUDBET EVENT WITH MARKETS",
+
+      betting:
         false
     },
 
@@ -1626,6 +1673,71 @@ export default {
 
 
       // ------------------------------------------------------
+      // EVENT TEST
+      //
+      // Example:
+      //
+      // /event?id=36106008
+      //
+      // Връща RAW Cloudbet event + markets.
+      // ------------------------------------------------------
+
+      if (
+        path === "/event"
+      ) {
+
+        const id =
+          url.searchParams.get(
+            "id"
+          );
+
+        if (
+          !id ||
+          !/^\d+$/.test(id)
+        ) {
+          return json(
+            {
+              success: false,
+
+              error:
+                "id is required and must be numeric",
+
+              example:
+                "/event?id=36106008"
+            },
+            400
+          );
+        }
+
+        const event =
+          await getEvent(
+            env,
+            id
+          );
+
+        return json({
+          success: true,
+
+          test:
+            "CLOUDBET EVENT",
+
+          event_id:
+            id,
+
+          endpoint:
+            `/events/${id}`,
+
+          data:
+            event,
+
+          timestamp:
+            new Date().toISOString()
+        });
+
+      }
+
+
+      // ------------------------------------------------------
       // 404
       // ------------------------------------------------------
 
@@ -1641,7 +1753,8 @@ export default {
             "/health",
             "/live",
             "/live?limit=100",
-            "/search?home=TEAM&away=TEAM"
+            "/search?home=TEAM&away=TEAM",
+            "/event?id=EVENT_ID"
           ]
         },
         404
