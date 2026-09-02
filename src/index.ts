@@ -1,19 +1,22 @@
 // ============================================================
-// CLOUDBET — FAST LIVE SOCCER DETECTOR V5
+// CLOUDBET — FAST LIVE SOCCER DETECTOR V5.1
 // READ ONLY
 //
-// V5 STABILITY / PERFORMANCE FIX
+// V5.1 PERFORMANCE OPTIMIZATION
 //
 // - /search остава търсене на САМИЯ МАЧ по HOME + AWAY
 // - /live проверява ВСИЧКИ активни soccer competitions
 // - limit ограничава само върнатите live мачове
 //
-// V5 FIXES:
+// V5.1 FIXES:
 // - Cloudbet API request timeout
 // - Ограничена concurrency при competition requests
 // - НЕ се пускат всички competitions едновременно
+// - competition concurrency увеличена 6 -> 12
 // - /event?id=EVENT_ID остава лек и независим
-// - Добавен scan timing
+// - Добавен подробен scan timing
+// - Добавено броене на успешни/неуспешни competition requests
+// - Запазен exact odds extraction
 //
 // ODDS:
 // - 1H Total Goals
@@ -37,14 +40,27 @@ const API_KEY_NAME =
 
 
 // ============================================================
-// V5 PERFORMANCE CONFIG
+// V5.1 PERFORMANCE CONFIG
+// ============================================================
+//
+// V5:
+//   concurrency = 6
+//
+// V5.1:
+//   concurrency = 12
+//
+// Цел:
+// - по-малко общо време
+// - без Promise.all върху всички 188 competitions
+// - контролирано натоварване към Cloudbet
+//
 // ============================================================
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
 
 const COMPETITION_CONCURRENCY =
-  6;
+  12;
 
 
 // ============================================================
@@ -638,7 +654,7 @@ function getApiKey(env) {
 // CLOUDBET FETCH
 // ============================================================
 //
-// V5:
+// V5.1:
 // - AbortController timeout
 // - elapsed time included in errors
 //
@@ -755,16 +771,11 @@ async function cloudbetFetch(
 // LIMITED CONCURRENCY
 // ============================================================
 //
-// V5:
-// Вместо:
-//
-// Promise.all(
-//   selected.map(...)
-// )
-//
-// изпълняваме максимум
-// COMPETITION_CONCURRENCY
+// V5.1:
+// Максимум COMPETITION_CONCURRENCY
 // заявки едновременно.
+//
+// Запазва реда на резултатите.
 //
 // ============================================================
 
@@ -799,26 +810,15 @@ async function mapWithConcurrency(
           index >=
           items.length
         ) {
+
           return;
         }
 
-        try {
-
-          results[index] =
-            await worker(
-              items[index],
-              index
-            );
-
-        } catch (
-          error
-        ) {
-
-          results[index] =
-            Promise.reject(
-              error
-            );
-        }
+        results[index] =
+          await worker(
+            items[index],
+            index
+          );
       }
     };
 
@@ -833,7 +833,7 @@ async function mapWithConcurrency(
       items.length
     );
 
-  const workers =
+  await Promise.all(
     Array.from(
       {
         length:
@@ -841,10 +841,7 @@ async function mapWithConcurrency(
       },
       () =>
         workerLoop()
-    );
-
-  await Promise.all(
-    workers
+    )
   );
 
   return results;
@@ -2040,10 +2037,25 @@ async function scan(
   const scanStarted =
     Date.now();
 
+  // ==========================================================
+  // SOCCER FETCH
+  // ==========================================================
+
+  const soccerStarted =
+    Date.now();
+
   const soccer =
     await getSoccer(
       env
     );
+
+  const soccerElapsed =
+    Date.now() -
+    soccerStarted;
+
+  // ==========================================================
+  // COMPETITIONS
+  // ==========================================================
 
   const competitions =
     getCompetitions(
@@ -2099,8 +2111,7 @@ async function scan(
   let liveEvents = 0;
 
   // ==========================================================
-  // V5:
-  // LIMITED CONCURRENCY
+  // COMPETITION SCAN
   // ==========================================================
 
   const competitionStarted =
@@ -2114,11 +2125,18 @@ async function scan(
 
         try {
 
+          const dataStarted =
+            Date.now();
+
           const data =
             await getCompetition(
               env,
               competition.key
             );
+
+          const requestElapsed =
+            Date.now() -
+            dataStarted;
 
           const events =
             Array.isArray(
@@ -2130,7 +2148,9 @@ async function scan(
           return {
             competition,
             events,
-            error: null
+            error: null,
+            elapsed_ms:
+              requestElapsed
           };
 
         } catch (
@@ -2143,7 +2163,10 @@ async function scan(
 
             error:
               error?.message ||
-              String(error)
+              String(error),
+
+            elapsed_ms:
+              null
           };
         }
       },
@@ -2156,8 +2179,26 @@ async function scan(
     competitionStarted;
 
   // ==========================================================
-  // EVENTS
+  // RESULTS / EVENTS
   // ==========================================================
+
+  const processingStarted =
+    Date.now();
+
+  let competitionsSuccessful =
+    0;
+
+  let competitionsFailed =
+    0;
+
+  let slowCompetitionRequests =
+    0;
+
+  let slowestCompetitionMs =
+    0;
+
+  let slowestCompetitionKey =
+    null;
 
   for (
     const result
@@ -2171,6 +2212,8 @@ async function scan(
       result.error
     ) {
 
+      competitionsFailed++;
+
       errors.push({
         competition:
           result.competition.key,
@@ -2179,10 +2222,42 @@ async function scan(
           result.competition.name,
 
         error:
-          result.error
+          result.error,
+
+        elapsed_ms:
+          result.elapsed_ms
       });
 
       continue;
+    }
+
+    competitionsSuccessful++;
+
+    if (
+      Number.isFinite(
+        result.elapsed_ms
+      )
+    ) {
+
+      if (
+        result.elapsed_ms >=
+        1000
+      ) {
+
+        slowCompetitionRequests++;
+      }
+
+      if (
+        result.elapsed_ms >
+        slowestCompetitionMs
+      ) {
+
+        slowestCompetitionMs =
+          result.elapsed_ms;
+
+        slowestCompetitionKey =
+          result.competition.key;
+      }
     }
 
     for (
@@ -2220,6 +2295,10 @@ async function scan(
       );
     }
   }
+
+  const processingElapsed =
+    Date.now() -
+    processingStarted;
 
   // ==========================================================
   // SORT
@@ -2281,6 +2360,10 @@ async function scan(
     Date.now() -
     scanStarted;
 
+  // ==========================================================
+  // RESPONSE
+  // ==========================================================
+
   return {
     success: true,
 
@@ -2288,7 +2371,7 @@ async function scan(
       "CLOUDBET ALL LIVE SOCCER",
 
     version:
-      "V5",
+      "V5.1",
 
     filter:
       "SOCCER + LIVE ONLY",
@@ -2306,11 +2389,26 @@ async function scan(
       competition_concurrency:
         COMPETITION_CONCURRENCY,
 
+      soccer_fetch_ms:
+        soccerElapsed,
+
       competition_scan_ms:
         competitionElapsed,
 
+      event_processing_ms:
+        processingElapsed,
+
       total_scan_ms:
-        totalElapsed
+        totalElapsed,
+
+      slow_competition_requests:
+        slowCompetitionRequests,
+
+      slowest_competition_ms:
+        slowestCompetitionMs,
+
+      slowest_competition:
+        slowestCompetitionKey
     },
 
     stats: {
@@ -2322,6 +2420,12 @@ async function scan(
 
       competitions_checked:
         selected.length,
+
+      competitions_successful:
+        competitionsSuccessful,
+
+      competitions_failed:
+        competitionsFailed,
 
       total_events:
         totalEvents,
@@ -2435,8 +2539,13 @@ async function searchMatch(
   let totalEventsChecked =
     0;
 
+  let competitionsSuccessful =
+    0;
+
+  let competitionsFailed =
+    0;
+
   // ==========================================================
-  // V5:
   // LIMITED CONCURRENCY
   // ==========================================================
 
@@ -2497,6 +2606,8 @@ async function searchMatch(
       result.error
     ) {
 
+      competitionsFailed++;
+
       errors.push({
         competition:
           result.competition.key,
@@ -2510,6 +2621,8 @@ async function searchMatch(
 
       continue;
     }
+
+    competitionsSuccessful++;
 
     for (
       const event
@@ -2635,6 +2748,15 @@ async function searchMatch(
         competition_concurrency:
           COMPETITION_CONCURRENCY,
 
+        competitions_checked:
+          selected.length,
+
+        competitions_successful:
+          competitionsSuccessful,
+
+        competitions_failed:
+          competitionsFailed,
+
         total_ms:
           Date.now() -
           started
@@ -2736,6 +2858,15 @@ async function searchMatch(
       competition_concurrency:
         COMPETITION_CONCURRENCY,
 
+      competitions_checked:
+        selected.length,
+
+      competitions_successful:
+        competitionsSuccessful,
+
+      competitions_failed:
+        competitionsFailed,
+
       total_ms:
         Date.now() -
         started
@@ -2782,7 +2913,7 @@ function health(
       "cloudbet-live-soccer",
 
     version:
-      "V5",
+      "V5.1",
 
     mode:
       "READ ONLY",
@@ -2996,7 +3127,7 @@ export default {
             "CLOUDBET EVENT",
 
           version:
-            "V5",
+            "V5.1",
 
           event_id:
             id,
@@ -3055,7 +3186,7 @@ export default {
             "cloudbet-live-soccer",
 
           version:
-            "V5",
+            "V5.1",
 
           error:
             error?.message ||
