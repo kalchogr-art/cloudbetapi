@@ -1,29 +1,20 @@
 // ============================================================
-// CLOUDBET — FAST LIVE SOCCER DETECTOR V5.1
+// CLOUDBET — FAST LIVE SOCCER DETECTOR V5.2
 // READ ONLY
 //
-// V5.1 PERFORMANCE OPTIMIZATION
+// V5.2 PERFORMANCE TEST
 //
 // - /search остава търсене на САМИЯ МАЧ по HOME + AWAY
 // - /live проверява ВСИЧКИ активни soccer competitions
 // - limit ограничава само върнатите live мачове
+// - НЕ се използва early-stop
+// - НЕ се пропуска competition
 //
-// V5.1 FIXES:
-// - Cloudbet API request timeout
-// - Ограничена concurrency при competition requests
-// - НЕ се пускат всички competitions едновременно
-// - competition concurrency увеличена 6 -> 12
-// - /event?id=EVENT_ID остава лек и независим
-// - Добавен подробен scan timing
-// - Добавено броене на успешни/неуспешни competition requests
-// - Запазен exact odds extraction
-//
-// ODDS:
-// - 1H Total Goals
-// - OVER 0.5
-// - markets -> submarkets -> selections -> price
-// - object и array структури
-// - recursive fallback parser
+// V5.2 CHANGE:
+// - competition concurrency 12 -> 24
+// - запазен пълният scan на всички competitions
+// - добавено batch/in-flight timing
+// - запазена цялата V5.1 odds логика
 //
 // НЕ променя matcher логиката
 // НЕ поставя залог
@@ -31,36 +22,30 @@
 //
 // ============================================================
 
-
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
 
 const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
-
 // ============================================================
-// V5.1 PERFORMANCE CONFIG
-// ============================================================
-//
-// V5:
-//   concurrency = 6
-//
-// V5.1:
-//   concurrency = 12
-//
-// Цел:
-// - по-малко общо време
-// - без Promise.all върху всички 188 competitions
-// - контролирано натоварване към Cloudbet
-//
+// V5.2 PERFORMANCE CONFIG
 // ============================================================
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
 
+// V5.1 = 12
+// V5.2 TEST = 24
+//
+// ВАЖНО:
+// Всички selected competitions се проверяват.
+// Няма early-stop.
+//
+// ============================================================
+
 const COMPETITION_CONCURRENCY =
-  12;
+  24;
 
 
 // ============================================================
@@ -653,12 +638,6 @@ function getApiKey(env) {
 // ============================================================
 // CLOUDBET FETCH
 // ============================================================
-//
-// V5.1:
-// - AbortController timeout
-// - elapsed time included in errors
-//
-// ============================================================
 
 async function cloudbetFetch(
   path,
@@ -771,11 +750,10 @@ async function cloudbetFetch(
 // LIMITED CONCURRENCY
 // ============================================================
 //
-// V5.1:
-// Максимум COMPETITION_CONCURRENCY
-// заявки едновременно.
-//
-// Запазва реда на резултатите.
+// V5.2:
+// - максимум 24 заявки едновременно
+// - всички competitions се обработват
+// - няма early-stop
 //
 // ============================================================
 
@@ -2371,7 +2349,7 @@ async function scan(
       "CLOUDBET ALL LIVE SOCCER",
 
     version:
-      "V5.1",
+      "V5.2",
 
     filter:
       "SOCCER + LIVE ONLY",
@@ -2400,6 +2378,9 @@ async function scan(
 
       total_scan_ms:
         totalElapsed,
+
+      scan_method:
+        "ALL_COMPETITIONS_NO_EARLY_STOP",
 
       slow_competition_requests:
         slowCompetitionRequests,
@@ -2544,10 +2525,6 @@ async function searchMatch(
 
   let competitionsFailed =
     0;
-
-  // ==========================================================
-  // LIMITED CONCURRENCY
-  // ==========================================================
 
   const results =
     await mapWithConcurrency(
@@ -2913,7 +2890,7 @@ function health(
       "cloudbet-live-soccer",
 
     version:
-      "V5.1",
+      "V5.2",
 
     mode:
       "READ ONLY",
@@ -2953,7 +2930,10 @@ function health(
         "RESULT_LIMIT_ONLY",
 
       concurrency:
-        COMPETITION_CONCURRENCY
+        COMPETITION_CONCURRENCY,
+
+      early_stop:
+        false
     },
 
     odds: {
@@ -3127,7 +3107,7 @@ export default {
             "CLOUDBET EVENT",
 
           version:
-            "V5.1",
+            "V5.2",
 
           event_id:
             id,
@@ -3186,7 +3166,7 @@ export default {
             "cloudbet-live-soccer",
 
           version:
-            "V5.1",
+            "V5.2",
 
           error:
             error?.message ||
