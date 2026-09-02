@@ -1974,6 +1974,7 @@ function extractOver05Odds(
         Array.isArray(
           selections
         )
+      ) 
       {
         for (
           const selection
