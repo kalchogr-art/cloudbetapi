@@ -1,17 +1,19 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.7.4
+// CLOUDBET LIVE SOCCER DETECTOR V5.7.5
 // READ ONLY
 //
-// V5.7.4:
+// V5.7.5:
 // - /live остава НЕПРОМЕНЕН
 // - /search остава НЕПРОМЕНЕН
 // - /event остава НЕПРОМЕНЕН
 // - /diagnostic-cloud0007 остава диагностичен
-// - NEW: /diagnostic-cloud0007-api
-// - Изтегля само JS bundle-ите 54692 и 6610
-// - Извлича малък контекст около реалните API calls
-// - NEW: /diagnostic-cloud0007-routes
-// - Проверява 7 открити Cloud0007 маршрута
+// - /diagnostic-cloud0007-api остава диагностичен
+// - /diagnostic-cloud0007-routes остава диагностичен
+// - NEW: /diagnostic-events-raw
+// - Директна RAW диагностика на официалния Cloudbet /events
+// - НЕ използва extractEvents()
+// - НЕ използва isLiveEvent()
+// - Показва реалния response shape
 // - НЕ прави betting
 // ============================================================
 
@@ -28,7 +30,7 @@ const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
 const VERSION =
-  "V5.7.4";
+  "V5.7.5";
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
@@ -50,6 +52,9 @@ const CLOUD0007_JS_TIMEOUT_MS =
 
 const CLOUD0007_JS_CONCURRENCY =
   6;
+
+const RAW_EVENTS_PREVIEW_CHARS =
+  20000;
 
 // ============================================================
 // BASIC HELPERS
@@ -1267,7 +1272,7 @@ async function mapWithConcurrency<T, R>(
 }
 
 // ============================================================
-// V5.7.4 NEW DIAGNOSTIC
+// V5.7.4 CLOUD0007 API DIAGNOSTIC
 // ============================================================
 
 async function diagnosticCloud0007API():
@@ -2269,6 +2274,336 @@ async function diagnosticCloud0007Routes():
 }
 
 // ============================================================
+// NEW V5.7.5 RAW OFFICIAL CLOUDBET /EVENTS DIAGNOSTIC
+// ============================================================
+
+async function diagnosticEventsRaw(
+  env: Env
+): Promise<Response> {
+  const started =
+    Date.now();
+
+  const path =
+    "/events?sport=soccer&live=true&players=false&limit=10000";
+
+  let result;
+
+  try {
+    result =
+      await cloudbetFetch(
+        env,
+        path,
+        CLOUDBET_TIMEOUT_MS
+      );
+  } catch (
+    error
+  ) {
+    return json(
+      {
+        success: false,
+
+        worker:
+          "cloudbet-live-soccer-detector",
+
+        version:
+          VERSION,
+
+        action:
+          "DIAGNOSTIC_EVENTS_RAW",
+
+        read_only:
+          true,
+
+        request: {
+          path,
+          requests_made:
+            1,
+        },
+
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      },
+      502
+    );
+  }
+
+  const response =
+    result.response;
+
+  const rawText =
+    await response.text();
+
+  let parsed:
+    any = null;
+
+  let parseError:
+    string | null = null;
+
+  if (
+    rawText.length > 0
+  ) {
+    try {
+      parsed =
+        JSON.parse(
+          rawText
+        );
+    } catch (
+      error
+    ) {
+      parseError =
+        error instanceof Error
+          ? error.message
+          : String(error);
+    }
+  }
+
+  const topLevelType =
+    parsed === null
+      ? null
+      : Array.isArray(
+          parsed
+        )
+      ? "array"
+      : typeof parsed;
+
+  const topLevelKeys =
+    parsed &&
+    typeof parsed ===
+      "object" &&
+    !Array.isArray(
+      parsed
+    )
+      ? Object.keys(
+          parsed
+        )
+      : [];
+
+  const firstArrayKeys:
+    AnyObj[] = [];
+
+  const firstArraySamples:
+    AnyObj[] = [];
+
+  if (
+    Array.isArray(
+      parsed
+    )
+  ) {
+    for (
+      const item of parsed.slice(
+        0,
+        5
+      )
+    ) {
+      if (
+        item &&
+        typeof item ===
+          "object" &&
+        !Array.isArray(
+          item
+        )
+      ) {
+        firstArrayKeys.push(
+          Object.keys(
+            item
+          )
+        );
+        firstArraySamples.push(
+          item
+        );
+      }
+    }
+  }
+
+  const candidateArrays:
+    AnyObj[] = [];
+
+  if (
+    parsed &&
+    typeof parsed ===
+      "object"
+  ) {
+    for (
+      const [
+        key,
+        value
+      ] of Object.entries(
+        parsed
+      )
+    ) {
+      if (
+        Array.isArray(
+          value
+        )
+      ) {
+        candidateArrays.push({
+          key,
+          length:
+            value.length,
+          first_item_keys:
+            value[0] &&
+            typeof value[0] ===
+              "object" &&
+            !Array.isArray(
+              value[0]
+            )
+              ? Object.keys(
+                  value[0]
+                )
+              : [],
+          first_item:
+            value[0] ??
+            null,
+        });
+      }
+    }
+  }
+
+  return json({
+    success:
+      response.ok,
+
+    worker:
+      "cloudbet-live-soccer-detector",
+
+    version:
+      VERSION,
+
+    action:
+      "DIAGNOSTIC_EVENTS_RAW",
+
+    read_only:
+      true,
+
+    betting:
+      false,
+
+    request: {
+      path,
+
+      full_url:
+        `${API_BASE}${path}`,
+
+      method:
+        "GET",
+
+      requests_made:
+        1,
+
+      timeout_ms:
+        CLOUDBET_TIMEOUT_MS,
+
+      api_key_present:
+        !!env?.[API_KEY_NAME],
+    },
+
+    performance: {
+      events_fetch_ms:
+        result.elapsedMs,
+
+      total_elapsed_ms:
+        Date.now() -
+        started,
+    },
+
+    response: {
+      http_status:
+        response.status,
+
+      ok:
+        response.ok,
+
+      content_type:
+        response.headers.get(
+          "content-type"
+        ),
+
+      content_length_header:
+        response.headers.get(
+          "content-length"
+        ),
+
+      raw_chars:
+        rawText.length,
+
+      raw_bytes:
+        new TextEncoder().encode(
+          rawText
+        ).length,
+    },
+
+    parsed: {
+      json_parseable:
+        parseError === null &&
+        rawText.length > 0,
+
+      parse_error:
+        parseError,
+
+      top_level_type:
+        topLevelType,
+
+      top_level_keys:
+        topLevelKeys,
+
+      candidate_arrays:
+        candidateArrays,
+
+      first_array_item_keys:
+        firstArrayKeys,
+
+      first_array_samples:
+        firstArraySamples,
+    },
+
+    raw_response_preview: {
+      max_chars:
+        RAW_EVENTS_PREVIEW_CHARS,
+
+      truncated:
+        rawText.length >
+        RAW_EVENTS_PREVIEW_CHARS,
+
+      text:
+        rawText.slice(
+          0,
+          RAW_EVENTS_PREVIEW_CHARS
+        ),
+    },
+
+    parser_test: {
+      extractEvents_was_used:
+        false,
+
+      isLiveEvent_was_used:
+        false,
+
+      purpose:
+        "This endpoint intentionally bypasses the existing parser so we can inspect the real Cloudbet /events response shape.",
+    },
+
+    interpretation: {
+      key_question:
+        "Why does /events return HTTP 200 but extractEvents() produce zero events?",
+
+      if_raw_response_contains_events:
+        "The problem is inside our response parser/shape assumptions.",
+
+      if_raw_response_is_empty:
+        "Cloudbet returned an empty live-event response for this request.",
+
+      if_raw_response_has_unexpected_shape:
+        "We need to adapt extractEvents() to the actual Cloudbet response structure.",
+
+      next_step:
+        "Send the complete JSON result of /diagnostic-events-raw for analysis.",
+    },
+  });
+}
+
+// ============================================================
 // EXISTING /LIVE
 // ============================================================
 
@@ -2440,6 +2775,9 @@ async function handleRoot():
 
       "/live":
         "direct Cloudbet live soccer",
+
+      "/diagnostic-events-raw":
+        "RAW official Cloudbet /events diagnostic",
 
       "/diagnostic-cloud0007":
         "Cloud0007 live page diagnostic",
@@ -2644,6 +2982,11 @@ export default {
           return handleEvent(
             env,
             request
+          );
+
+        case "/diagnostic-events-raw":
+          return diagnosticEventsRaw(
+            env
           );
 
         case "/diagnostic-cloud0007":
