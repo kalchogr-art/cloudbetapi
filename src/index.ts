@@ -1,28 +1,22 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.6
+// CLOUDBET LIVE SOCCER DETECTOR V5.7
 //
-// V5.6:
-// - NEW FAST LIVE PATH
-// - /live now uses Cloudbet /events endpoint
-// - 1 Cloudbet request instead of ~186 competition requests
-// - sport=soccer
-// - live=true
-// - players=false
-// - limit=10000
-//
-// PRESERVED:
+// V5.7:
+// - PRESERVED V5.6 FAST LIVE PATH
+// - PRESERVED /live
+// - PRESERVED /search
+// - PRESERVED /event
+// - PRESERVED exact 1H OVER 0.5 odds detection
+// - NEW /diagnostic-cloud0007
+// - Tests the actual Cloud0007 Live Soccer page
 // - READ ONLY
-// - betting disabled
-// - exact 1H OVER 0.5 odds detection
-// - /search
-// - /event
-// - /health
-// - /diagnostic-soccer
+// - NO BETTING
 //
 // IMPORTANT:
-// - No matcher changes
-// - No odds target changes
-// - No betting
+// - /live is NOT changed in V5.7
+// - /search is NOT changed
+// - odds target is NOT changed
+// - no betting
 // ============================================================
 
 interface Env {
@@ -36,15 +30,22 @@ const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
 const VERSION =
-  "V5.6";
+  "V5.7";
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
 
 // Kept for /search compatibility.
-// /live no longer uses competition concurrency.
+// /live uses direct /events endpoint.
 const COMPETITION_CONCURRENCY =
   24;
+
+// ============================================================
+// CLOUD0007 PAGE
+// ============================================================
+
+const CLOUD0007_LIVE_SOCCER_URL =
+  "https://www.cloud0007.com/en/sports/live?s=soccer";
 
 // ============================================================
 // EXACT TARGET
@@ -1308,24 +1309,7 @@ function extractTargetOdds(
 }
 
 // ============================================================
-// NEW: /events? SPORT=SOCCER & LIVE=TRUE
-// ============================================================
-//
-// This is the important V5.6 optimization.
-//
-// OLD:
-//
-// /sports/soccer
-//   -> ~186 competitions
-//   -> ~186 /competitions/{key} requests
-//
-// NEW:
-//
-// /events?sport=soccer&live=true&players=false&limit=10000
-//   -> ONE request
-//
-// Cloudbet exposes GET /v2/odds/events for listing events,
-// including live events.
+// NEW FAST /events? SPORT=SOCCER & LIVE=TRUE
 // ============================================================
 
 async function getLiveSoccerEvents(
@@ -1388,21 +1372,6 @@ async function getLiveSoccerEvents(
 // ============================================================
 // EXTRACT LIVE EVENTS RESPONSE
 // ============================================================
-//
-// Supports:
-//
-// [
-//   {...event}
-// ]
-//
-// and:
-//
-// {
-//   events: [...]
-// }
-//
-// and common wrapped variants.
-// ============================================================
 
 function extractLiveEvents(
   data: any
@@ -1457,11 +1426,6 @@ function extractLiveEvents(
 
 // ============================================================
 // DIAGNOSTIC LIVE EVENTS
-// ============================================================
-//
-// This endpoint makes ONE request only.
-//
-// It is safe to test before relying on /live.
 // ============================================================
 
 async function diagnosticLiveEvents(
@@ -1584,6 +1548,7 @@ async function diagnosticLiveEvents(
               )
               .map(
                 event => ({
+
                   id:
                     event?.id ??
                     event?.eventId ??
@@ -1670,7 +1635,648 @@ async function diagnosticLiveEvents(
 }
 
 // ============================================================
-// NEW FAST /live
+// V5.7 — CLOUD0007 PAGE DIAGNOSTIC
+// ============================================================
+//
+// This does NOT replace /live.
+//
+// It simply fetches:
+//
+// https://www.cloud0007.com/en/sports/live?s=soccer
+//
+// and inspects the returned HTML for:
+// - embedded data
+// - scripts
+// - API URLs
+// - WebSocket references
+// - Cloudbet/live/soccer/event/odds markers
+//
+// ONE external page request only.
+// READ ONLY.
+// ============================================================
+
+function extractScriptSources(
+  html: string
+): string[] {
+
+  const sources:
+    string[] = [];
+
+  const regex =
+    /<script[^>]+src=["']([^"']+)["']/gi;
+
+  let match:
+    RegExpExecArray | null;
+
+  while (
+    (match =
+      regex.exec(html)) !== null
+  ) {
+
+    const source =
+      match[1];
+
+    if (
+      source &&
+      !sources.includes(
+        source
+      )
+    ) {
+
+      sources.push(
+        source
+      );
+    }
+
+    if (
+      sources.length >=
+      100
+    ) {
+      break;
+    }
+  }
+
+  return sources;
+}
+
+// ============================================================
+// EXTRACT POSSIBLE URLS
+// ============================================================
+
+function extractPossibleUrls(
+  html: string
+): string[] {
+
+  const urls =
+    new Set<string>();
+
+  const patterns = [
+
+    /https?:\/\/[^"'\\\s<>]+/gi,
+
+    /\/(?:api|pub|v\d+|sports|events|odds|live)[^"'\\\s<>]*/gi
+  ];
+
+  for (
+    const pattern of patterns
+  ) {
+
+    const matches =
+      html.match(
+        pattern
+      ) || [];
+
+    for (
+      const value of matches
+    ) {
+
+      const cleaned =
+        value
+          .replace(
+            /[),;]+$/,
+            ""
+          );
+
+      if (
+        cleaned.length < 8
+      ) {
+        continue;
+      }
+
+      urls.add(
+        cleaned
+      );
+
+      if (
+        urls.size >=
+        100
+      ) {
+
+        return Array.from(
+          urls
+        );
+      }
+    }
+  }
+
+  return Array.from(
+    urls
+  );
+}
+
+// ============================================================
+// CLOUD0007 HTML SIGNALS
+// ============================================================
+
+function detectCloud0007Signals(
+  html: string
+): AnyObj {
+
+  const lower =
+    html.toLowerCase();
+
+  const terms = [
+
+    "soccer",
+
+    "football",
+
+    "live",
+
+    "cloudbet",
+
+    "sports",
+
+    "events",
+
+    "odds",
+
+    "trading_live",
+
+    "__next_data__",
+
+    "application/json",
+
+    "websocket",
+
+    "socket.io",
+
+    "graphql"
+  ];
+
+  const result:
+    Record<string, boolean> =
+    {};
+
+  for (
+    const term of terms
+  ) {
+
+    result[term] =
+      lower.includes(
+        term
+      );
+  }
+
+  return result;
+}
+
+// ============================================================
+// EMBEDDED JSON INSPECTION
+// ============================================================
+
+function inspectEmbeddedData(
+  html: string
+): AnyObj {
+
+  const result:
+    AnyObj = {};
+
+  // ==========================================================
+  // NEXT.JS
+  // ==========================================================
+
+  const nextData =
+    html.match(
+      /<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i
+    );
+
+  if (
+    nextData?.[1]
+  ) {
+
+    result.next_data = {
+
+      present:
+        true,
+
+      chars:
+        nextData[1].length
+    };
+
+    try {
+
+      const parsed =
+        JSON.parse(
+          nextData[1]
+        );
+
+      result.next_data.type =
+        Array.isArray(
+          parsed
+        )
+          ? "array"
+          : typeof parsed;
+
+      result.next_data.keys =
+        parsed &&
+        typeof parsed ===
+          "object"
+          ? Object.keys(
+              parsed
+            )
+          : [];
+
+      // Do not dump an enormous object.
+      if (
+        parsed &&
+        typeof parsed ===
+          "object"
+      ) {
+
+        result.next_data.top_level_sample =
+          Object.keys(
+            parsed
+          )
+            .slice(
+              0,
+              30
+            )
+            .reduce(
+              (
+                acc: AnyObj,
+                key: string
+              ) => {
+
+                acc[key] =
+                  parsed[key];
+
+                return acc;
+
+              },
+              {}
+            );
+      }
+
+    } catch {
+
+      result.next_data.parseable =
+        false;
+    }
+
+  } else {
+
+    result.next_data = {
+
+      present:
+        false
+    };
+  }
+
+  // ==========================================================
+  // APPLICATION/JSON SCRIPTS
+  // ==========================================================
+
+  const jsonScripts:
+    AnyObj[] = [];
+
+  const jsonRegex =
+    /<script[^>]*type=["']application\/json["'][^>]*>([\s\S]*?)<\/script>/gi;
+
+  let match:
+    RegExpExecArray | null;
+
+  while (
+    (match =
+      jsonRegex.exec(html)) !== null
+  ) {
+
+    const text =
+      match[1];
+
+    const item:
+      AnyObj = {
+
+        chars:
+          text.length,
+
+        parseable:
+          false
+      };
+
+    try {
+
+      const parsed =
+        JSON.parse(
+          text
+        );
+
+      item.parseable =
+        true;
+
+      item.type =
+        Array.isArray(
+          parsed
+        )
+          ? "array"
+          : typeof parsed;
+
+      if (
+        parsed &&
+        typeof parsed ===
+          "object"
+      ) {
+
+        item.keys =
+          Object.keys(
+            parsed
+          ).slice(
+            0,
+            50
+          );
+      }
+
+    } catch {
+      // Not valid JSON.
+    }
+
+    jsonScripts.push(
+      item
+    );
+
+    if (
+      jsonScripts.length >=
+      20
+    ) {
+      break;
+    }
+  }
+
+  result.application_json_scripts =
+    jsonScripts;
+
+  return result;
+}
+
+// ============================================================
+// CLOUD0007 DIAGNOSTIC
+// ============================================================
+
+async function diagnosticCloud0007(
+  env: Env
+): Promise<Response> {
+
+  const started =
+    Date.now();
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      10000
+    );
+
+  try {
+
+    const response =
+      await fetch(
+        CLOUD0007_LIVE_SOCCER_URL,
+        {
+
+          method:
+            "GET",
+
+          headers: {
+
+            "accept":
+              "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+
+            "user-agent":
+              "Mozilla/5.0 (compatible; CloudbetLiveDiagnostic/5.7)"
+          },
+
+          redirect:
+            "follow",
+
+          cache:
+            "no-store",
+
+          signal:
+            controller.signal
+        }
+      );
+
+    const html =
+      await response.text();
+
+    const elapsed =
+      Date.now() -
+      started;
+
+    const responseBytes =
+      new TextEncoder()
+        .encode(
+          html
+        ).length;
+
+    const titleMatch =
+      html.match(
+        /<title[^>]*>([\s\S]*?)<\/title>/i
+      );
+
+    const title =
+      titleMatch?.[1]
+        ?.replace(
+          /\s+/g,
+          " "
+        )
+        ?.trim() ||
+      null;
+
+    const scripts =
+      extractScriptSources(
+        html
+      );
+
+    const possibleUrls =
+      extractPossibleUrls(
+        html
+      );
+
+    const embedded =
+      inspectEmbeddedData(
+        html
+      );
+
+    return json(
+      {
+
+        success:
+          true,
+
+        worker:
+          "cloudbet-live-soccer-detector",
+
+        version:
+          VERSION,
+
+        action:
+          "DIAGNOSTIC_CLOUD0007",
+
+        read_only:
+          true,
+
+        request: {
+
+          url:
+            CLOUD0007_LIVE_SOCCER_URL,
+
+          method:
+            "GET",
+
+          requests_made:
+            1,
+
+          timeout_ms:
+            10000
+        },
+
+        performance: {
+
+          elapsed_ms:
+            elapsed,
+
+          http_status:
+            response.status,
+
+          content_type:
+            response.headers.get(
+              "content-type"
+            ),
+
+          response_bytes:
+            responseBytes,
+
+          html_chars:
+            html.length
+        },
+
+        page: {
+
+          final_url:
+            response.url,
+
+          redirected:
+            response.url !==
+            CLOUD0007_LIVE_SOCCER_URL,
+
+          title,
+
+          signals:
+            detectCloud0007Signals(
+              html
+            )
+        },
+
+        embedded_data:
+          embedded,
+
+        scripts: {
+
+          count:
+            scripts.length,
+
+          first_50:
+            scripts.slice(
+              0,
+              50
+            )
+        },
+
+        possible_urls: {
+
+          count:
+            possibleUrls.length,
+
+          first_100:
+            possibleUrls.slice(
+              0,
+              100
+            )
+        },
+
+        html_sample: {
+
+          first_5000:
+            html.slice(
+              0,
+              5000
+            )
+        },
+
+        interpretation: {
+
+          purpose:
+            "Inspect the Cloud0007 Live Soccer page without modifying the existing Cloudbet live path.",
+
+          current_live_path:
+            "UNCHANGED",
+
+          next_step:
+            "If the HTML exposes an API endpoint or embedded live-event data, that source can be tested as a faster live-soccer path."
+        },
+
+        timestamp:
+          nowISO()
+      }
+    );
+
+  } catch (
+    error: any
+  ) {
+
+    return json(
+      {
+
+        success:
+          false,
+
+        worker:
+          "cloudbet-live-soccer-detector",
+
+        version:
+          VERSION,
+
+        action:
+          "DIAGNOSTIC_CLOUD0007",
+
+        url:
+          CLOUD0007_LIVE_SOCCER_URL,
+
+        elapsed_ms:
+          Date.now() -
+          started,
+
+        error:
+          error?.name ===
+          "AbortError"
+
+            ? "Cloud0007 request timed out after 10000ms"
+
+            : (
+                error?.message ||
+                String(error)
+              ),
+
+        timestamp:
+          nowISO()
+      },
+      502
+    );
+
+  } finally {
+
+    clearTimeout(
+      timer
+    );
+  }
+}
+
+// ============================================================
+// /live
 // ============================================================
 
 async function live(
@@ -1739,23 +2345,13 @@ async function live(
     const event of events
   ) {
 
-    // Because Cloudbet was explicitly asked
-    // for live=true, treat returned events as
-    // the live candidate set.
-    //
-    // We still inspect status for diagnostics.
     if (
       !isLiveEvent(
         event
       )
     ) {
-
-      // Do NOT throw away the event.
-      //
-      // Some Cloudbet responses can expose
-      // a live event through the live filter
-      // without using one of our recognized
-      // textual status values.
+      // Keep event because Cloudbet
+      // was explicitly queried with live=true.
     }
 
     liveEventsDetected++;
@@ -1788,7 +2384,6 @@ async function live(
       oddsFound++;
     }
 
-    // Preserve minute if Cloudbet exposes it.
     if (
       event?.minute !==
       undefined
@@ -1798,7 +2393,6 @@ async function live(
         event.minute;
     }
 
-    // Preserve scores if available.
     if (
       event?.scores !==
       undefined
@@ -2011,7 +2605,9 @@ async function health(
 
         "/diagnostic-soccer",
 
-        "/diagnostic-live-events"
+        "/diagnostic-live-events",
+
+        "/diagnostic-cloud0007"
       ]
     }
   );
@@ -2109,8 +2705,7 @@ async function event(
 // /search
 // ============================================================
 //
-// /search remains the old competition-based search.
-// We are NOT changing it in V5.6.
+// /search remains competition based.
 // ============================================================
 
 async function search(
@@ -2349,7 +2944,10 @@ async function root(
           "/diagnostic-soccer",
 
         diagnostic_live_events:
-          "/diagnostic-live-events"
+          "/diagnostic-live-events",
+
+        diagnostic_cloud0007:
+          "/diagnostic-cloud0007"
       },
 
       live_optimization: {
@@ -2360,12 +2958,24 @@ async function root(
         new:
           "events?sport=soccer&live=true -> 1 request",
 
-        expected:
-          "Major reduction in Cloudbet loading time."
+        current:
+          "V5.7 keeps the V5.6 direct-events /live path unchanged."
+      },
+
+      cloud0007_diagnostic: {
+
+        url:
+          CLOUD0007_LIVE_SOCCER_URL,
+
+        purpose:
+          "Inspect the Live Soccer page for embedded data and API references.",
+
+        changes_live:
+          false
       },
 
       note:
-        "V5.6 replaces the expensive full competition scan used by /live with Cloudbet's direct live-events endpoint. /search remains competition based."
+        "V5.7 adds only /diagnostic-cloud0007. Existing /live, /search, /event and exact 1H OVER 0.5 detection remain unchanged."
     }
   );
 }
@@ -2437,6 +3047,11 @@ export default {
             env
           );
 
+        case "/diagnostic-cloud0007":
+          return diagnosticCloud0007(
+            env
+          );
+
         default:
 
           return json(
@@ -2465,7 +3080,9 @@ export default {
 
                 "/diagnostic-soccer",
 
-                "/diagnostic-live-events"
+                "/diagnostic-live-events",
+
+                "/diagnostic-cloud0007"
               ]
             },
             404
