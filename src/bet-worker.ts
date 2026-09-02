@@ -1,16 +1,23 @@
 // ============================================================
-// CLOUDBET BET WORKER V5.8.4
+// CLOUDBET BET WORKER V5.8.5
 // DRY RUN — PERSISTENT ODDS RETRY
 // EXACT 1H TOTAL GOALS OVER 0.5 MARKET
 //
-// V5.8.4 FIX:
+// V5.8.5 FIX:
 // - /live се използва за live event verification
 // - /event?id=EVENT_ID се използва за FULL CLOUDBET EVENT
-// - Odds се четат от full event markets/submarkets/selections
-// - Pending odds retry също използва /event?id=EVENT_ID
-// - Добавена odds диагностика:
-//   event -> market -> submarket -> selection -> price
+// - Поддържа реалния Cloudbet market:
+//     soccer.total_goals
+//       -> period=1h
+//       -> over
+//       -> total=0.5
+// - Поддържа и legacy:
+//     soccer.total_goals_period_first_half
+// - Odds се четат само при:
+//     FIRST HALF + OVER + TOTAL 0.5
 // - TEAM TOTAL markets са изрично отхвърлени
+// - Добавена разширена диагностика на soccer.total_goals
+// - Pending odds retry използва /event?id=EVENT_ID
 // - hunter_bet_archive schema е запазена
 // - Persistent pending odds retry е запазен
 // - REAL BETTING DISABLED
@@ -29,7 +36,7 @@ type AnyObj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V5.8.4";
+const VERSION = "V5.8.5";
 
 const MODE = "DRY_RUN";
 
@@ -72,10 +79,35 @@ const TARGET_LINE =
 
 // ============================================================
 // EXACT CLOUDBET MARKET
+//
+// IMPORTANT:
+//
+// Cloudbet may expose first-half total goals as:
+//
+// soccer.total_goals
+//   -> period=1h
+//      -> outcome=over
+//         -> params=total=0.5
+//
+// Some structures may expose:
+//
+// soccer.total_goals_period_first_half
+//
+// We support both, but NEVER accept an arbitrary
+// soccer.total_goals selection.
+//
+// Required:
+//   market       = allowed target market
+//   submarket    = period=1h
+//   outcome      = over
+//   params       = total=0.5
 // ============================================================
 
-const TARGET_MARKET_KEY =
-  "soccer.total_goals_period_first_half";
+const TARGET_MARKET_KEYS =
+  new Set([
+    "soccer.total_goals",
+    "soccer.total_goals_period_first_half"
+  ]);
 
 const TARGET_SUBMARKET_KEY =
   "period=1h";
@@ -86,8 +118,11 @@ const TARGET_OUTCOME_KEY =
 const TARGET_PARAMS =
   "total=0.5";
 
-const TARGET_MARKET_URL =
-  "soccer.total_goals_period_first_half/over?total=0.5";
+const TARGET_MARKET_URLS =
+  new Set([
+    "soccer.total_goals/over?total=0.5",
+    "soccer.total_goals_period_first_half/over?total=0.5"
+  ]);
 
 // ============================================================
 // PENDING
@@ -852,9 +887,6 @@ async function fetchServiceJSON(
 
 // ============================================================
 // CLOUDBET FULL EVENT
-//
-// /live = live list / verification
-// /event?id=ID = full event with markets
 // ============================================================
 
 async function fetchCloudbetEvent(
@@ -1643,8 +1675,17 @@ function findDirectCloudbet(
 
 // ============================================================
 // ODDS
-// EXACT CLOUDBET MARKET
 // ============================================================
+
+function isTargetMarketKey(
+  key: any
+): boolean {
+  return TARGET_MARKET_KEYS.has(
+    safeString(
+      key
+    ).toLowerCase()
+  );
+}
 
 function isSelectionEnabled(
   selection: AnyObj
@@ -1695,7 +1736,7 @@ function extractSelectionPrice(
 // Supports:
 // 1. markets: []
 // 2. markets: {}
-// 3. direct soccer.* keys on event
+// 3. direct soccer.* keys
 // ============================================================
 
 function extractMarketEntries(
@@ -1937,14 +1978,31 @@ function isTargetOver05Selection(
       selection?.marketUrl
     ).toLowerCase();
 
-  return (
-    marketUrl ===
-    TARGET_MARKET_URL
+  return TARGET_MARKET_URLS.has(
+    marketUrl
   );
 }
 
 // ============================================================
 // EXACT ODDS EXTRACTION
+//
+// REQUIRED:
+//
+// market:
+//   soccer.total_goals
+//
+// submarket:
+//   period=1h
+//
+// selection:
+//   outcome=over
+//   params=total=0.5
+//
+// TEAM TOTAL is rejected because:
+// - market key must be exact allowed market
+// - submarket cannot contain team=
+// - outcome must be over
+// - params must be total=0.5
 // ============================================================
 
 function extractFirstHalfOver05Odds(
@@ -1972,11 +2030,12 @@ function extractFirstHalfOver05Odds(
         market?.marketKey ??
         market?.key ??
         market?.market
-      );
+      ).toLowerCase();
 
     if (
-      marketKey !==
-      TARGET_MARKET_KEY
+      !isTargetMarketKey(
+        marketKey
+      )
     ) {
       continue;
     }
@@ -2101,19 +2160,74 @@ function extractOddsRecursive(
 
     visited.add(node);
 
-    const currentMarketKey =
+    let currentMarketKey =
       safeString(
         node?.marketKey ??
         node?.market ??
-        node?.key ??
         marketKeyContext
       );
 
-    const currentSubmarketKey =
+    let currentSubmarketKey =
       safeString(
         node?.submarketKey ??
         submarketKeyContext
       );
+
+    // --------------------------------------------------------
+    // IMPORTANT:
+    // If a nested object itself has a soccer.* key,
+    // preserve it as market context.
+    // --------------------------------------------------------
+
+    if (
+      safeString(
+        node?.key
+      ).toLowerCase()
+        .startsWith(
+          "soccer."
+        )
+    ) {
+      currentMarketKey =
+        safeString(
+          node?.key
+        );
+    }
+
+    if (
+      safeString(
+        node?._market_key
+      ).toLowerCase()
+        .startsWith(
+          "soccer."
+        )
+    ) {
+      currentMarketKey =
+        safeString(
+          node?._market_key
+        );
+    }
+
+    if (
+      safeString(
+        node?.submarketKey
+      )
+    ) {
+      currentSubmarketKey =
+        safeString(
+          node?.submarketKey
+        );
+    }
+
+    if (
+      safeString(
+        node?._submarket_key
+      )
+    ) {
+      currentSubmarketKey =
+        safeString(
+          node?._submarket_key
+        );
+    }
 
     const currentContext = [
       context,
@@ -2145,14 +2259,16 @@ function extractOddsRecursive(
     const marketUrl =
       safeString(
         node?.marketUrl
-      );
+      ).toLowerCase();
 
     const exactMarket =
-      currentMarketKey ===
-      TARGET_MARKET_KEY;
+      isTargetMarketKey(
+        currentMarketKey
+      );
 
     const exactSubmarket =
-      currentSubmarketKey ===
+      currentSubmarketKey
+        .toLowerCase() ===
         TARGET_SUBMARKET_KEY ||
       (
         currentContext.includes(
@@ -2172,8 +2288,13 @@ function extractOddsRecursive(
       TARGET_PARAMS;
 
     const exactUrl =
-      marketUrl ===
-      TARGET_MARKET_URL;
+      TARGET_MARKET_URLS.has(
+        marketUrl
+      );
+
+    // --------------------------------------------------------
+    // PRIMARY STRICT CHECK
+    // --------------------------------------------------------
 
     if (
       node?.price !==
@@ -2209,6 +2330,16 @@ function extractOddsRecursive(
       }
     }
 
+    // --------------------------------------------------------
+    // EXACT MARKET URL CHECK
+    //
+    // This is also strict because URL itself identifies:
+    // market + outcome + total=0.5
+    //
+    // We still reject team totals because URL must be one
+    // of the exact target URLs.
+    // --------------------------------------------------------
+
     if (
       node?.price !==
         undefined &&
@@ -2240,6 +2371,10 @@ function extractOddsRecursive(
       }
     }
 
+    // --------------------------------------------------------
+    // ARRAY
+    // --------------------------------------------------------
+
     if (
       Array.isArray(node)
     ) {
@@ -2263,6 +2398,10 @@ function extractOddsRecursive(
 
       return null;
     }
+
+    // --------------------------------------------------------
+    // OBJECT
+    // --------------------------------------------------------
 
     for (
       const [
@@ -2309,6 +2448,52 @@ function extractOddsRecursive(
           key;
       }
 
+      // ------------------------------------------------------
+      // Also handle exact Cloudbet market object wrappers.
+      // ------------------------------------------------------
+
+      if (
+        key ===
+        "_market_key"
+      ) {
+        const value =
+          safeString(
+            node[key]
+          );
+
+        if (
+          value
+            .toLowerCase()
+            .startsWith(
+              "soccer."
+            )
+        ) {
+          nextMarketKey =
+            value;
+        }
+      }
+
+      if (
+        key ===
+        "_submarket_key"
+      ) {
+        const value =
+          safeString(
+            node[key]
+          );
+
+        if (
+          value
+            .toLowerCase()
+            .startsWith(
+              "period="
+            )
+        ) {
+          nextSubmarketKey =
+            value;
+        }
+      }
+
       const found =
         walk(
           child,
@@ -2332,6 +2517,10 @@ function extractOddsRecursive(
     ""
   );
 }
+
+// ============================================================
+// FINAL ODDS FUNCTION
+// ============================================================
 
 function extractOdds(
   match: AnyObj
@@ -2384,7 +2573,30 @@ function buildOddsDiagnostic(
       )
     );
 
+  // ----------------------------------------------------------
+  // ALL SUPPORTED TARGET MARKETS
+  // ----------------------------------------------------------
+
   const targetMarkets =
+    markets.filter(
+      market =>
+        isTargetMarketKey(
+          safeString(
+            market?._market_key ??
+            market?.marketKey ??
+            market?.key ??
+            market?.market
+          )
+        )
+    );
+
+  // ----------------------------------------------------------
+  // ACTUAL soccer.total_goals
+  //
+  // This is the critical diagnostic added in V5.8.5.
+  // ----------------------------------------------------------
+
+  const soccerTotalGoalsMarkets =
     markets.filter(
       market =>
         safeString(
@@ -2392,9 +2604,119 @@ function buildOddsDiagnostic(
           market?.marketKey ??
           market?.key ??
           market?.market
-        ) ===
-        TARGET_MARKET_KEY
+        ).toLowerCase() ===
+        "soccer.total_goals"
     );
+
+  const soccerTotalGoalsSubmarkets:
+    AnyObj[] =
+    [];
+
+  for (
+    const market of
+    soccerTotalGoalsMarkets
+  ) {
+    const submarkets =
+      extractSubmarketEntries(
+        market
+      );
+
+    for (
+      const submarket of
+      submarkets
+    ) {
+      const submarketKey =
+        safeString(
+          submarket?._submarket_key ??
+          submarket?.submarketKey ??
+          submarket?.key
+        );
+
+      const selections =
+        Array.isArray(
+          submarket?.selections
+        )
+          ? submarket.selections
+          : [];
+
+      soccerTotalGoalsSubmarkets.push({
+        key:
+          submarketKey ||
+          null,
+
+        target_first_half:
+          isTargetFirstHalfSubmarket(
+            submarketKey
+          ),
+
+        selections:
+          selections.map(
+            selection => ({
+              outcome:
+                safeString(
+                  selection?.outcome
+                ) || null,
+
+              params:
+                safeString(
+                  selection?.params
+                ) || null,
+
+              marketUrl:
+                safeString(
+                  selection?.marketUrl
+                ) || null,
+
+              price:
+                extractSelectionPrice(
+                  selection
+                ),
+
+              raw_price:
+                selection?.price ??
+                null,
+
+              status:
+                safeString(
+                  selection?.status
+                ) || null,
+
+              maxStake:
+                selection?.maxStake ??
+                null,
+
+              enabled:
+                isSelectionEnabled(
+                  selection
+                ),
+
+              target_outcome:
+                safeString(
+                  selection?.outcome
+                ).toLowerCase() ===
+                TARGET_OUTCOME_KEY,
+
+              target_params:
+                safeString(
+                  selection?.params
+                ).toLowerCase() ===
+                TARGET_PARAMS,
+
+              target_market_url:
+                TARGET_MARKET_URLS.has(
+                  safeString(
+                    selection?.marketUrl
+                  ).toLowerCase()
+                )
+            })
+          )
+      });
+    }
+  }
+
+  // ----------------------------------------------------------
+  // TARGET MARKET / SUBMARKET / SELECTION DIAGNOSTIC
+  // ----------------------------------------------------------
 
   const targetSubmarkets:
     AnyObj[] =
@@ -2470,7 +2792,7 @@ function buildOddsDiagnostic(
         const marketUrl =
           safeString(
             selection?.marketUrl
-          );
+          ).toLowerCase();
 
         const price =
           extractSelectionPrice(
@@ -2486,8 +2808,9 @@ function buildOddsDiagnostic(
           TARGET_PARAMS;
 
         const targetUrl =
-          marketUrl.toLowerCase() ===
-          TARGET_MARKET_URL;
+          TARGET_MARKET_URLS.has(
+            marketUrl
+          );
 
         const targetSelection =
           targetSubmarket &&
@@ -2612,8 +2935,14 @@ function buildOddsDiagnostic(
         100
       ),
 
-    target_market:
-      TARGET_MARKET_KEY,
+    // --------------------------------------------------------
+    // V5.8.5 TARGET
+    // --------------------------------------------------------
+
+    target_markets:
+      Array.from(
+        TARGET_MARKET_KEYS
+      ),
 
     target_market_found:
       targetMarkets.length >
@@ -2635,7 +2964,21 @@ function buildOddsDiagnostic(
       targetPrice,
 
     target_submarkets:
-      targetSubmarkets
+      targetSubmarkets,
+
+    // --------------------------------------------------------
+    // CRITICAL V5.8.5 DIAGNOSTIC
+    // --------------------------------------------------------
+
+    soccer_total_goals_found:
+      soccerTotalGoalsMarkets.length >
+      0,
+
+    soccer_total_goals_market_count:
+      soccerTotalGoalsMarkets.length,
+
+    soccer_total_goals_submarkets:
+      soccerTotalGoalsSubmarkets
   };
 }
 
@@ -2798,7 +3141,8 @@ function buildCloudbetIdMap(
     >();
 
   for (
-    const match of matches
+    const match of
+    matches
   ) {
     const id =
       extractMatchId(
@@ -3199,7 +3543,8 @@ async function archivePreparedBets(
     [];
 
   for (
-    const bet of bets
+    const bet of
+    bets
   ) {
     const matcherScore =
       Number(
@@ -3796,7 +4141,7 @@ async function processPendingOdds(
     }
 
     // --------------------------------------------------------
-    // /live is ONLY used to verify that the event is still live.
+    // /live ONLY verifies the event is still live.
     // --------------------------------------------------------
 
     const liveCloudbet =
@@ -3918,8 +4263,7 @@ async function processPendingOdds(
     }
 
     // --------------------------------------------------------
-    // IMPORTANT V5.8.4:
-    // Fetch FULL EVENT for odds.
+    // FULL EVENT FOR ODDS
     // --------------------------------------------------------
 
     const oddsResolution =
@@ -3997,7 +4341,7 @@ async function processPendingOdds(
     }
 
     // --------------------------------------------------------
-    // Rebuild pending bet from stored payload.
+    // Rebuild pending bet.
     // --------------------------------------------------------
 
     let bet:
@@ -4678,13 +5022,6 @@ async function runV58(
   const started =
     Date.now();
 
-  // All three external services
-  // are called in parallel.
-  //
-  // /live remains the verification source.
-  // Full odds events are fetched below only
-  // for verified candidates.
-
   const [
     trackerData,
     matcherData,
@@ -4806,8 +5143,7 @@ async function runV58(
     }
 
     // --------------------------------------------------------
-    // V5.8.4:
-    // GET FULL EVENT BY CLOUDBET EVENT ID
+    // FULL EVENT
     // --------------------------------------------------------
 
     const liveCloudbet =
@@ -5023,8 +5359,10 @@ async function runV58(
       target_line:
         TARGET_LINE,
 
-      exact_market_key:
-        TARGET_MARKET_KEY,
+      exact_market_keys:
+        Array.from(
+          TARGET_MARKET_KEYS
+        ),
 
       exact_submarket:
         TARGET_SUBMARKET_KEY,
@@ -5035,8 +5373,10 @@ async function runV58(
       exact_params:
         TARGET_PARAMS,
 
-      exact_market_url:
-        TARGET_MARKET_URL,
+      exact_market_urls:
+        Array.from(
+          TARGET_MARKET_URLS
+        ),
 
       required_classification:
         REQUIRED_MATCH_CLASSIFICATION,
@@ -5191,8 +5531,10 @@ function healthResponse(
       stake_eur:
         BET_STAKE_EUR,
 
-      exact_market_key:
-        TARGET_MARKET_KEY,
+      exact_market_keys:
+        Array.from(
+          TARGET_MARKET_KEYS
+        ),
 
       exact_submarket:
         TARGET_SUBMARKET_KEY,
@@ -5202,6 +5544,11 @@ function healthResponse(
 
       exact_params:
         TARGET_PARAMS,
+
+      exact_market_urls:
+        Array.from(
+          TARGET_MARKET_URLS
+        ),
 
       full_event_endpoint:
         "/event?id=EVENT_ID",
