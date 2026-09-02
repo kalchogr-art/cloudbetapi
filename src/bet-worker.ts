@@ -1,14 +1,18 @@
-// ============================================================
-// CLOUDBET BET WORKER V5.8.9
+// CLOUDBET BET WORKER V5.9.0
 // DRY RUN · EXACT 1H TOTAL GOALS OVER 0.5
 //
 // FLOW:
 // TRACKER → MATCHER → CLOUDBET EVENT → EXACT TARGET → RETRY
 //
-// V5.8.9:
+// V5.9.0:
+// - V5.8.9 behavior preserved
 // - /run service timeout protection
 // - TRACKER / MATCHER / CLOUDBET independently diagnosed
 // - Promise.allSettled() prevents one service from hanging /run
+// - NEW /diagnostic endpoint
+// - /diagnostic calls TRACKER → MATCHER → CLOUDBET sequentially
+// - /diagnostic measures each service independently
+// - exact elapsed_ms / HTTP status / response bytes
 // - EXACT target only
 // - SAME Cloudbet event retry
 // - 20 attempts
@@ -26,7 +30,7 @@ interface Env {
 
 type Obj = Record<string, any>;
 
-const VERSION = "V5.8.9";
+const VERSION = "V5.9.0";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -51,9 +55,6 @@ const TARGET_PARAMS =
   "total=0.5";
 
 // ─── TIMEOUT / RETRY ──────────────────────────────────────
-
-// Timeout applies to individual service requests.
-// It does NOT replace the 20 × 30 sec odds retry.
 
 const SERVICE_TIMEOUT_MS = 10_000;
 
@@ -113,10 +114,31 @@ const TEAM_ALIASES: Record<string, string> = {
 };
 
 const GENERIC_WORDS = new Set([
-  "fc", "cf", "sc", "ac", "afc", "ca", "cd",
-  "sd", "ss", "as", "us", "ud", "aa", "ad",
-  "rc", "fk", "sk", "ks", "sv", "vfb", "vfl",
-  "club", "calcio", "football", "soccer"
+  "fc",
+  "cf",
+  "sc",
+  "ac",
+  "afc",
+  "ca",
+  "cd",
+  "sd",
+  "ss",
+  "as",
+  "us",
+  "ud",
+  "aa",
+  "ad",
+  "rc",
+  "fk",
+  "sk",
+  "ks",
+  "sv",
+  "vfb",
+  "vfl",
+  "club",
+  "calcio",
+  "football",
+  "soccer"
 ]);
 
 // ─── BASIC ─────────────────────────────────────────────────
@@ -137,7 +159,10 @@ function norm(v: any): string {
     .trim();
 }
 
-function json(data: any, status = 200): Response {
+function json(
+  data: any,
+  status = 200
+): Response {
   return new Response(
     JSON.stringify(data, null, 2),
     {
@@ -145,38 +170,46 @@ function json(data: any, status = 200): Response {
       headers: {
         "content-type":
           "application/json; charset=UTF-8",
-        "cache-control": "no-store"
+        "cache-control":
+          "no-store"
       }
     }
   );
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve =>
-    setTimeout(resolve, ms)
+function sleep(
+  ms: number
+): Promise<void> {
+  return new Promise(
+    resolve => setTimeout(resolve, ms)
   );
 }
 
 // ─── TEAM NORMALIZATION ────────────────────────────────────
 
-function normalizeTeam(value: any): string {
+function normalizeTeam(
+  value: any
+): string {
   let result = norm(value);
 
-  for (const [alias, full] of Object.entries(
-    TEAM_ALIASES
-  )) {
-    const escaped = alias.replace(
-      /[.*+?^${}()|[\]\\]/g,
-      "\\$&"
-    );
+  for (
+    const [alias, full]
+    of Object.entries(TEAM_ALIASES)
+  ) {
+    const escaped =
+      alias.replace(
+        /[.*+?^${}()|[\]\\]/g,
+        "\\$&"
+      );
 
-    result = result.replace(
-      new RegExp(
-        `(^|\\s)${escaped}(?=\\s|$)`,
-        "g"
-      ),
-      `$1${full}`
-    );
+    result =
+      result.replace(
+        new RegExp(
+          `(^|\\s)${escaped}(?=\\s|$)`,
+          "g"
+        ),
+        `$1${full}`
+      );
   }
 
   return result
@@ -192,33 +225,46 @@ function normalizeTeam(value: any): string {
     .trim();
 }
 
-function teamTokens(value: any): string[] {
+function teamTokens(
+  value: any
+): string[] {
   return normalizeTeam(value)
     .split(" ")
-    .filter(x => x.length >= 3);
+    .filter(
+      x => x.length >= 3
+    );
 }
 
-function splitMatch(value: any): {
+function splitMatch(
+  value: any
+): {
   home: string;
   away: string;
 } {
   const text = safe(value);
 
-  for (const separator of [
-    " - ",
-    " v ",
-    " vs ",
-    " VS ",
-    " @ "
-  ]) {
-    const i = text.indexOf(separator);
+  for (
+    const separator of [
+      " - ",
+      " v ",
+      " vs ",
+      " VS ",
+      " @ "
+    ]
+  ) {
+    const i =
+      text.indexOf(separator);
 
     if (i >= 0) {
       return {
-        home: text.slice(0, i).trim(),
-        away: text.slice(
-          i + separator.length
-        ).trim()
+        home:
+          text.slice(0, i).trim(),
+        away:
+          text
+            .slice(
+              i + separator.length
+            )
+            .trim()
       };
     }
   }
@@ -229,7 +275,9 @@ function splitMatch(value: any): {
   };
 }
 
-function extractHome(m: Obj): string {
+function extractHome(
+  m: Obj
+): string {
   const direct =
     m?.v27?.home ??
     m?.v27?.homeTeam ??
@@ -255,7 +303,9 @@ function extractHome(m: Obj): string {
   ).home;
 }
 
-function extractAway(m: Obj): string {
+function extractAway(
+  m: Obj
+): string {
   const direct =
     m?.v27?.away ??
     m?.v27?.awayTeam ??
@@ -281,19 +331,26 @@ function extractAway(m: Obj): string {
   ).away;
 }
 
-function displayMatch(m: Obj): string {
-  const direct = safe(
-    m?.match ??
-    m?.name ??
-    m?.event_name
-  );
+function displayMatch(
+  m: Obj
+): string {
+  const direct =
+    safe(
+      m?.match ??
+      m?.name ??
+      m?.event_name
+    );
 
-  if (direct) return direct;
+  if (direct) {
+    return direct;
+  }
 
   return `${extractHome(m)} - ${extractAway(m)}`.trim();
 }
 
-function extractMatchId(m: Obj): string {
+function extractMatchId(
+  m: Obj
+): string {
   return safe(
     m?.id ??
     m?.match_id ??
@@ -323,10 +380,14 @@ function levenshtein(
   const aa = norm(a);
   const bb = norm(b);
 
-  const previous = Array.from(
-    { length: bb.length + 1 },
-    (_, i) => i
-  );
+  const previous =
+    Array.from(
+      {
+        length:
+          bb.length + 1
+      },
+      (_, i) => i
+    );
 
   for (
     let i = 1;
@@ -366,23 +427,37 @@ function characterSimilarity(
   a: string,
   b: string
 ): number {
-  const aa = normalizeTeam(a);
-  const bb = normalizeTeam(b);
+  const aa =
+    normalizeTeam(a);
 
-  if (!aa || !bb) return 0;
-  if (aa === bb) return 1;
+  const bb =
+    normalizeTeam(b);
 
-  const max = Math.max(
-    aa.length,
-    bb.length
-  );
+  if (!aa || !bb) {
+    return 0;
+  }
 
-  if (!max) return 0;
+  if (aa === bb) {
+    return 1;
+  }
+
+  const max =
+    Math.max(
+      aa.length,
+      bb.length
+    );
+
+  if (!max) {
+    return 0;
+  }
 
   return Math.max(
     0,
     1 -
-      levenshtein(aa, bb) / max
+      levenshtein(
+        aa,
+        bb
+      ) / max
   );
 }
 
@@ -390,8 +465,11 @@ function teamScore(
   a: string,
   b: string
 ): Obj {
-  const aa = normalizeTeam(a);
-  const bb = normalizeTeam(b);
+  const aa =
+    normalizeTeam(a);
+
+  const bb =
+    normalizeTeam(b);
 
   if (!aa || !bb) {
     return {
@@ -413,37 +491,41 @@ function teamScore(
     aa.includes(bb) ||
     bb.includes(aa)
   ) {
-    const score = Math.max(
-      CONTAINMENT_MIN_SCORE,
-      Math.min(
-        aa.length,
-        bb.length
-      ) /
-        Math.max(
+    const score =
+      Math.max(
+        CONTAINMENT_MIN_SCORE,
+        Math.min(
           aa.length,
           bb.length
-        )
-    );
+        ) /
+          Math.max(
+            aa.length,
+            bb.length
+          )
+      );
 
     return {
       score,
       method: "CONTAINMENT",
       accepted:
-        score >= TEAM_MATCH_MIN_SCORE
+        score >=
+        TEAM_MATCH_MIN_SCORE
     };
   }
 
-  const aTokens = new Set(
-    teamTokens(aa)
-  );
+  const aTokens =
+    new Set(
+      teamTokens(aa)
+    );
 
-  const bTokens = new Set(
-    teamTokens(bb)
-  );
+  const bTokens =
+    new Set(
+      teamTokens(bb)
+    );
 
   const common =
-    [...aTokens].filter(x =>
-      bTokens.has(x)
+    [...aTokens].filter(
+      x => bTokens.has(x)
     ).length;
 
   const denominator =
@@ -490,10 +572,16 @@ function twoSidedTeamScore(
   awayB: string
 ): Obj {
   const normalHome =
-    teamScore(homeA, homeB);
+    teamScore(
+      homeA,
+      homeB
+    );
 
   const normalAway =
-    teamScore(awayA, awayB);
+    teamScore(
+      awayA,
+      awayB
+    );
 
   const normal =
     Math.min(
@@ -502,10 +590,16 @@ function twoSidedTeamScore(
     );
 
   const reverseHome =
-    teamScore(homeA, awayB);
+    teamScore(
+      homeA,
+      awayB
+    );
 
   const reverseAway =
-    teamScore(awayA, homeB);
+    teamScore(
+      awayA,
+      homeB
+    );
 
   const reverse =
     Math.min(
@@ -617,11 +711,16 @@ class ServiceRequestError
 
   toJSON(): Obj {
     return {
-      service: this.service,
-      path: this.path,
-      code: this.code,
-      status: this.status,
-      message: this.message
+      service:
+        this.service,
+      path:
+        this.path,
+      code:
+        this.code,
+      status:
+        this.status,
+      message:
+        this.message
     };
   }
 }
@@ -632,14 +731,16 @@ async function fetchServiceJSON(
   service: Fetcher,
   path: string,
   serviceName = "UNKNOWN",
-  timeoutMs = SERVICE_TIMEOUT_MS
+  timeoutMs =
+    SERVICE_TIMEOUT_MS
 ): Promise<Obj> {
   const controller =
     new AbortController();
 
   const timer =
     setTimeout(
-      () => controller.abort(),
+      () =>
+        controller.abort(),
       timeoutMs
     );
 
@@ -692,7 +793,8 @@ async function fetchServiceJSON(
     }
   } catch (error) {
     if (
-      error instanceof ServiceRequestError
+      error instanceof
+      ServiceRequestError
     ) {
       throw error;
     }
@@ -752,7 +854,9 @@ async function fetchCloudbetEvent(
     data?.data &&
     typeof data.data ===
       "object" &&
-    !Array.isArray(data.data)
+    !Array.isArray(
+      data.data
+    )
   ) {
     return data.data;
   }
@@ -776,7 +880,8 @@ function extractSignals(
     ? source.filter(
         x =>
           x &&
-          typeof x === "object"
+          typeof x ===
+            "object"
       )
     : [];
 }
@@ -853,14 +958,15 @@ function matcherMatches(
 function matcherScore(
   item: Obj
 ): number {
-  const n = Number(
-    item?.scoring?.total ??
-    item?.scoring?.score ??
-    item?.matcher_score ??
-    item?.match_score ??
-    item?.score ??
-    0
-  );
+  const n =
+    Number(
+      item?.scoring?.total ??
+      item?.scoring?.score ??
+      item?.matcher_score ??
+      item?.match_score ??
+      item?.score ??
+      0
+    );
 
   return Number.isFinite(n)
     ? n
@@ -951,7 +1057,8 @@ function validateMatcher(
       accepted: false,
       reason:
         "STRICT_TWO_SIDED_TEAM_VALIDATION_FAILED",
-      team_scores: teams
+      team_scores:
+        teams
     };
   }
 
@@ -977,7 +1084,8 @@ function validateMatcher(
   if (
     classification !==
       REQUIRED_MATCH_CLASSIFICATION &&
-    score < MATCHER_THRESHOLD
+    score <
+      MATCHER_THRESHOLD
   ) {
     return {
       accepted: false,
@@ -1080,7 +1188,9 @@ function cloudbetMatches(
       data?.data
     ]
   ) {
-    if (Array.isArray(source)) {
+    if (
+      Array.isArray(source)
+    ) {
       return source;
     }
   }
@@ -1136,7 +1246,8 @@ function findCloudbet(
     null;
 
   for (
-    const match of liveMatches
+    const match of
+    liveMatches
   ) {
     const score =
       twoSidedTeamScore(
@@ -1165,7 +1276,8 @@ function findCloudbet(
   if (!best) {
     return {
       found: false,
-      source: "NOT_FOUND",
+      source:
+        "NOT_FOUND",
       cloudbet: null
     };
   }
@@ -1358,12 +1470,13 @@ function marketEntries(
     ) {
       result.push({
         ...market,
-        _market_key: safe(
-          market?.market_key ??
-          market?.marketKey ??
-          market?.key ??
-          market?.market
-        )
+        _market_key:
+          safe(
+            market?.market_key ??
+            market?.marketKey ??
+            market?.key ??
+            market?.market
+          )
       });
     }
   } else if (
@@ -1818,22 +1931,6 @@ function buildOddsDiagnostic(
 }
 
 // ─── RETRY SAME EVENT ──────────────────────────────────────
-//
-// Attempt 1 = immediately
-// Attempt 2 = +30 sec
-// ...
-// Attempt 20 = +30 sec
-//
-// ALWAYS:
-// /event?id=SAME_EVENT_ID
-//
-// NEVER:
-// - another event
-// - another market
-// - another line
-//
-// Stops immediately when exact target becomes valid.
-// ───────────────────────────────────────────────────────────
 
 async function resolveOddsWithRetry(
   env: Env,
@@ -1859,16 +1956,16 @@ async function resolveOddsWithRetry(
   const attempts: Obj[] =
     [];
 
-  let lastEvent: Obj | null =
-    null;
+  let lastEvent:
+    Obj | null = null;
 
-  let lastDiagnostic: Obj | null =
-    null;
+  let lastDiagnostic:
+    Obj | null = null;
 
   for (
     let attempt = 1;
     attempt <=
-      ODDS_EVENT_MAX_RETRIES;
+    ODDS_EVENT_MAX_RETRIES;
     attempt++
   ) {
     try {
@@ -1926,7 +2023,8 @@ async function resolveOddsWithRetry(
 
           odds,
 
-          attempts: attempt,
+          attempts:
+            attempt,
 
           error: null,
 
@@ -2062,7 +2160,8 @@ function buildBet(
         ? "READY"
         : "ODDS_UNAVAILABLE",
 
-    mode: MODE,
+    mode:
+      MODE,
 
     betting_enabled:
       BETTING_ENABLED,
@@ -2225,6 +2324,9 @@ function buildCandidate(
       {}
     );
 
+  const complete =
+    odds !== null;
+
   return {
     status:
       "BET_CANDIDATE",
@@ -2277,7 +2379,7 @@ function buildCandidate(
       odds !== null,
 
     candidate_complete:
-      odds !== null,
+      complete,
 
     odds_source:
       odds !== null
@@ -3014,7 +3116,6 @@ async function processPending(
       !cloudbetId
     ) {
       result.errors++;
-
       continue;
     }
 
@@ -3183,6 +3284,7 @@ async function processPending(
     bet.cloudbet = {
       ...(bet.cloudbet ??
         {}),
+
       ...(oddsResult.event ??
         {}),
 
@@ -3275,12 +3377,6 @@ async function runWorker(
   const started =
     Date.now();
 
-  // ========================================================
-  // IMPORTANT:
-  // Promise.allSettled prevents one service from hanging
-  // the complete /run request.
-  // ========================================================
-
   const results =
     await Promise.allSettled([
       fetchServiceJSON(
@@ -3324,12 +3420,14 @@ async function runWorker(
     serviceDiagnostics.push({
       service:
         "TRACKER",
+
       ...(trackerResult.reason instanceof
       ServiceRequestError
         ? trackerResult.reason.toJSON()
         : {
             code:
               "UNKNOWN_ERROR",
+
             message:
               trackerResult.reason instanceof
               Error
@@ -3348,12 +3446,14 @@ async function runWorker(
     serviceDiagnostics.push({
       service:
         "MATCHER",
+
       ...(matcherResult.reason instanceof
       ServiceRequestError
         ? matcherResult.reason.toJSON()
         : {
             code:
               "UNKNOWN_ERROR",
+
             message:
               matcherResult.reason instanceof
               Error
@@ -3372,12 +3472,14 @@ async function runWorker(
     serviceDiagnostics.push({
       service:
         "CLOUDBET",
+
       ...(cloudbetResult.reason instanceof
       ServiceRequestError
         ? cloudbetResult.reason.toJSON()
         : {
             code:
               "UNKNOWN_ERROR",
+
             message:
               cloudbetResult.reason instanceof
               Error
@@ -3388,11 +3490,6 @@ async function runWorker(
           })
     });
   }
-
-  // ========================================================
-  // If ANY required service failed, return immediately.
-  // No more waiting and no blind processing.
-  // ========================================================
 
   if (
     serviceDiagnostics.length
@@ -3545,10 +3642,6 @@ async function runWorker(
       continue;
     }
 
-    // ======================================================
-    // EXACT SAME EVENT RETRY
-    // ======================================================
-
     const oddsResult =
       await resolveOddsWithRetry(
         env,
@@ -3602,23 +3695,17 @@ async function runWorker(
   const complete =
     prepared.filter(
       bet =>
-        bet?.candidate_complete !==
-          false &&
         bet?.cloudbet
           ?.odds_available ===
-          true
+        true
     );
 
   const incomplete =
     prepared.filter(
       bet =>
-        !(
-          bet?.candidate_complete !==
-            false &&
-          bet?.cloudbet
-            ?.odds_available ===
-            true
-        )
+        bet?.cloudbet
+          ?.odds_available !==
+        true
     );
 
   const pendingResults: Obj[] =
@@ -3832,6 +3919,282 @@ async function runWorker(
   };
 }
 
+// ─── /DIAGNOSTIC ───────────────────────────────────────────
+//
+// IMPORTANT:
+// This endpoint deliberately calls the services
+// SEQUENTIALLY.
+//
+// TRACKER → MATCHER → CLOUDBET
+//
+// Purpose:
+// determine exactly which service is slow/hanging.
+//
+// It does NOT:
+// - run matcher logic
+// - search Cloudbet events
+// - fetch odds
+// - perform odds retry
+// - access the betting pipeline
+//
+// It only measures service response performance.
+// ───────────────────────────────────────────────────────────
+
+async function diagnosticService(
+  service: Fetcher,
+  serviceName: string,
+  path: string
+): Promise<Obj> {
+  const started =
+    Date.now();
+
+  const startedAt =
+    new Date().toISOString();
+
+  try {
+    const data =
+      await fetchServiceJSON(
+        service,
+        path,
+        serviceName,
+        SERVICE_TIMEOUT_MS
+      );
+
+    const elapsed =
+      Date.now() -
+      started;
+
+    let serialized = "";
+
+    try {
+      serialized =
+        JSON.stringify(data);
+    } catch {
+      serialized = "";
+    }
+
+    const result: Obj = {
+      service:
+        serviceName,
+
+      path,
+
+      success:
+        true,
+
+      elapsed_ms:
+        elapsed,
+
+      http_status:
+        200,
+
+      response_bytes:
+        new TextEncoder()
+          .encode(serialized)
+          .length,
+
+      started_at:
+        startedAt
+    };
+
+    if (
+      serviceName ===
+      "TRACKER"
+    ) {
+      result.signals =
+        extractSignals(
+          data
+        ).length;
+    }
+
+    if (
+      serviceName ===
+      "MATCHER"
+    ) {
+      result.matches =
+        matcherMatches(
+          data
+        ).length;
+    }
+
+    if (
+      serviceName ===
+      "CLOUDBET"
+    ) {
+      result.live_events =
+        cloudbetMatches(
+          data
+        ).length;
+    }
+
+    return result;
+  } catch (error) {
+    const elapsed =
+      Date.now() -
+      started;
+
+    const serviceError =
+      error instanceof
+      ServiceRequestError
+        ? error.toJSON()
+        : null;
+
+    return {
+      service:
+        serviceName,
+
+      path,
+
+      success:
+        false,
+
+      elapsed_ms:
+        elapsed,
+
+      http_status:
+        serviceError?.status ??
+        null,
+
+      response_bytes:
+        null,
+
+      started_at:
+        startedAt,
+
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error),
+
+      service_error:
+        serviceError
+    };
+  }
+}
+
+async function diagnosticResponse(
+  env: Env
+): Promise<Response> {
+  const started =
+    Date.now();
+
+  const tracker =
+    await diagnosticService(
+      env.TRACKER,
+      "TRACKER",
+      "/entries"
+    );
+
+  const matcher =
+    await diagnosticService(
+      env.MATCHER,
+      "MATCHER",
+      `/match?threshold=${MATCHER_THRESHOLD}`
+    );
+
+  const cloudbet =
+    await diagnosticService(
+      env.CLOUDBET,
+      "CLOUDBET",
+      "/live"
+    );
+
+  const total =
+    Date.now() -
+    started;
+
+  return json({
+    success:
+      tracker.success &&
+      matcher.success &&
+      cloudbet.success,
+
+    worker:
+      "cloudbet-bet-worker",
+
+    version:
+      VERSION,
+
+    mode:
+      MODE,
+
+    betting:
+      "DISABLED",
+
+    dry_run:
+      true,
+
+    action:
+      "DIAGNOSTIC",
+
+    diagnostic_mode:
+      "SEQUENTIAL",
+
+    timeout_ms:
+      SERVICE_TIMEOUT_MS,
+
+    order: [
+      "TRACKER",
+      "MATCHER",
+      "CLOUDBET"
+    ],
+
+    services: {
+      TRACKER:
+        tracker.success
+          ? "OK"
+          : "FAILED",
+
+      MATCHER:
+        matcher.success
+          ? "OK"
+          : "FAILED",
+
+      CLOUDBET:
+        cloudbet.success
+          ? "OK"
+          : "FAILED"
+    },
+
+    tracker,
+
+    matcher,
+
+    cloudbet,
+
+    total_elapsed_ms:
+      total,
+
+    analysis: {
+      slowest_service:
+        [
+          tracker,
+          matcher,
+          cloudbet
+        ].reduce(
+          (
+            slowest,
+            current
+          ) =>
+            current.elapsed_ms >
+            slowest.elapsed_ms
+              ? current
+              : slowest
+        ).service,
+
+      slowest_elapsed_ms:
+        Math.max(
+          tracker.elapsed_ms,
+          matcher.elapsed_ms,
+          cloudbet.elapsed_ms
+        ),
+
+      expected_relationship:
+        "TOTAL ≈ TRACKER + MATCHER + CLOUDBET because diagnostic is sequential"
+    }
+  });
+}
+
 // ─── /LINES ────────────────────────────────────────────────
 
 async function linesResponse(
@@ -4014,6 +4377,7 @@ function healthResponse(
     endpoints: [
       "/health",
       "/lines?id=EVENT_ID",
+      "/diagnostic",
       "/run",
       "/pending",
       "/archive"
@@ -4189,6 +4553,52 @@ export default {
 
     if (
       url.pathname ===
+      "/diagnostic"
+    ) {
+      if (
+        request.method !==
+        "GET"
+      ) {
+        return json(
+          {
+            success: false,
+            error:
+              "METHOD_NOT_ALLOWED"
+          },
+          405
+        );
+      }
+
+      try {
+        return await diagnosticResponse(
+          env
+        );
+      } catch (error) {
+        return json(
+          {
+            success: false,
+
+            worker:
+              "cloudbet-bet-worker",
+
+            version:
+              VERSION,
+
+            action:
+              "DIAGNOSTIC",
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(error)
+          },
+          500
+        );
+      }
+    }
+
+    if (
+      url.pathname ===
       "/lines"
     ) {
       if (
@@ -4312,6 +4722,7 @@ export default {
         available: [
           "/health",
           "/lines?id=EVENT_ID",
+          "/diagnostic",
           "/run",
           "/pending",
           "/archive"
