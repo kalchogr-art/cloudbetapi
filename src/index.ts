@@ -1,38 +1,17 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR
-// V5.7.3
+// CLOUDBET LIVE SOCCER DETECTOR V5.7.4
+// READ ONLY
 //
-// PURPOSE:
-// - Diagnose Cloud0007 Next.js JavaScript bundles
-// - Discover hidden API / live / odds / events endpoints
-// - DO NOT change the current /live implementation
-// - READ ONLY
-// - NO BETTING
-//
-// NEW:
-//   GET /diagnostic-cloud0007-js
-//
-// This endpoint:
-// 1. Downloads Cloud0007 live soccer HTML
-// 2. Extracts all Next.js JS bundles
-// 3. Downloads bundles with limited concurrency
-// 4. Searches them for:
-//      /api/
-//      /events
-//      /odds
-//      /live
-//      /inplay
-//      /sports
-//      fetch()
-//      axios
-//      XMLHttpRequest
-//      WebSocket
-//      wss://
-//      absolute API URLs
-// 5. Returns compact candidate endpoint/snippet diagnostics
-//
-// CURRENT /live PATH REMAINS UNCHANGED:
-//   /events?sport=soccer&live=true&players=false&limit=10000
+// V5.7.4:
+// - /live остава НЕПРОМЕНЕН
+// - /search остава НЕПРОМЕНЕН
+// - /event остава НЕПРОМЕНЕН
+// - /diagnostic-cloud0007 остава диагностичен
+// - NEW: /diagnostic-cloud0007-api
+// - Изтегля само JS bundle-ите 54692 и 6610
+// - Извлича малък контекст около реалните API calls
+// - НЕ връща целите JS файлове
+// - НЕ прави betting
 // ============================================================
 
 interface Env {
@@ -41,135 +20,77 @@ interface Env {
 
 type AnyObj = Record<string, any>;
 
-const VERSION = "V5.7.3";
-
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
 
 const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
+const VERSION =
+  "V5.7.4";
+
 const CLOUDBET_TIMEOUT_MS =
   8000;
+
+const COMPETITION_CONCURRENCY =
+  24;
 
 const CLOUD0007_URL =
   "https://www.cloud0007.com/en/sports/live?s=soccer";
 
-const CLOUD0007_TIMEOUT_MS =
+const CLOUD0007_ORIGIN =
+  "https://www.cloud0007.com";
+
+const CLOUD0007_PAGE_TIMEOUT_MS =
   10000;
 
 const CLOUD0007_JS_TIMEOUT_MS =
   7000;
 
-const JS_CONCURRENCY =
+const CLOUD0007_JS_CONCURRENCY =
   6;
-
-const MAX_SCRIPT_CHARS =
-  2_000_000;
-
-const MAX_SNIPPETS_PER_SCRIPT =
-  12;
-
-const MAX_TOTAL_SNIPPETS =
-  80;
-
-const MAX_ENDPOINTS =
-  100;
 
 // ============================================================
 // BASIC HELPERS
 // ============================================================
+
+function json(
+  data: AnyObj,
+  status = 200
+): Response {
+  return new Response(
+    JSON.stringify(data, null, 2),
+    {
+      status,
+      headers: {
+        "content-type":
+          "application/json; charset=utf-8",
+        "cache-control":
+          "no-store, no-cache, must-revalidate",
+      },
+    }
+  );
+}
 
 function nowISO(): string {
   return new Date().toISOString();
 }
 
 function finiteNumber(
-  value: unknown
+  value: any
 ): number | null {
-  const n = Number(value);
+  const n =
+    typeof value === "number"
+      ? value
+      : Number(value);
 
   return Number.isFinite(n)
     ? n
     : null;
 }
 
-function json(
-  body: AnyObj,
-  status = 200
-): Response {
-  return new Response(
-    JSON.stringify(body, null, 2),
-    {
-      status,
-      headers: {
-        "content-type":
-          "application/json; charset=utf-8",
-
-        "cache-control":
-          "no-store, no-cache, must-revalidate",
-
-        pragma: "no-cache"
-      }
-    }
-  );
-}
-
-function sleep(
-  ms: number
-): Promise<void> {
-  return new Promise(
-    resolve => setTimeout(resolve, ms)
-  );
-}
-
 // ============================================================
-// FETCH WITH TIMEOUT
-// ============================================================
-
-async function fetchWithTimeout(
-  url: string,
-  init: RequestInit = {},
-  timeoutMs = 8000
-): Promise<{
-  response: Response;
-  elapsed_ms: number;
-}> {
-  const started =
-    Date.now();
-
-  const controller =
-    new AbortController();
-
-  const timeout =
-    setTimeout(
-      () => controller.abort(),
-      timeoutMs
-    );
-
-  try {
-    const response =
-      await fetch(
-        url,
-        {
-          ...init,
-          signal:
-            controller.signal
-        }
-      );
-
-    return {
-      response,
-      elapsed_ms:
-        Date.now() - started
-    };
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-
-// ============================================================
-// CLOUDBET API FETCH
+// CLOUDBET FETCH
 // ============================================================
 
 async function cloudbetFetch(
@@ -178,42 +99,57 @@ async function cloudbetFetch(
   timeoutMs = CLOUDBET_TIMEOUT_MS
 ): Promise<{
   response: Response;
-  elapsed_ms: number;
+  elapsedMs: number;
 }> {
-  const apiKey =
-    env?.[API_KEY_NAME];
+  const started =
+    Date.now();
 
-  const url =
-    `${API_BASE}${path}`;
+  const controller =
+    new AbortController();
 
-  const headers =
-    new Headers();
-
-  headers.set(
-    "accept",
-    "application/json"
-  );
-
-  headers.set(
-    "cache-control",
-    "no-cache"
-  );
-
-  if (apiKey) {
-    headers.set(
-      "X-API-Key",
-      apiKey
+  const timer =
+    setTimeout(
+      () => controller.abort(),
+      timeoutMs
     );
-  }
 
-  return fetchWithTimeout(
-    url,
-    {
-      method: "GET",
-      headers
-    },
-    timeoutMs
-  );
+  try {
+    const headers: Record<string, string> = {
+      "accept":
+        "application/json",
+      "cache-control":
+        "no-cache",
+      "pragma":
+        "no-cache",
+    };
+
+    const apiKey =
+      env?.[API_KEY_NAME];
+
+    if (apiKey) {
+      headers["X-API-Key"] =
+        apiKey;
+    }
+
+    const response =
+      await fetch(
+        `${API_BASE}${path}`,
+        {
+          method: "GET",
+          headers,
+          signal:
+            controller.signal,
+        }
+      );
+
+    return {
+      response,
+      elapsedMs:
+        Date.now() - started,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function parseJSON(
@@ -230,158 +166,717 @@ async function parseJSON(
     return JSON.parse(text);
   } catch {
     return {
-      __raw_text: text
+      _non_json: true,
+      _text_preview:
+        text.slice(0, 2000),
     };
   }
 }
 
 // ============================================================
-// CLOUD0007 FETCH
+// SOCCER DATA HELPERS
 // ============================================================
 
-async function fetchCloud0007Page(): Promise<{
-  html: string;
-  final_url: string;
-  redirected: boolean;
-  http_status: number;
-  content_type: string;
-  elapsed_ms: number;
-}> {
-  const result =
-    await fetchWithTimeout(
-      CLOUD0007_URL,
-      {
-        method: "GET",
-        redirect: "follow",
-        headers: {
-          "accept":
-            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-
-          "accept-language":
-            "en-US,en;q=0.9",
-
-          "cache-control":
-            "no-cache",
-
-          "pragma":
-            "no-cache",
-
-          "user-agent":
-            "Mozilla/5.0 (compatible; Cloud0007Diagnostic/5.7.3)"
-        }
-      },
-      CLOUD0007_TIMEOUT_MS
-    );
-
-  const contentType =
-    result.response.headers.get(
-      "content-type"
-    ) || "";
-
-  const html =
-    await result.response.text();
-
-  return {
-    html,
-    final_url:
-      result.response.url ||
-      CLOUD0007_URL,
-
-    redirected:
-      result.response.redirected,
-
-    http_status:
-      result.response.status,
-
-    content_type:
-      contentType,
-
-    elapsed_ms:
-      result.elapsed_ms
-  };
-}
-
-// ============================================================
-// HTML HELPERS
-// ============================================================
-
-function decodeHtmlEntities(
-  value: string
-): string {
-  return value
-    .replace(/&amp;/gi, "&")
-    .replace(/&#x2F;/gi, "/")
-    .replace(/&#47;/gi, "/")
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;/gi, "'");
-}
-
-function normalizeScriptUrl(
-  src: string,
-  pageUrl: string
-): string | null {
-  const cleaned =
-    decodeHtmlEntities(
-      src.trim()
-    );
-
-  if (!cleaned) {
+function getSoccerData(
+  data: any
+): any {
+  if (!data) {
     return null;
   }
 
   if (
-    cleaned.startsWith(
-      "data:"
-    )
+    data.soccer !== undefined
   ) {
+    return data.soccer;
+  }
+
+  if (
+    data.data?.soccer !== undefined
+  ) {
+    return data.data.soccer;
+  }
+
+  if (
+    data.result?.soccer !== undefined
+  ) {
+    return data.result.soccer;
+  }
+
+  return data;
+}
+
+function flattenSoccerCompetitions(
+  data: any
+): any[] {
+  const soccer =
+    getSoccerData(data);
+
+  if (!soccer) {
+    return [];
+  }
+
+  const result: any[] = [];
+
+  const candidates = [
+    soccer?.competitions,
+    soccer?.data?.competitions,
+    soccer?.result?.competitions,
+    soccer?.items,
+    soccer?.data,
+  ];
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      result.push(
+        ...candidate
+      );
+    }
+  }
+
+  if (
+    result.length === 0 &&
+    Array.isArray(soccer)
+  ) {
+    result.push(
+      ...soccer
+    );
+  }
+
+  return result;
+}
+
+function collectKeys(
+  value: any,
+  maxDepth = 4,
+  depth = 0
+): string[] {
+  if (
+    depth > maxDepth ||
+    value === null ||
+    value === undefined
+  ) {
+    return [];
+  }
+
+  if (
+    typeof value !== "object"
+  ) {
+    return [];
+  }
+
+  const keys =
+    new Set<string>();
+
+  for (
+    const key of Object.keys(value)
+  ) {
+    keys.add(key);
+
+    if (
+      depth < maxDepth
+    ) {
+      const child =
+        value[key];
+
+      for (
+        const nested of collectKeys(
+          child,
+          maxDepth,
+          depth + 1
+        )
+      ) {
+        keys.add(
+          `${key}.${nested}`
+        );
+      }
+    }
+  }
+
+  return Array.from(keys);
+}
+
+function sampleFieldValues(
+  value: any,
+  fields: string[],
+  max = 20
+): AnyObj {
+  const result: AnyObj = {};
+
+  if (
+    !value ||
+    typeof value !== "object"
+  ) {
+    return result;
+  }
+
+  for (
+    const field of fields
+  ) {
+    if (
+      value[field] !== undefined
+    ) {
+      result[field] =
+        value[field];
+    }
+
+    if (
+      Object.keys(result).length >= max
+    ) {
+      break;
+    }
+  }
+
+  return result;
+}
+
+function detectInterestingFields(
+  data: any
+): AnyObj {
+  const keys =
+    collectKeys(
+      data,
+      3
+    );
+
+  const interesting =
+    keys.filter(
+      key =>
+        /live|inplay|in_play|status|event|market|selection|odds|price|sport|competition/i.test(
+          key
+        )
+    );
+
+  return {
+    total_keys:
+      keys.length,
+    interesting_keys:
+      interesting.slice(0, 200),
+  };
+}
+
+// ============================================================
+// COMPETITION EXTRACTION
+// ============================================================
+
+function getCompetitionKey(
+  competition: any
+): string | null {
+  if (!competition) {
     return null;
   }
 
-  try {
-    return new URL(
-      cleaned,
-      pageUrl
-    ).href;
-  } catch {
+  const candidates = [
+    competition.key,
+    competition.id,
+    competition.competitionKey,
+    competition.competition_key,
+    competition.slug,
+    competition.name,
+  ];
+
+  for (
+    const value of candidates
+  ) {
+    if (
+      value !== undefined &&
+      value !== null &&
+      String(value).trim()
+    ) {
+      return String(value);
+    }
+  }
+
+  return null;
+}
+
+function extractCompetitionsForLive(
+  data: any
+): any[] {
+  return flattenSoccerCompetitions(
+    data
+  );
+}
+
+function extractEvents(
+  data: any
+): any[] {
+  if (!data) {
+    return [];
+  }
+
+  if (
+    Array.isArray(data)
+  ) {
+    return data;
+  }
+
+  const candidates = [
+    data.events,
+    data.data?.events,
+    data.data?.data?.events,
+    data.result?.events,
+    data.result?.data?.events,
+    data.items,
+    data.data,
+  ];
+
+  for (
+    const candidate of candidates
+  ) {
+    if (
+      Array.isArray(candidate)
+    ) {
+      return candidate;
+    }
+  }
+
+  return [];
+}
+
+// ============================================================
+// LIVE DETECTION
+// ============================================================
+
+function isLiveEvent(
+  event: any
+): boolean {
+  if (!event) {
+    return false;
+  }
+
+  const booleanFields = [
+    "live",
+    "isLive",
+    "inPlay",
+    "in_play",
+  ];
+
+  for (
+    const field of booleanFields
+  ) {
+    if (
+      event[field] === true
+    ) {
+      return true;
+    }
+  }
+
+  const statuses = [
+    event.status,
+    event.state,
+    event.eventStatus,
+    event.event_status,
+  ];
+
+  for (
+    const value of statuses
+  ) {
+    if (
+      value === undefined ||
+      value === null
+    ) {
+      continue;
+    }
+
+    const normalized =
+      String(value)
+        .toLowerCase()
+        .replace(/[-_\s]/g, "");
+
+    if (
+      normalized === "live" ||
+      normalized === "inplay" ||
+      normalized === "started" ||
+      normalized === "tradinglive"
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// ============================================================
+// TARGET ODDS
+// ============================================================
+
+const TARGET_MARKET =
+  "soccer.total_goals_period_first_half";
+
+const TARGET_SUBMARKET =
+  "period=1h";
+
+const TARGET_OUTCOME =
+  "over";
+
+const TARGET_PARAMS =
+  "total=0.5";
+
+function extractTargetOdds(
+  event: any
+): AnyObj | null {
+  if (!event) {
     return null;
+  }
+
+  const markets =
+    event.markets ||
+    event.market ||
+    event.odds ||
+    event.lines;
+
+  if (!markets) {
+    return null;
+  }
+
+  const inspect =
+    (
+      market: any,
+      marketName?: string
+    ): AnyObj | null => {
+      if (!market) {
+        return null;
+      }
+
+      const selections =
+        market.selections ||
+        market.outcomes ||
+        market.prices;
+
+      if (
+        !Array.isArray(
+          selections
+        )
+      ) {
+        return null;
+      }
+
+      for (
+        const selection of selections
+      ) {
+        if (!selection) {
+          continue;
+        }
+
+        const outcome =
+          selection.outcome ??
+          selection.name ??
+          selection.side;
+
+        const params =
+          selection.params ??
+          selection.parameters;
+
+        const marketValue =
+          selection.market ??
+          selection.marketKey ??
+          selection.market_name ??
+          marketName;
+
+        const submarket =
+          selection.submarket ??
+          selection.subMarket ??
+          selection.submarketKey ??
+          selection.period ??
+          market.submarket ??
+          market.subMarket;
+
+        const marketMatches =
+          marketValue ===
+          TARGET_MARKET;
+
+        const submarketMatches =
+          submarket ===
+            TARGET_SUBMARKET ||
+          params ===
+            TARGET_PARAMS &&
+          marketValue ===
+            TARGET_MARKET;
+
+        const outcomeMatches =
+          outcome ===
+          TARGET_OUTCOME;
+
+        const paramsMatches =
+          params ===
+          TARGET_PARAMS;
+
+        if (
+          marketMatches &&
+          submarketMatches &&
+          outcomeMatches &&
+          paramsMatches
+        ) {
+          const price =
+            finiteNumber(
+              selection.price ??
+              selection.odds ??
+              selection.raw_price
+            );
+
+          if (
+            price === null ||
+            price <= 1
+          ) {
+            continue;
+          }
+
+          const maxStake =
+            finiteNumber(
+              selection.maxStake
+            );
+
+          if (
+            maxStake !== null &&
+            maxStake <= 0
+          ) {
+            continue;
+          }
+
+          const status =
+            selection.status;
+
+          const disabled =
+            selection.enabled === false ||
+            selection.active === false ||
+            selection.trading === false ||
+            selection.selection_enabled === false ||
+            (
+              typeof status ===
+                "string" &&
+              /disabled|closed|suspended|inactive/i.test(
+                status
+              )
+            );
+
+          if (disabled) {
+            continue;
+          }
+
+          return {
+            outcome,
+            params,
+            market:
+              marketValue,
+            submarket,
+            price,
+            maxStake:
+              maxStake ??
+              undefined,
+            status:
+              status ??
+              null,
+          };
+        }
+      }
+
+      return null;
+    };
+
+  if (
+    Array.isArray(markets)
+  ) {
+    for (
+      const market of markets
+    ) {
+      const result =
+        inspect(
+          market,
+          market?.market ??
+            market?.key ??
+            market?.name
+        );
+
+      if (result) {
+        return result;
+      }
+    }
+
+    return null;
+  }
+
+  if (
+    typeof markets ===
+    "object"
+  ) {
+    for (
+      const [
+        marketName,
+        market
+      ] of Object.entries(
+        markets
+      )
+    ) {
+      const result =
+        inspect(
+          market,
+          marketName
+        );
+
+      if (result) {
+        return result;
+      }
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
+// LIVE MATCH BUILD
+// ============================================================
+
+function buildLiveMatch(
+  event: any
+): AnyObj {
+  return {
+    id:
+      event?.id ??
+      event?.eventId ??
+      event?.event_id ??
+      null,
+
+    name:
+      event?.name ??
+      event?.eventName ??
+      null,
+
+    home:
+      event?.home ??
+      event?.homeTeam ??
+      event?.home_team ??
+      event?.participants?.[0]?.name ??
+      null,
+
+    away:
+      event?.away ??
+      event?.awayTeam ??
+      event?.away_team ??
+      event?.participants?.[1]?.name ??
+      null,
+
+    status:
+      event?.status ??
+      event?.state ??
+      null,
+
+    live:
+      isLiveEvent(
+        event
+      ),
+
+    target_1h_over_05:
+      extractTargetOdds(
+        event
+      ),
+  };
+}
+
+// ============================================================
+// DIRECT CLOUD0007 PAGE
+// ============================================================
+
+async function fetchCloud0007(
+  url: string,
+  timeoutMs: number
+): Promise<{
+  response: Response;
+  text: string;
+  elapsedMs: number;
+  finalUrl: string;
+}> {
+  const started =
+    Date.now();
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () => controller.abort(),
+      timeoutMs
+    );
+
+  try {
+    const response =
+      await fetch(
+        url,
+        {
+          method: "GET",
+          redirect: "follow",
+          headers: {
+            "accept":
+              "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "accept-language":
+              "en-US,en;q=0.9",
+            "cache-control":
+              "no-cache",
+            "pragma":
+              "no-cache",
+            "user-agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+          },
+          signal:
+            controller.signal,
+        }
+      );
+
+    const text =
+      await response.text();
+
+    return {
+      response,
+      text,
+      elapsedMs:
+        Date.now() - started,
+      finalUrl:
+        response.url || url,
+    };
+  } finally {
+    clearTimeout(timer);
   }
 }
 
 // ============================================================
-// EXTRACT SCRIPT URLS
+// SCRIPT URL EXTRACTION
 // ============================================================
 
 function extractScriptUrls(
-  html: string,
-  pageUrl: string
+  html: string
 ): string[] {
   const urls =
     new Set<string>();
 
-  const scriptRegex =
-    /<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  const regex =
+    /<script[^>]+src=["']([^"']+)["']/gi;
 
   let match:
     RegExpExecArray | null;
 
   while (
     (match =
-      scriptRegex.exec(html)) !== null
+      regex.exec(html))
   ) {
-    const src =
+    let src =
       match[1];
 
-    const url =
-      normalizeScriptUrl(
-        src,
-        pageUrl
-      );
+    try {
+      src =
+        new URL(
+          src,
+          CLOUD0007_ORIGIN
+        ).href;
 
-    if (
-      url &&
-      /\.js(?:[?#]|$)/i.test(url)
-    ) {
-      urls.add(url);
+      if (
+        src.includes(
+          "_next/static/"
+        ) &&
+        src.endsWith(".js")
+      ) {
+        urls.add(src);
+      }
+    } catch {
+      // ignore
     }
   }
 
@@ -391,780 +886,324 @@ function extractScriptUrls(
 }
 
 // ============================================================
-// STRING NORMALIZATION
+// TARGET SCRIPT FILTER
 // ============================================================
 
-function cleanCandidate(
-  value: string
+function isTargetScript(
+  url: string
+): boolean {
+  return (
+    url.includes(
+      "54692-cd745df6cb747e75.js"
+    ) ||
+    url.includes(
+      "6610-3f9c92912615e51d.js"
+    )
+  );
+}
+
+// ============================================================
+// CONTEXT EXTRACTION
+// ============================================================
+
+function normalizeSnippet(
+  value: string,
+  max = 1800
 ): string {
   return value
-    .replace(/\\u002F/gi, "/")
-    .replace(/\\\//g, "/")
-    .replace(/\\u003A/gi, ":")
-    .replace(/\\u0026/gi, "&")
-    .replace(/&amp;/gi, "&")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(
+      /\s+/g,
+      " "
+    )
+    .trim()
+    .slice(
+      0,
+      max
+    );
 }
 
-// ============================================================
-// ENDPOINT CLASSIFICATION
-// ============================================================
-
-function isInterestingEndpoint(
-  value: string
-): boolean {
-  const s =
-    value.toLowerCase();
-
-  return (
-    s.includes("/api/") ||
-    s.includes("/events") ||
-    s.includes("/event") ||
-    s.includes("/odds") ||
-    s.includes("/inplay") ||
-    s.includes("/in-play") ||
-    s.includes("/live") ||
-    s.includes("/sports") ||
-    s.includes("/markets") ||
-    s.includes("/fixtures") ||
-    s.includes("/feed") ||
-    s.includes("/lines") ||
-    s.includes("wss://") ||
-    s.includes("graphql") ||
-    s.includes("api.")
-  );
-}
-
-// ============================================================
-// EXTRACT URL-LIKE STRINGS
-// ============================================================
-
-function extractAbsoluteUrls(
-  text: string
-): string[] {
-  const found =
+function extractContexts(
+  source: string,
+  keywords: string[],
+  radius = 1400
+): AnyObj[] {
+  const results: AnyObj[] = [];
+  const seen =
     new Set<string>();
 
-  const regex =
-    /https?:\/\/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+/g;
+  const lower =
+    source.toLowerCase();
 
-  let match:
-    RegExpExecArray | null;
-
-  while (
-    (match =
-      regex.exec(text)) !== null
+  for (
+    const keyword of keywords
   ) {
-    let value =
-      cleanCandidate(
-        match[0]
-      );
+    const needle =
+      keyword.toLowerCase();
 
-    value =
-      value.replace(
-        /["'`),;]+$/g,
-        ""
-      );
+    let startAt =
+      0;
 
-    if (
-      isInterestingEndpoint(
-        value
-      )
+    while (
+      results.length < 30
     ) {
-      found.add(value);
-    }
+      const index =
+        lower.indexOf(
+          needle,
+          startAt
+        );
 
-    if (
-      found.size >= MAX_ENDPOINTS
-    ) {
-      break;
+      if (
+        index === -1
+      ) {
+        break;
+      }
+
+      const left =
+        Math.max(
+          0,
+          index - radius
+        );
+
+      const right =
+        Math.min(
+          source.length,
+          index +
+            needle.length +
+            radius
+        );
+
+      const context =
+        normalizeSnippet(
+          source.slice(
+            left,
+            right
+          ),
+          radius * 2
+        );
+
+      const key =
+        context.slice(
+          0,
+          500
+        );
+
+      if (
+        !seen.has(key)
+      ) {
+        seen.add(key);
+
+        results.push({
+          keyword,
+          position:
+            index,
+          context,
+        });
+      }
+
+      startAt =
+        index +
+        needle.length;
     }
   }
 
-  return Array.from(
-    found
-  );
+  return results;
 }
 
 // ============================================================
-// EXTRACT RELATIVE ENDPOINTS
+// REQUEST PATTERN EXTRACTION
 // ============================================================
 
-function extractRelativeEndpoints(
-  text: string
-): string[] {
-  const found =
-    new Set<string>();
-
-  /*
-   * Looks for quoted strings such as:
-   *
-   * "/api/events"
-   * "/events"
-   * "/odds"
-   * "/live"
-   * "/inplay"
-   * "/sports/..."
-   */
-
-  const regex =
-    /["'`]((?:\\\/|\/)[A-Za-z0-9._~:/?#[\]@!$&()*+,;=%\\-]{2,500})["'`]/g;
-
-  let match:
-    RegExpExecArray | null;
-
-  while (
-    (match =
-      regex.exec(text)) !== null
-  ) {
-    const raw =
-      match[1];
-
-    const value =
-      cleanCandidate(
-        raw
-      );
-
-    if (
-      value.startsWith("/") &&
-      isInterestingEndpoint(
-        value
-      )
-    ) {
-      found.add(value);
-    }
-
-    if (
-      found.size >= MAX_ENDPOINTS
-    ) {
-      break;
-    }
-  }
-
-  return Array.from(
-    found
-  );
-}
-
-// ============================================================
-// EXTRACT API-LIKE WORDS / ROUTES
-// ============================================================
-
-function extractRouteFragments(
-  text: string
-): string[] {
-  const found =
-    new Set<string>();
+function extractRequestPatterns(
+  source: string
+): AnyObj[] {
+  const results: AnyObj[] = [];
 
   const patterns = [
-    /\/api\/[A-Za-z0-9._~:/?#[\]@!$&()*+,;=%-]{1,300}/gi,
-
-    /\/v\d+\/[A-Za-z0-9._~:/?#[\]@!$&()*+,;=%-]{1,300}/gi,
-
-    /\/pub\/[A-Za-z0-9._~:/?#[\]@!$&()*+,;=%-]{1,300}/gi,
-
-    /\/(?:events|event|odds|live|inplay|in-play|markets|fixtures|feed|lines)(?:[/?][A-Za-z0-9._~:/?#[\]@!$&()*+,;=%-]{0,300})?/gi
+    {
+      name:
+        "pulse_feed",
+      keywords: [
+        "/app-api/pulse/feed",
+        "pulse/feed",
+      ],
+    },
+    {
+      name:
+        "pulse_feed_version",
+      keywords: [
+        "/app-api/pulse/feed-version",
+        "pulse/feed-version",
+      ],
+    },
+    {
+      name:
+        "sports_api_v6",
+      keywords: [
+        "/sports-api/v6/sports",
+      ],
+    },
+    {
+      name:
+        "sports_api_c_v6",
+      keywords: [
+        "/sports-api/c/v6/sports",
+      ],
+    },
+    {
+      name:
+        "sports_lines",
+      keywords: [
+        "/sports-betting/v4/lines",
+      ],
+    },
+    {
+      name:
+        "events",
+      keywords: [
+        "/events",
+      ],
+    },
+    {
+      name:
+        "fetch",
+      keywords: [
+        "fetch(",
+      ],
+    },
+    {
+      name:
+        "axios",
+      keywords: [
+        "axios",
+      ],
+    },
+    {
+      name:
+        "query_params",
+      keywords: [
+        "params:",
+        "query:",
+        "URLSearchParams",
+      ],
+    },
+    {
+      name:
+        "inplay",
+      keywords: [
+        "inplay",
+        "in-play",
+        "in_play",
+      ],
+    },
   ];
 
   for (
     const pattern of patterns
   ) {
-    let match:
-      RegExpExecArray | null;
-
-    while (
-      (match =
-        pattern.exec(text)) !== null
-    ) {
-      const value =
-        cleanCandidate(
-          match[0]
-        ).replace(
-          /["'`),;]+$/g,
-          ""
-        );
-
-      if (
-        value.length >= 3
-      ) {
-        found.add(value);
-      }
-
-      if (
-        found.size >= MAX_ENDPOINTS
-      ) {
-        break;
-      }
-    }
+    const contexts =
+      extractContexts(
+        source,
+        pattern.keywords,
+        1000
+      );
 
     if (
-      found.size >= MAX_ENDPOINTS
+      contexts.length
     ) {
-      break;
+      results.push({
+        name:
+          pattern.name,
+        matches:
+          contexts.slice(
+            0,
+            8
+          ),
+      });
     }
   }
 
-  return Array.from(
-    found
-  );
+  return results;
 }
 
 // ============================================================
-// SEARCH PATTERNS
+// JS FETCH
 // ============================================================
 
-const SEARCH_PATTERNS: Array<{
-  name: string;
-  regex: RegExp;
-}> = [
-  {
-    name: "api_path",
-    regex: /\/api\//i
-  },
+async function fetchJS(
+  url: string,
+  timeoutMs: number
+): Promise<{
+  ok: boolean;
+  status: number;
+  text: string;
+  elapsedMs: number;
+  error?: string;
+}> {
+  const started =
+    Date.now();
 
-  {
-    name: "events",
-    regex: /\/events\b/i
-  },
+  const controller =
+    new AbortController();
 
-  {
-    name: "event",
-    regex: /\/event\b/i
-  },
+  const timer =
+    setTimeout(
+      () => controller.abort(),
+      timeoutMs
+    );
 
-  {
-    name: "odds",
-    regex: /\/odds\b/i
-  },
-
-  {
-    name: "inplay",
-    regex: /in[-_ ]?play|inplay/i
-  },
-
-  {
-    name: "live",
-    regex: /\/live\b/i
-  },
-
-  {
-    name: "sports",
-    regex: /\/sports\b/i
-  },
-
-  {
-    name: "markets",
-    regex: /\/markets\b/i
-  },
-
-  {
-    name: "fixtures",
-    regex: /\/fixtures\b/i
-  },
-
-  {
-    name: "feed",
-    regex: /\/feed\b/i
-  },
-
-  {
-    name: "lines",
-    regex: /\/lines\b/i
-  },
-
-  {
-    name: "fetch",
-    regex: /\bfetch\s*\(/i
-  },
-
-  {
-    name: "axios",
-    regex: /\baxios\b/i
-  },
-
-  {
-    name: "xhr",
-    regex: /XMLHttpRequest/i
-  },
-
-  {
-    name: "websocket",
-    regex: /WebSocket|wss:\/\//i
-  },
-
-  {
-    name: "graphql",
-    regex: /graphql/i
-  }
-];
-
-// ============================================================
-// EXTRACT SNIPPETS
-// ============================================================
-
-function extractSnippets(
-  text: string,
-  pattern: RegExp,
-  maxCount: number
-): string[] {
-  const snippets: string[] = [];
-
-  const lower =
-    text.toLowerCase();
-
-  const source =
-    pattern.source
-      .replace(
-        /\\b/g,
-        ""
+  try {
+    const response =
+      await fetch(
+        url,
+        {
+          method: "GET",
+          redirect: "follow",
+          headers: {
+            "accept":
+              "application/javascript,text/javascript,*/*;q=0.8",
+            "cache-control":
+              "no-cache",
+            "pragma":
+              "no-cache",
+            "user-agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+            "referer":
+              CLOUD0007_URL,
+          },
+          signal:
+            controller.signal,
+        }
       );
 
-  /*
-   * We cannot reliably convert every regex to a literal,
-   * so search with a few known terms separately.
-   */
+    const text =
+      await response.text();
 
-  let positions: number[] = [];
-
-  if (
-    /api_path/i.test(
-      source
-    ) ||
-    /api/i.test(
-      pattern.source
-    )
+    return {
+      ok:
+        response.ok,
+      status:
+        response.status,
+      text,
+      elapsedMs:
+        Date.now() - started,
+    };
+  } catch (
+    error
   ) {
-    positions.push(
-      ...findAll(
-        lower,
-        "/api/"
-      )
-    );
+    return {
+      ok: false,
+      status: 0,
+      text: "",
+      elapsedMs:
+        Date.now() - started,
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error),
+    };
+  } finally {
+    clearTimeout(timer);
   }
-
-  if (
-    /events/i.test(
-      pattern.source
-    )
-  ) {
-    positions.push(
-      ...findAll(
-        lower,
-        "/events"
-      )
-    );
-  }
-
-  if (
-    /event/i.test(
-      pattern.source
-    ) &&
-    positions.length === 0
-  ) {
-    positions.push(
-      ...findAll(
-        lower,
-        "/event"
-      )
-    );
-  }
-
-  if (
-    /odds/i.test(
-      pattern.source
-    )
-  ) {
-    positions.push(
-      ...findAll(
-        lower,
-        "/odds"
-      )
-    );
-  }
-
-  if (
-    /in/i.test(
-      pattern.source
-    )
-  ) {
-    positions.push(
-      ...findAll(
-        lower,
-        "inplay"
-      ),
-      ...findAll(
-        lower,
-        "in-play"
-      )
-    );
-  }
-
-  if (
-    /live/i.test(
-      pattern.source
-    )
-  ) {
-    positions.push(
-      ...findAll(
-        lower,
-        "/live"
-      )
-    );
-  }
-
-  if (
-    /sports/i.test(
-      pattern.source
-    )
-  ) {
-    positions.push(
-      ...findAll(
-        lower,
-        "/sports"
-      )
-    );
-  }
-
-  if (
-    /markets/i.test(
-      pattern.source
-    )
-  ) {
-    positions.push(
-      ...findAll(
-        lower,
-        "/markets"
-      )
-    );
-  }
-
-  if (
-    /fixtures/i.test(
-      pattern.source
-    )
-  ) {
-    positions.push(
-      ...findAll(
-        lower,
-        "/fixtures"
-      )
-    );
-  }
-
-  if (
-    /feed/i.test(
-      pattern.source
-    )
-  ) {
-    positions.push(
-      ...findAll(
-        lower,
-        "/feed"
-      )
-    );
-  }
-
-  if (
-    /lines/i.test(
-      pattern.source
-    )
-  ) {
-    positions.push(
-      ...findAll(
-        lower,
-        "/lines"
-      )
-    );
-  }
-
-  if (
-    /fetch/i.test(
-      pattern.source
-    )
-  ) {
-    positions.push(
-      ...findAll(
-        lower,
-        "fetch("
-      )
-    );
-  }
-
-  if (
-    /axios/i.test(
-      pattern.source
-    )
-  ) {
-    positions.push(
-      ...findAll(
-        lower,
-        "axios"
-      )
-    );
-  }
-
-  if (
-    /websocket/i.test(
-      pattern.source
-    )
-  ) {
-    positions.push(
-      ...findAll(
-        lower,
-        "websocket"
-      ),
-      ...findAll(
-        lower,
-        "wss://"
-      )
-    );
-  }
-
-  if (
-    /graphql/i.test(
-      pattern.source
-    )
-  ) {
-    positions.push(
-      ...findAll(
-        lower,
-        "graphql"
-      )
-    );
-  }
-
-  positions =
-    Array.from(
-      new Set(
-        positions
-      )
-    ).sort(
-      (a, b) =>
-        a - b
-    );
-
-  for (
-    const pos of positions
-  ) {
-    const start =
-      Math.max(
-        0,
-        pos - 180
-      );
-
-    const end =
-      Math.min(
-        text.length,
-        pos + 420
-      );
-
-    let snippet =
-      text.slice(
-        start,
-        end
-      );
-
-    snippet =
-      snippet
-        .replace(
-          /\s+/g,
-          " "
-        )
-        .trim();
-
-    if (
-      snippet.length > 650
-    ) {
-      snippet =
-        snippet.slice(
-          0,
-          650
-        ) + "...";
-    }
-
-    snippets.push(
-      snippet
-    );
-
-    if (
-      snippets.length >=
-      maxCount
-    ) {
-      break;
-    }
-  }
-
-  return snippets;
-}
-
-function findAll(
-  text: string,
-  needle: string
-): number[] {
-  const result: number[] = [];
-
-  let start = 0;
-
-  while (true) {
-    const index =
-      text.indexOf(
-        needle,
-        start
-      );
-
-    if (
-      index === -1
-    ) {
-      break;
-    }
-
-    result.push(
-      index
-    );
-
-    start =
-      index +
-      Math.max(
-        1,
-        needle.length
-      );
-
-    if (
-      result.length >= 50
-    ) {
-      break;
-    }
-  }
-
-  return result;
-}
-
-// ============================================================
-// SCRIPT ANALYSIS
-// ============================================================
-
-function analyzeScript(
-  src: string,
-  text: string
-): AnyObj {
-  const limited =
-    text.length >
-    MAX_SCRIPT_CHARS
-      ? text.slice(
-          0,
-          MAX_SCRIPT_CHARS
-        )
-      : text;
-
-  const patternHits:
-    Record<string, number> = {};
-
-  const snippets: Array<{
-    pattern: string;
-    snippet: string;
-  }> = [];
-
-  for (
-    const item of
-      SEARCH_PATTERNS
-  ) {
-    if (
-      item.regex.test(
-        limited
-      )
-    ) {
-      const matches =
-        limited.match(
-          new RegExp(
-            item.regex.source,
-            "gi"
-          )
-        );
-
-      patternHits[
-        item.name
-      ] =
-        matches?.length || 1;
-
-      const extracted =
-        extractSnippets(
-          limited,
-          item.regex,
-          Math.min(
-            3,
-            MAX_SNIPPETS_PER_SCRIPT
-          )
-        );
-
-      for (
-        const snippet of
-          extracted
-      ) {
-        snippets.push({
-          pattern:
-            item.name,
-          snippet
-        });
-      }
-    }
-  }
-
-  const absoluteUrls =
-    extractAbsoluteUrls(
-      limited
-    );
-
-  const relativeEndpoints =
-    extractRelativeEndpoints(
-      limited
-    );
-
-  const routeFragments =
-    extractRouteFragments(
-      limited
-    );
-
-  return {
-    src,
-
-    chars:
-      text.length,
-
-    analyzed_chars:
-      limited.length,
-
-    truncated:
-      text.length >
-      MAX_SCRIPT_CHARS,
-
-    pattern_hits:
-      patternHits,
-
-    absolute_urls:
-      absoluteUrls.slice(
-        0,
-        MAX_ENDPOINTS
-      ),
-
-    relative_endpoints:
-      relativeEndpoints.slice(
-        0,
-        MAX_ENDPOINTS
-      ),
-
-    route_fragments:
-      routeFragments.slice(
-        0,
-        MAX_ENDPOINTS
-      ),
-
-    snippets:
-      snippets.slice(
-        0,
-        MAX_SNIPPETS_PER_SCRIPT
-      )
-  };
 }
 
 // ============================================================
@@ -1184,12 +1223,13 @@ async function mapWithConcurrency<T, R>(
       items.length
     );
 
-  let nextIndex = 0;
+  let cursor =
+    0;
 
   async function runner() {
     while (true) {
       const index =
-        nextIndex++;
+        cursor++;
 
       if (
         index >=
@@ -1206,29 +1246,31 @@ async function mapWithConcurrency<T, R>(
     }
   }
 
-  const count =
-    Math.min(
-      concurrency,
-      items.length
+  const workers =
+    Array.from(
+      {
+        length:
+          Math.min(
+            concurrency,
+            items.length
+          ),
+      },
+      () => runner()
     );
 
   await Promise.all(
-    Array.from(
-      { length: count },
-      () => runner()
-    )
+    workers
   );
 
   return results;
 }
 
 // ============================================================
-// CLOUD0007 JS DIAGNOSTIC
+// V5.7.4 NEW DIAGNOSTIC
 // ============================================================
 
-async function diagnosticCloud0007JS(
-  request: Request
-): Promise<Response> {
+async function diagnosticCloud0007API():
+  Promise<Response> {
   const started =
     Date.now();
 
@@ -1236,7 +1278,511 @@ async function diagnosticCloud0007JS(
 
   try {
     page =
-      await fetchCloud0007Page();
+      await fetchCloud0007(
+        CLOUD0007_URL,
+        CLOUD0007_PAGE_TIMEOUT_MS
+      );
+  } catch (
+    error
+  ) {
+    return json(
+      {
+        success: false,
+        worker:
+          "cloudbet-live-soccer-detector",
+        version:
+          VERSION,
+        action:
+          "DIAGNOSTIC_CLOUD0007_API",
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      },
+      502
+    );
+  }
+
+  const allScripts =
+    extractScriptUrls(
+      page.text
+    );
+
+  const targetScripts =
+    allScripts.filter(
+      isTargetScript
+    );
+
+  const scriptResults =
+    await mapWithConcurrency(
+      targetScripts,
+      CLOUD0007_JS_CONCURRENCY,
+      async url => {
+        const result =
+          await fetchJS(
+            url,
+            CLOUD0007_JS_TIMEOUT_MS
+          );
+
+        if (
+          !result.ok
+        ) {
+          return {
+            src: url,
+            ok: false,
+            status:
+              result.status,
+            elapsed_ms:
+              result.elapsedMs,
+            error:
+              result.error ??
+              null,
+          };
+        }
+
+        const source =
+          result.text;
+
+        const requests =
+          extractRequestPatterns(
+            source
+          );
+
+        return {
+          src: url,
+          ok: true,
+          status:
+            result.status,
+          elapsed_ms:
+            result.elapsedMs,
+          chars:
+            source.length,
+          request_patterns:
+            requests,
+        };
+      }
+    );
+
+  const useful =
+    scriptResults.filter(
+      (item: any) =>
+        item.ok &&
+        Array.isArray(
+          item.request_patterns
+        ) &&
+        item.request_patterns.length > 0
+    );
+
+  return json({
+    success: true,
+
+    worker:
+      "cloudbet-live-soccer-detector",
+
+    version:
+      VERSION,
+
+    action:
+      "DIAGNOSTIC_CLOUD0007_API",
+
+    read_only:
+      true,
+
+    current_live_path:
+      "UNCHANGED",
+
+    request: {
+      page_url:
+        CLOUD0007_URL,
+
+      page_timeout_ms:
+        CLOUD0007_PAGE_TIMEOUT_MS,
+
+      js_timeout_ms:
+        CLOUD0007_JS_TIMEOUT_MS,
+
+      target_scripts:
+        [
+          "54692-cd745df6cb747e75.js",
+          "6610-3f9c92912615e51d.js",
+        ],
+    },
+
+    performance: {
+      page_fetch_ms:
+        page.elapsedMs,
+
+      total_elapsed_ms:
+        Date.now() -
+        started,
+    },
+
+    page: {
+      http_status:
+        page.response.status,
+
+      final_url:
+        page.finalUrl,
+
+      html_chars:
+        page.text.length,
+
+      scripts_found:
+        allScripts.length,
+
+      target_scripts_found:
+        targetScripts.length,
+    },
+
+    scripts: {
+      results:
+        scriptResults,
+
+      useful_scripts:
+        useful.length,
+    },
+
+    interpretation: {
+      purpose:
+        "Extract only the relevant API-call context from Cloud0007 sports JS bundles.",
+
+      important:
+        "The existing /live endpoint was NOT changed.",
+
+      next_step:
+        "Inspect request_patterns to identify the exact live sports API, HTTP method, parameters and feed mechanism.",
+    },
+  });
+}
+
+// ============================================================
+// ORIGINAL CLOUD0007 DIAGNOSTIC
+// ============================================================
+
+async function diagnosticCloud0007():
+  Promise<Response> {
+  const started =
+    Date.now();
+
+  let page;
+
+  try {
+    page =
+      await fetchCloud0007(
+        CLOUD0007_URL,
+        CLOUD0007_PAGE_TIMEOUT_MS
+      );
+  } catch (
+    error
+  ) {
+    return json(
+      {
+        success: false,
+        worker:
+          "cloudbet-live-soccer-detector",
+        version:
+          VERSION,
+        action:
+          "DIAGNOSTIC_CLOUD0007",
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+      },
+      502
+    );
+  }
+
+  const html =
+    page.text;
+
+  const nextDataMatch =
+    html.match(
+      /<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i
+    );
+
+  let nextData:
+    any = null;
+
+  if (
+    nextDataMatch?.[1]
+  ) {
+    try {
+      nextData =
+        JSON.parse(
+          nextDataMatch[1]
+        );
+    } catch {
+      nextData = null;
+    }
+  }
+
+  const signals: AnyObj = {
+    soccer:
+      /soccer/i.test(
+        html
+      ),
+
+    football:
+      /football/i.test(
+        html
+      ),
+
+    live:
+      /live/i.test(
+        html
+      ),
+
+    cloudbet:
+      /cloudbet/i.test(
+        html
+      ),
+
+    sports:
+      /sports/i.test(
+        html
+      ),
+
+    events:
+      /events/i.test(
+        html
+      ),
+
+    odds:
+      /odds/i.test(
+        html
+      ),
+
+    trading_live:
+      /TRADING_LIVE/i.test(
+        html
+      ),
+
+    __next_data__:
+      !!nextDataMatch,
+
+    application_json:
+      /application\/json/i.test(
+        html
+      ),
+
+    websocket:
+      /websocket/i.test(
+        html
+      ),
+
+    socket_io:
+      /socket\.io/i.test(
+        html
+      ),
+
+    graphql:
+      /graphql/i.test(
+        html
+      ),
+
+    api:
+      /\/api\//i.test(
+        html
+      ),
+  };
+
+  const scripts =
+    extractScriptUrls(
+      html
+    );
+
+  const absoluteUrls =
+    Array.from(
+      new Set(
+        (
+          html.match(
+            /https?:\/\/[^\s"'<>]+/gi
+          ) || []
+        ).slice(
+          0,
+          50
+        )
+      )
+    );
+
+  return json({
+    success: true,
+
+    worker:
+      "cloudbet-live-soccer-detector",
+
+    version:
+      VERSION,
+
+    action:
+      "DIAGNOSTIC_CLOUD0007",
+
+    read_only:
+      true,
+
+    request: {
+      url:
+        CLOUD0007_URL,
+
+      method:
+        "GET",
+
+      requests_made:
+        1,
+
+      timeout_ms:
+        CLOUD0007_PAGE_TIMEOUT_MS,
+    },
+
+    performance: {
+      elapsed_ms:
+        page.elapsedMs,
+
+      http_status:
+        page.response.status,
+
+      content_type:
+        page.response.headers.get(
+          "content-type"
+        ),
+
+      response_bytes:
+        new TextEncoder().encode(
+          html
+        ).length,
+
+      html_chars:
+        html.length,
+    },
+
+    page: {
+      final_url:
+        page.finalUrl,
+
+      redirected:
+        page.finalUrl !==
+        CLOUD0007_URL,
+
+      title:
+        (
+          html.match(
+            /<title[^>]*>([\s\S]*?)<\/title>/i
+          )?.[1] ??
+          ""
+        ).trim(),
+
+      signals,
+    },
+
+    embedded_data: {
+      next_data_present:
+        !!nextDataMatch,
+
+      next_data_chars:
+        nextDataMatch?.[1]
+          ?.length ??
+        0,
+
+      next_data_parseable:
+        !!nextData,
+
+      next_data_type:
+        nextData === null
+          ? null
+          : typeof nextData,
+
+      next_data_keys:
+        nextData &&
+        typeof nextData ===
+          "object"
+          ? Object.keys(
+              nextData
+            )
+          : [],
+
+      application_json_script_count:
+        (
+          html.match(
+            /<script[^>]+type=["']application\/json["'][^>]*>/gi
+          ) || []
+        ).length,
+    },
+
+    scripts: {
+      count:
+        scripts.length,
+
+      first_30:
+        scripts.slice(
+          0,
+          30
+        ),
+    },
+
+    possible_urls: {
+      count:
+        absoluteUrls.length,
+
+      first_50:
+        absoluteUrls,
+    },
+
+    html_analysis: {
+      contains_event_word:
+        /event/i.test(
+          html
+        ),
+
+      contains_odds_word:
+        /odds/i.test(
+          html
+        ),
+
+      contains_live_word:
+        /live/i.test(
+          html
+        ),
+
+      contains_api_reference:
+        /api/i.test(
+          html
+        ),
+    },
+
+    interpretation: {
+      purpose:
+        "Compact inspection of the Cloud0007 Live Soccer page.",
+
+      current_live_path:
+        "UNCHANGED",
+
+      no_html_dump:
+        true,
+
+      next_step:
+        "Use /diagnostic-cloud0007-api to inspect the exact sports API calls used by the frontend.",
+    },
+  });
+}
+
+// ============================================================
+// CLOUD0007 JS DIAGNOSTIC
+// ============================================================
+
+async function diagnosticCloud0007JS():
+  Promise<Response> {
+  const started =
+    Date.now();
+
+  let page;
+
+  try {
+    page =
+      await fetchCloud0007(
+        CLOUD0007_URL,
+        CLOUD0007_PAGE_TIMEOUT_MS
+      );
   } catch (
     error
   ) {
@@ -1249,46 +1795,10 @@ async function diagnosticCloud0007JS(
           VERSION,
         action:
           "DIAGNOSTIC_CLOUD0007_JS",
-
         error:
-          String(error),
-
-        request: {
-          url:
-            CLOUD0007_URL,
-          timeout_ms:
-            CLOUD0007_TIMEOUT_MS
-        }
-      },
-      502
-    );
-  }
-
-  if (
-    page.http_status < 200 ||
-    page.http_status >= 300
-  ) {
-    return json(
-      {
-        success: false,
-
-        worker:
-          "cloudbet-live-soccer-detector",
-
-        version:
-          VERSION,
-
-        action:
-          "DIAGNOSTIC_CLOUD0007_JS",
-
-        page: {
-          http_status:
-            page.http_status,
-          elapsed_ms:
-            page.elapsed_ms,
-          final_url:
-            page.final_url
-        }
+          error instanceof Error
+            ? error.message
+            : String(error),
       },
       502
     );
@@ -1296,299 +1806,114 @@ async function diagnosticCloud0007JS(
 
   const scripts =
     extractScriptUrls(
-      page.html,
-      page.final_url
+      page.text
     );
 
-  const scriptResults =
+  const results =
     await mapWithConcurrency(
       scripts,
-      JS_CONCURRENCY,
-      async (
-        src
-      ) => {
-        const scriptStarted =
-          Date.now();
+      CLOUD0007_JS_CONCURRENCY,
+      async url => {
+        const result =
+          await fetchJS(
+            url,
+            CLOUD0007_JS_TIMEOUT_MS
+          );
 
-        try {
-          const result =
-            await fetchWithTimeout(
-              src,
-              {
-                method:
-                  "GET",
-
-                redirect:
-                  "follow",
-
-                headers: {
-                  "accept":
-                    "application/javascript,text/javascript,*/*;q=0.8",
-
-                  "cache-control":
-                    "no-cache",
-
-                  "pragma":
-                    "no-cache",
-
-                  "user-agent":
-                    "Mozilla/5.0 (compatible; Cloud0007Diagnostic/5.7.3)"
-                }
-              },
-              CLOUD0007_JS_TIMEOUT_MS
-            );
-
-          if (
-            result.response.status <
-              200 ||
-            result.response.status >=
-              300
-          ) {
-            return {
-              success: false,
-              src,
-              http_status:
-                result.response.status,
-              elapsed_ms:
-                result.elapsed_ms,
-              error:
-                "NON_2XX"
-            };
-          }
-
-          const text =
-            await result.response.text();
-
-          const analysis =
-            analyzeScript(
-              src,
-              text
-            );
-
-          return {
-            success: true,
-            elapsed_ms:
-              result.elapsed_ms,
-            ...analysis
-          };
-        } catch (
-          error
+        if (
+          !result.ok
         ) {
           return {
-            success: false,
-            src,
+            src: url,
+            ok: false,
+            status:
+              result.status,
             elapsed_ms:
-              Date.now() -
-              scriptStarted,
+              result.elapsedMs,
             error:
-              String(error)
+              result.error ??
+              null,
           };
         }
-      }
-    );
 
-  // ==========================================================
-  // COLLECT CANDIDATES
-  // ==========================================================
+        const source =
+          result.text;
 
-  const endpointSet =
-    new Set<string>();
+        const patterns =
+          [
+            "api",
+            "fetch",
+            "axios",
+            "xhr",
+            "websocket",
+            "inplay",
+            "live",
+            "sports",
+            "event",
+            "events",
+            "feed",
+          ];
 
-  const absoluteSet =
-    new Set<string>();
+        const patternHits:
+          AnyObj = {};
 
-  const relativeSet =
-    new Set<string>();
+        for (
+          const pattern of patterns
+        ) {
+          const count =
+            source
+              .toLowerCase()
+              .split(
+                pattern
+              ).length - 1;
 
-  const routeSet =
-    new Set<string>();
+          if (
+            count > 0
+          ) {
+            patternHits[
+              pattern
+            ] = count;
+          }
+        }
 
-  const compactHits:
-    AnyObj[] = [];
+        const relativeEndpoints =
+          Array.from(
+            new Set(
+              (
+                source.match(
+                  /["'`]\/(?:api|app-api|sports-api|sports-betting|events|event|lines|live|sports)[^"'`]*/gi
+                ) || []
+              )
+                .map(
+                  value =>
+                    value.slice(
+                      1
+                    )
+                )
+                .slice(
+                  0,
+                  100
+                )
+            )
+          );
 
-  let fetched =
-    0;
-
-  let failed =
-    0;
-
-  let totalScriptBytes =
-    0;
-
-  for (
-    const result of
-      scriptResults
-  ) {
-    if (
-      result?.success
-    ) {
-      fetched++;
-
-      totalScriptBytes +=
-        Number(
-          result.chars ||
-          0
-        );
-
-      for (
-        const url of
-          result.absolute_urls ||
-          []
-      ) {
-        absoluteSet.add(
-          url
-        );
-
-        endpointSet.add(
-          url
-        );
-      }
-
-      for (
-        const endpoint of
-          result.relative_endpoints ||
-          []
-      ) {
-        relativeSet.add(
-          endpoint
-        );
-
-        endpointSet.add(
-          endpoint
-        );
-      }
-
-      for (
-        const route of
-          result.route_fragments ||
-          []
-      ) {
-        routeSet.add(
-          route
-        );
-
-        endpointSet.add(
-          route
-        );
-      }
-
-      if (
-        (
-          result.snippets ||
-          []
-        ).length > 0
-      ) {
-        compactHits.push({
-          src:
-            result.src,
-
-          pattern_hits:
-            result.pattern_hits,
-
-          snippets:
-            result.snippets
-        });
-      }
-    } else {
-      failed++;
-    }
-  }
-
-  // ==========================================================
-  // RANK ENDPOINTS
-  // ==========================================================
-
-  const endpointArray =
-    Array.from(
-      endpointSet
-    );
-
-  endpointArray.sort(
-    (a, b) => {
-      const scoreA =
-        endpointScore(a);
-
-      const scoreB =
-        endpointScore(b);
-
-      if (
-        scoreA !==
-        scoreB
-      ) {
-        return (
-          scoreB -
-          scoreA
-        );
-      }
-
-      return a.localeCompare(
-        b
-      );
-    }
-  );
-
-  // ==========================================================
-  // ONLY KEEP USEFUL SCRIPT RESULTS
-  // ==========================================================
-
-  const interestingScripts =
-    scriptResults
-      .filter(
-        x =>
-          x?.success &&
-          (
-            Object.keys(
-              x.pattern_hits ||
-              {}
-            ).length > 0 ||
-            (
-              x.absolute_urls ||
-              []
-            ).length > 0 ||
-            (
-              x.relative_endpoints ||
-              []
-            ).length > 0 ||
-            (
-              x.route_fragments ||
-              []
-            ).length > 0
-          )
-      )
-      .map(
-        x => ({
-          src:
-            x.src,
-
+        return {
+          src: url,
           chars:
-            x.chars,
-
+            source.length,
           analyzed_chars:
-            x.analyzed_chars,
-
+            source.length,
           truncated:
-            x.truncated,
-
+            false,
           elapsed_ms:
-            x.elapsed_ms,
-
+            result.elapsedMs,
           pattern_hits:
-            x.pattern_hits,
-
-          absolute_urls:
-            x.absolute_urls,
-
+            patternHits,
           relative_endpoints:
-            x.relative_endpoints,
-
-          route_fragments:
-            x.route_fragments
-        })
-      );
-
-  // ==========================================================
-  // FINAL RESULT
-  // ==========================================================
+            relativeEndpoints,
+        };
+      }
+    );
 
   return json({
     success: true,
@@ -1613,574 +1938,342 @@ async function diagnosticCloud0007JS(
         CLOUD0007_URL,
 
       page_timeout_ms:
-        CLOUD0007_TIMEOUT_MS,
+        CLOUD0007_PAGE_TIMEOUT_MS,
 
       js_timeout_ms:
         CLOUD0007_JS_TIMEOUT_MS,
 
       js_concurrency:
-        JS_CONCURRENCY,
+        CLOUD0007_JS_CONCURRENCY,
 
       scripts_found:
         scripts.length,
 
       scripts_fetched:
-        fetched,
+        results.filter(
+          (item: any) =>
+            item.status === 200
+        ).length,
 
       scripts_failed:
-        failed
+        results.filter(
+          (item: any) =>
+            item.status !== 200
+        ).length,
     },
 
     performance: {
       page_fetch_ms:
-        page.elapsed_ms,
+        page.elapsedMs,
 
       total_elapsed_ms:
         Date.now() -
         started,
 
       total_script_chars:
-        totalScriptBytes
+        results.reduce(
+          (
+            sum: number,
+            item: any
+          ) =>
+            sum +
+            (
+              item.chars ??
+              0
+            ),
+          0
+        ),
     },
 
     page: {
       http_status:
-        page.http_status,
+        page.response.status,
 
       content_type:
-        page.content_type,
+        page.response.headers.get(
+          "content-type"
+        ),
 
       final_url:
-        page.final_url,
-
-      redirected:
-        page.redirected,
+        page.finalUrl,
 
       html_chars:
-        page.html.length
-    },
-
-    discovery: {
-      candidate_endpoint_count:
-        endpointArray.length,
-
-      candidate_endpoints:
-        endpointArray.slice(
-          0,
-          MAX_ENDPOINTS
-        ),
-
-      absolute_api_like_urls:
-        Array.from(
-          absoluteSet
-        ).slice(
-          0,
-          MAX_ENDPOINTS
-        ),
-
-      relative_api_like_endpoints:
-        Array.from(
-          relativeSet
-        ).slice(
-          0,
-          MAX_ENDPOINTS
-        ),
-
-      route_fragments:
-        Array.from(
-          routeSet
-        ).slice(
-          0,
-          MAX_ENDPOINTS
-        )
+        page.text.length,
     },
 
     interesting_scripts:
-      interestingScripts,
-
-    script_hits:
-      compactHits.slice(
-        0,
-        MAX_TOTAL_SNIPPETS
-      ),
+      results
+        .filter(
+          (item: any) =>
+            Object.keys(
+              item.pattern_hits ??
+                {}
+            ).length >
+            0 ||
+            (
+              item.relative_endpoints ??
+                []
+            ).length >
+            0
+        )
+        .sort(
+          (
+            a: any,
+            b: any
+          ) =>
+            (
+              Object.keys(
+                b.pattern_hits ??
+                  {}
+              ).length +
+              (
+                b.relative_endpoints ??
+                  []
+              ).length
+            ) -
+            (
+              Object.keys(
+                a.pattern_hits ??
+                  {}
+              ).length +
+              (
+                a.relative_endpoints ??
+                  []
+              ).length
+            )
+        )
+        .slice(
+          0,
+          100
+        ),
 
     interpretation: {
       purpose:
-        "Inspect Cloud0007 Next.js JavaScript bundles to identify the real live-soccer data source.",
+        "Discover sports/live API endpoints used by Cloud0007 frontend JS.",
+
+      current_live_path:
+        "UNCHANGED",
 
       important:
-        "This diagnostic does NOT replace or modify /live.",
+        "This endpoint is diagnostic only and does not replace /live.",
 
       next_step:
-        endpointArray.length > 0
-          ? "Inspect candidate endpoints and snippets. The next version can test the strongest candidate directly."
-          : "No obvious API endpoint found in downloaded bundles. Next step is deeper inspection of Next.js runtime/chunks and network configuration."
+        "Use /diagnostic-cloud0007-api for focused request-context extraction.",
     },
-
-    timestamp:
-      nowISO()
   });
 }
 
 // ============================================================
-// EXISTING TARGET ODDS
+// DIRECT CLOUD0007 API PROBE
 // ============================================================
 
-const TARGET_MARKET =
-  "soccer.total_goals_period_first_half";
+async function probeCloud0007Path(
+  path: string
+): Promise<AnyObj> {
+  const started =
+    Date.now();
 
-const TARGET_SUBMARKET =
-  "period=1h";
+  const url =
+    `${CLOUD0007_ORIGIN}${path}`;
 
-const TARGET_OUTCOME =
-  "over";
+  const controller =
+    new AbortController();
 
-const TARGET_PARAMS =
-  "total=0.5";
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      CLOUD0007_JS_TIMEOUT_MS
+    );
 
-// ============================================================
-// EXACT TARGET ODDS EXTRACTION
-// ============================================================
-
-function extractTargetOdds(
-  event: AnyObj
-): AnyObj | null {
-  const markets =
-    event?.markets ??
-    event?.submarkets ??
-    event?.data?.markets ??
-    event?.data?.submarkets;
-
-  if (!markets) {
-    return null;
-  }
-
-  const candidates: AnyObj[] =
-    [];
-
-  function visit(
-    value: any,
-    parentMarket?: string,
-    parentSubmarket?: string
-  ) {
-    if (
-      value === null ||
-      value === undefined
-    ) {
-      return;
-    }
-
-    if (
-      Array.isArray(value)
-    ) {
-      for (
-        const item of value
-      ) {
-        visit(
-          item,
-          parentMarket,
-          parentSubmarket
-        );
-      }
-
-      return;
-    }
-
-    if (
-      typeof value !==
-      "object"
-    ) {
-      return;
-    }
-
-    const market =
-      String(
-        value.market ??
-        value.marketName ??
-        value.market_key ??
-        parentMarket ??
-        ""
-      );
-
-    const submarket =
-      String(
-        value.submarket ??
-        value.submarketName ??
-        value.submarket_key ??
-        parentSubmarket ??
-        ""
-      );
-
-    const outcome =
-      String(
-        value.outcome ??
-        value.side ??
-        ""
-      ).toLowerCase();
-
-    const params =
-      String(
-        value.params ??
-        value.parameters ??
-        ""
-      );
-
-    if (
-      market ===
-        TARGET_MARKET &&
-      submarket ===
-        TARGET_SUBMARKET &&
-      outcome ===
-        TARGET_OUTCOME &&
-      params ===
-        TARGET_PARAMS
-    ) {
-      candidates.push(
-        value
-      );
-    }
-
-    for (
-      const [
-        key,
-        child
-      ] of Object.entries(
-        value
-      )
-    ) {
-      if (
-        key ===
-          "market" ||
-        key ===
-          "submarket" ||
-        key ===
-          "outcome" ||
-        key ===
-          "params"
-      ) {
-        continue;
-      }
-
-      if (
-        child &&
-        typeof child ===
-          "object"
-      ) {
-        let nextMarket =
-          parentMarket;
-
-        let nextSubmarket =
-          parentSubmarket;
-
-        if (
-          !nextMarket &&
-          !Array.isArray(
-            value
-          )
-        ) {
-          if (
-            key ===
-            TARGET_MARKET
-          ) {
-            nextMarket =
-              key;
-          }
+  try {
+    const response =
+      await fetch(
+        url,
+        {
+          method: "GET",
+          redirect: "follow",
+          headers: {
+            "accept":
+              "application/json,text/plain,*/*",
+            "cache-control":
+              "no-cache",
+            "pragma":
+              "no-cache",
+            "user-agent":
+              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+            "referer":
+              CLOUD0007_URL,
+          },
+          signal:
+            controller.signal,
         }
+      );
 
-        if (
-          !nextSubmarket &&
-          key ===
-            TARGET_SUBMARKET
-        ) {
-          nextSubmarket =
-            key;
-        }
+    const text =
+      await response.text();
 
-        visit(
-          child,
-          nextMarket,
-          nextSubmarket
+    let parsed:
+      any = null;
+
+    try {
+      parsed =
+        JSON.parse(
+          text
         );
-      }
+    } catch {
+      parsed = null;
     }
-  }
 
-  visit(
-    markets
-  );
-
-  for (
-    const selection of
-      candidates
+    return {
+      path,
+      url,
+      status:
+        response.status,
+      ok:
+        response.ok,
+      elapsed_ms:
+        Date.now() -
+        started,
+      content_type:
+        response.headers.get(
+          "content-type"
+        ),
+      bytes:
+        new TextEncoder().encode(
+          text
+        ).length,
+      text_chars:
+        text.length,
+      json:
+        !!parsed,
+      top_level_type:
+        parsed === null
+          ? null
+          : Array.isArray(
+              parsed
+            )
+          ? "array"
+          : typeof parsed,
+      top_level_keys:
+        parsed &&
+        typeof parsed ===
+          "object" &&
+        !Array.isArray(
+          parsed
+        )
+          ? Object.keys(
+              parsed
+            ).slice(
+              0,
+              100
+            )
+          : [],
+      preview:
+        text.slice(
+          0,
+          1500
+        ),
+    };
+  } catch (
+    error
   ) {
-    const price =
-      finiteNumber(
-        selection.price ??
-        selection.odds ??
-        selection.raw_price
-      );
-
-    const maxStake =
-      finiteNumber(
-        selection.maxStake ??
-        selection.max_stake
-      );
-
-    const status =
-      String(
-        selection.status ??
-        ""
-      ).toUpperCase();
-
-    const enabled =
-      selection.enabled ===
-        undefined
-        ? true
-        : Boolean(
-            selection.enabled
-          );
-
-    const statusEnabled =
-      !status ||
-      status ===
-        "SELECTION_ENABLED" ||
-      status ===
-        "OPEN" ||
-      status ===
-        "TRADING" ||
-      status ===
-        "ACTIVE";
-
-    const stakeOk =
-      maxStake === null ||
-      maxStake > 0;
-
-    if (
-      enabled &&
-      statusEnabled &&
-      price !== null &&
-      price > 1 &&
-      stakeOk
-    ) {
-      return {
-        market:
-          TARGET_MARKET,
-
-        submarket:
-          TARGET_SUBMARKET,
-
-        outcome:
-          TARGET_OUTCOME,
-
-        params:
-          TARGET_PARAMS,
-
-        price,
-
-        raw_price:
-          selection.raw_price ??
-          null,
-
-        status:
-          selection.status ??
-          null,
-
-        maxStake:
-          selection.maxStake ??
-          null,
-
-        selection
-      };
-    }
+    return {
+      path,
+      url,
+      status: 0,
+      ok: false,
+      elapsed_ms:
+        Date.now() -
+        started,
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error),
+    };
+  } finally {
+    clearTimeout(
+      timer
+    );
   }
-
-  return null;
 }
 
 // ============================================================
-// LIVE EVENT DETECTION
+// CLOUD0007 ROUTE PROBE DIAGNOSTIC
 // ============================================================
 
-function isLiveEvent(
-  event: AnyObj
-): boolean {
-  if (
-    event?.live === true ||
-    event?.isLive === true ||
-    event?.inPlay === true ||
-    event?.in_play === true
-  ) {
-    return true;
-  }
+async function diagnosticCloud0007Routes():
+  Promise<Response> {
+  const started =
+    Date.now();
 
-  const status =
-    String(
-      event?.status ??
-      event?.eventStatus ??
-      event?.state ??
-      ""
-    ).toLowerCase();
+  const paths = [
+    "/sports-api/v6/sports",
+    "/sports-api/c/v6/sports",
+    "/sports-betting/v4/lines",
+    "/events",
+    "/live",
+    "/app-api/pulse/feed",
+    "/app-api/pulse/feed-version",
+  ];
 
-  return [
-    "live",
-    "inplay",
-    "in-play",
-    "started",
-    "trading_live"
-  ].includes(
-    status
-  );
+  const results =
+    await mapWithConcurrency(
+      paths,
+      4,
+      async path =>
+        probeCloud0007Path(
+          path
+        )
+    );
+
+  return json({
+    success: true,
+
+    worker:
+      "cloudbet-live-soccer-detector",
+
+    version:
+      VERSION,
+
+    action:
+      "DIAGNOSTIC_CLOUD0007_ROUTES",
+
+    read_only:
+      true,
+
+    current_live_path:
+      "UNCHANGED",
+
+    performance: {
+      total_elapsed_ms:
+        Date.now() -
+        started,
+    },
+
+    probes:
+      results,
+
+    interpretation: {
+      purpose:
+        "Read-only probe of discovered Cloud0007 sports/live routes.",
+
+      warning:
+        "A route returning HTML, 404 or an error does not by itself mean the route is invalid; some endpoints require parameters or authentication.",
+
+      next_step:
+        "Use the request context from /diagnostic-cloud0007-api to determine the exact frontend request.",
+    },
+  });
 }
 
 // ============================================================
-// EVENT EXTRACTION
-// ============================================================
-
-function extractLiveEvents(
-  data: any
-): AnyObj[] {
-  if (
-    Array.isArray(data)
-  ) {
-    return data;
-  }
-
-  if (
-    Array.isArray(
-      data?.events
-    )
-  ) {
-    return data.events;
-  }
-
-  if (
-    Array.isArray(
-      data?.data?.events
-    )
-  ) {
-    return data.data.events;
-  }
-
-  if (
-    Array.isArray(
-      data?.data?.data?.events
-    )
-  ) {
-    return data.data.data.events;
-  }
-
-  if (
-    Array.isArray(
-      data?.result?.events
-    )
-  ) {
-    return data.result.events;
-  }
-
-  if (
-    Array.isArray(
-      data?.items
-    )
-  ) {
-    return data.items;
-  }
-
-  if (
-    Array.isArray(
-      data?.data
-    )
-  ) {
-    return data.data;
-  }
-
-  return [];
-}
-
-// ============================================================
-// BUILD LIVE MATCH
-// ============================================================
-
-function buildLiveMatch(
-  event: AnyObj
-): AnyObj {
-  const home =
-    event?.home ??
-    event?.homeTeam ??
-    event?.participants?.[0] ??
-    null;
-
-  const away =
-    event?.away ??
-    event?.awayTeam ??
-    event?.participants?.[1] ??
-    null;
-
-  const homeName =
-    typeof home ===
-      "string"
-      ? home
-      : home?.name ??
-        home?.title ??
-        "";
-
-  const awayName =
-    typeof away ===
-      "string"
-      ? away
-      : away?.name ??
-        away?.title ??
-        "";
-
-  return {
-    id:
-      event?.id ??
-      event?.eventId ??
-      event?.event_id ??
-      null,
-
-    home:
-      homeName,
-
-    away:
-      awayName,
-
-    status:
-      event?.status ??
-      event?.eventStatus ??
-      event?.state ??
-      null,
-
-    live:
-      isLiveEvent(
-        event
-      ),
-
-    odds:
-      extractTargetOdds(
-        event
-      )
-  };
-}
-
-// ============================================================
-// CURRENT /LIVE IMPLEMENTATION
+// EXISTING /LIVE
 // ============================================================
 
 async function getLiveSoccerEvents(
   env: Env
-): Promise<{
-  events: AnyObj[];
-  elapsed_ms: number;
-  http_status: number;
-}> {
-  /*
-   * IMPORTANT:
-   *
-   * This is intentionally unchanged.
-   *
-   * V5.7.3 only diagnoses Cloud0007.
-   */
-
+): Promise<AnyObj> {
   const path =
     "/events?sport=soccer&live=true&players=false&limit=10000";
 
@@ -2196,31 +2289,46 @@ async function getLiveSoccerEvents(
     );
 
   const events =
-    extractLiveEvents(
+    extractEvents(
       data
     );
 
-  const live =
+  const liveEvents =
     events.filter(
       isLiveEvent
     );
 
   return {
+    request: {
+      path,
+      requests_made:
+        1,
+      elapsed_ms:
+        result.elapsedMs,
+      http_status:
+        result.response.status,
+    },
+
+    events_received:
+      events.length,
+
+    events_recognized_live:
+      liveEvents.length,
+
     events:
-      live.map(
+      liveEvents.map(
         buildLiveMatch
       ),
 
-    elapsed_ms:
-      result.elapsed_ms,
-
-    http_status:
-      result.response.status
+    raw_shape:
+      detectInterestingFields(
+        data
+      ),
   };
 }
 
 // ============================================================
-// /LIVE
+// ORIGINAL /LIVE HANDLER
 // ============================================================
 
 async function handleLive(
@@ -2250,46 +2358,13 @@ async function handleLive(
       read_only:
         true,
 
-      betting:
-        false,
-
-      request: {
-        path:
-          "/events?sport=soccer&live=true&players=false&limit=10000",
-
-        requests_made:
-          1
-      },
-
       performance: {
-        events_fetch_ms:
-          result.elapsed_ms,
-
         total_elapsed_ms:
           Date.now() -
           started,
-
-        http_status:
-          result.http_status
       },
 
-      result: {
-        live_events:
-          result.events.length,
-
-        target_1h_over_05_found:
-          result.events.filter(
-            x =>
-              x.odds !==
-              null
-          ).length,
-
-        events:
-          result.events
-      },
-
-      timestamp:
-        nowISO()
+      ...result,
     });
   } catch (
     error
@@ -2297,18 +2372,16 @@ async function handleLive(
     return json(
       {
         success: false,
-
         worker:
           "cloudbet-live-soccer-detector",
-
         version:
           VERSION,
-
         action:
           "LIVE",
-
         error:
-          String(error)
+          error instanceof Error
+            ? error.message
+            : String(error),
       },
       500
     );
@@ -2316,630 +2389,122 @@ async function handleLive(
 }
 
 // ============================================================
-// /DIAGNOSTIC-LIVE-EVENTS
+// /HEALTH
 // ============================================================
 
-async function diagnosticLiveEvents(
-  env: Env
-): Promise<Response> {
-  try {
-    const started =
-      Date.now();
-
-    const path =
-      "/events?sport=soccer&live=true&players=false&limit=10000";
-
-    const result =
-      await cloudbetFetch(
-        env,
-        path
-      );
-
-    const data =
-      await parseJSON(
-        result.response
-      );
-
-    const events =
-      extractLiveEvents(
-        data
-      );
-
-    const live =
-      events.filter(
-        isLiveEvent
-      );
-
-    const statuses:
-      Record<string, number> =
-      {};
-
-    for (
-      const event of
-        events
-    ) {
-      const status =
-        String(
-          event?.status ??
-          event?.eventStatus ??
-          event?.state ??
-          "UNKNOWN"
-        );
-
-      statuses[status] =
-        (
-          statuses[status] ||
-          0
-        ) + 1;
-    }
-
-    const built =
-      live.map(
-        buildLiveMatch
-      );
-
-    return json({
-      success: true,
-
-      worker:
-        "cloudbet-live-soccer-detector",
-
-      version:
-        VERSION,
-
-      action:
-        "DIAGNOSTIC_LIVE_EVENTS",
-
-      read_only:
-        true,
-
-      request: {
-        path,
-
-        requests_made:
-          1,
-
-        competition_requests_made:
-          0,
-
-        timeout_ms:
-          CLOUDBET_TIMEOUT_MS
-      },
-
-      performance: {
-        events_fetch_ms:
-          result.elapsed_ms,
-
-        total_elapsed_ms:
-          Date.now() -
-          started,
-
-        http_status:
-          result.response.status
-      },
-
-      result: {
-        events_received:
-          events.length,
-
-        events_recognized_live:
-          live.length,
-
-        statuses,
-
-        target_1h_over_05_found:
-          built.filter(
-            x =>
-              x.odds !==
-              null
-          ).length,
-
-        first_10:
-          built.slice(
-            0,
-            10
-          )
-      }
-    });
-  } catch (
-    error
-  ) {
-    return json(
-      {
-        success: false,
-
-        worker:
-          "cloudbet-live-soccer-detector",
-
-        version:
-          VERSION,
-
-        action:
-          "DIAGNOSTIC_LIVE_EVENTS",
-
-        error:
-          String(error)
-      },
-      500
-    );
-  }
+async function handleHealth():
+  Promise<Response> {
+  return json({
+    success: true,
+    worker:
+      "cloudbet-live-soccer-detector",
+    version:
+      VERSION,
+    mode:
+      "READ_ONLY",
+    betting:
+      false,
+    timestamp:
+      nowISO(),
+  });
 }
 
 // ============================================================
-// /DIAGNOSTIC-CLOUD0007
+// /ROOT
 // ============================================================
 
-async function diagnosticCloud0007(
-  request: Request
-): Promise<Response> {
-  const started =
-    Date.now();
-
-  try {
-    const page =
-      await fetchCloud0007Page();
-
-    const html =
-      page.html;
-
-    const nextDataMatch =
-      html.match(
-        /<script[^>]+id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/i
-      );
-
-    let nextData:
-      AnyObj | null =
-      null;
-
-    let nextDataParseable =
-      false;
-
-    let nextDataChars =
-      0;
-
-    if (
-      nextDataMatch
-    ) {
-      const raw =
-        nextDataMatch[1];
-
-      nextDataChars =
-        raw.length;
-
-      try {
-        nextData =
-          JSON.parse(
-            raw
-          );
-
-        nextDataParseable =
-          true;
-      } catch {
-        nextData =
-          null;
-      }
-    }
-
-    const applicationJsonCount =
-      (
-        html.match(
-          /<script[^>]+type=["']application\/json["'][^>]*>/gi
-        ) || []
-      ).length;
-
-    const scripts =
-      extractScriptUrls(
-        html,
-        page.final_url
-      );
-
-    const lower =
-      html.toLowerCase();
-
-    const possibleUrls =
-      extractAbsoluteUrls(
-        html
-      );
-
-    const signals = {
-      soccer:
-        lower.includes(
-          "soccer"
-        ),
-
-      football:
-        lower.includes(
-          "football"
-        ),
-
-      live:
-        lower.includes(
-          "live"
-        ),
-
-      cloudbet:
-        lower.includes(
-          "cloudbet"
-        ),
-
-      sports:
-        lower.includes(
-          "sports"
-        ),
-
-      events:
-        lower.includes(
-          "events"
-        ),
+async function handleRoot():
+  Promise<Response> {
+  return json({
+    success: true,
 
-      odds:
-        lower.includes(
-          "odds"
-        ),
-
-      trading_live:
-        lower.includes(
-          "trading_live"
-        ),
-
-      __next_data__:
-        Boolean(
-          nextDataMatch
-        ),
-
-      application_json:
-        applicationJsonCount >
-        0,
-
-      websocket:
-        /websocket/i.test(
-          html
-        ),
-
-      socket_io:
-        /socket\.io/i.test(
-          html
-        ),
-
-      graphql:
-        /graphql/i.test(
-          html
-        ),
-
-      api:
-        /\bapi\b/i.test(
-          html
-        )
-    };
-
-    return json({
-      success: true,
-
-      worker:
-        "cloudbet-live-soccer-detector",
-
-      version:
-        VERSION,
-
-      action:
-        "DIAGNOSTIC_CLOUD0007",
-
-      read_only:
-        true,
-
-      request: {
-        url:
-          CLOUD0007_URL,
-
-        method:
-          "GET",
-
-        requests_made:
-          1,
-
-        timeout_ms:
-          CLOUD0007_TIMEOUT_MS
-      },
-
-      performance: {
-        elapsed_ms:
-          page.elapsed_ms,
-
-        total_elapsed_ms:
-          Date.now() -
-          started,
-
-        http_status:
-          page.http_status,
-
-        content_type:
-          page.content_type,
-
-        response_bytes:
-          new TextEncoder().encode(
-            html
-          ).length,
-
-        html_chars:
-          html.length
-      },
-
-      page: {
-        final_url:
-          page.final_url,
-
-        redirected:
-          page.redirected,
-
-        title:
-          (
-            html.match(
-              /<title[^>]*>([\s\S]*?)<\/title>/i
-            )?.[1] ||
-            ""
-          ).trim(),
-
-        signals
-      },
-
-      embedded_data: {
-        next_data_present:
-          Boolean(
-            nextDataMatch
-          ),
-
-        next_data_chars:
-          nextDataChars,
-
-        next_data_parseable:
-          nextDataParseable,
-
-        next_data_type:
-          nextData === null
-            ? null
-            : Array.isArray(
-                nextData
-              )
-            ? "array"
-            : typeof nextData,
-
-        next_data_keys:
-          nextData &&
-          typeof nextData ===
-            "object"
-            ? Object.keys(
-                nextData
-              ).slice(
-                0,
-                100
-              )
-            : [],
-
-        application_json_script_count:
-          applicationJsonCount
-      },
-
-      scripts: {
-        count:
-          scripts.length,
-
-        first_30:
-          scripts.slice(
-            0,
-            30
-          )
-      },
-
-      possible_urls: {
-        count:
-          possibleUrls.length,
-
-        first_50:
-          possibleUrls.slice(
-            0,
-            50
-          )
-      },
-
-      html_analysis: {
-        contains_event_word:
-          /\bevent/i.test(
-            html
-          ),
-
-        contains_odds_word:
-          /\bodds/i.test(
-            html
-          ),
-
-        contains_live_word:
-          /\blive/i.test(
-            html
-          ),
-
-        contains_api_reference:
-          /\bapi\b/i.test(
-            html
-          )
-      },
-
-      interpretation: {
-        purpose:
-          "Compact inspection of the Cloud0007 Live Soccer page.",
-
-        current_live_path:
-          "UNCHANGED",
-
-        no_html_dump:
-          true,
-
-        next_step:
-          "Use /diagnostic-cloud0007-js to inspect Next.js JavaScript bundles and discover the actual data API."
-      }
-    });
-  } catch (
-    error
-  ) {
-    return json(
-      {
-        success: false,
-
-        worker:
-          "cloudbet-live-soccer-detector",
-
-        version:
-          VERSION,
-
-        action:
-          "DIAGNOSTIC_CLOUD0007",
-
-        error:
-          String(error)
-      },
-      502
-    );
-  }
+    worker:
+      "cloudbet-live-soccer-detector",
+
+    version:
+      VERSION,
+
+    mode:
+      "READ_ONLY",
+
+    betting:
+      false,
+
+    endpoints: {
+      "/":
+        "worker info",
+
+      "/health":
+        "health",
+
+      "/live":
+        "direct Cloudbet live soccer",
+
+      "/diagnostic-cloud0007":
+        "Cloud0007 live page diagnostic",
+
+      "/diagnostic-cloud0007-js":
+        "Cloud0007 JavaScript endpoint discovery",
+
+      "/diagnostic-cloud0007-api":
+        "Focused API-call context from JS bundles",
+
+      "/diagnostic-cloud0007-routes":
+        "Read-only probe of discovered Cloud0007 routes",
+
+      "/search":
+        "Cloudbet competition search",
+
+      "/event":
+        "Cloudbet event lookup",
+    },
+
+    target: {
+      market:
+        TARGET_MARKET,
+
+      submarket:
+        TARGET_SUBMARKET,
+
+      outcome:
+        TARGET_OUTCOME,
+
+      params:
+        TARGET_PARAMS,
+    },
+  });
 }
 
 // ============================================================
-// ENDPOINT SCORE
-// ============================================================
-
-function endpointScore(
-  endpoint: string
-): number {
-  const s =
-    endpoint.toLowerCase();
-
-  let score = 0;
-
-  if (
-    s.startsWith(
-      "https://sports-api."
-    )
-  ) {
-    score += 100;
-  }
-
-  if (
-    s.includes(
-      "/api/"
-    )
-  ) {
-    score += 50;
-  }
-
-  if (
-    s.includes(
-      "/events"
-    )
-  ) {
-    score += 45;
-  }
-
-  if (
-    s.includes(
-      "/odds"
-    )
-  ) {
-    score += 40;
-  }
-
-  if (
-    s.includes(
-      "inplay"
-    ) ||
-    s.includes(
-      "in-play"
-    )
-  ) {
-    score += 40;
-  }
-
-  if (
-    s.includes(
-      "/live"
-    )
-  ) {
-    score += 35;
-  }
-
-  if (
-    s.includes(
-      "/markets"
-    )
-  ) {
-    score += 25;
-  }
-
-  if (
-    s.includes(
-      "/feed"
-    )
-  ) {
-    score += 20;
-  }
-
-  if (
-    s.includes(
-      "wss://"
-    )
-  ) {
-    score += 30;
-  }
-
-  if (
-    s.includes(
-      "graphql"
-    )
-  ) {
-    score += 25;
-  }
-
-  return score;
-}
-
-// ============================================================
-// SEARCH ENDPOINT
+// /SEARCH
 // ============================================================
 
 async function handleSearch(
   env: Env,
   request: Request
 ): Promise<Response> {
-  /*
-   * Keep this route intentionally lightweight.
-   *
-   * It is not part of the Cloud0007 investigation.
-   */
-
   const url =
     new URL(
       request.url
     );
 
   const q =
-    url.searchParams.get(
-      "q"
-    ) ||
-    "";
+    (
+      url.searchParams.get(
+        "q"
+      ) ??
+      ""
+    ).trim();
 
-  if (!q.trim()) {
-    return json({
-      success: false,
-
-      worker:
-        "cloudbet-live-soccer-detector",
-
-      version:
-        VERSION,
-
-      action:
-        "SEARCH",
-
-      error:
-        "Missing ?q="
-    }, 400);
+  if (!q) {
+    return json(
+      {
+        success: false,
+        error:
+          "Missing q",
+      },
+      400
+    );
   }
 
   return json({
@@ -2961,7 +2526,7 @@ async function handleSearch(
       q,
 
     note:
-      "Use the existing matcher/search implementation for competition-level discovery."
+      "Competition scan/search logic remains unchanged in V5.7.4.",
   });
 }
 
@@ -2979,103 +2544,38 @@ async function handleEvent(
     );
 
   const id =
-    url.searchParams.get(
-      "id"
-    );
+    (
+      url.searchParams.get(
+        "id"
+      ) ??
+      ""
+    ).trim();
 
   if (!id) {
-    return json({
-      success: false,
-
-      worker:
-        "cloudbet-live-soccer-detector",
-
-      version:
-        VERSION,
-
-      action:
-        "EVENT",
-
-      error:
-        "Missing ?id="
-    }, 400);
-  }
-
-  try {
-    const path =
-      `/events/${encodeURIComponent(id)}`;
-
-    const result =
-      await cloudbetFetch(
-        env,
-        path
-      );
-
-    const data =
-      await parseJSON(
-        result.response
-      );
-
-    return json({
-      success:
-        result.response.ok,
-
-      worker:
-        "cloudbet-live-soccer-detector",
-
-      version:
-        VERSION,
-
-      action:
-        "EVENT",
-
-      read_only:
-        true,
-
-      request: {
-        path,
-
-        http_status:
-          result.response.status,
-
-        elapsed_ms:
-          result.elapsed_ms
-      },
-
-      result:
-        data
-    });
-  } catch (
-    error
-  ) {
     return json(
       {
         success: false,
-
-        worker:
-          "cloudbet-live-soccer-detector",
-
-        version:
-          VERSION,
-
-        action:
-          "EVENT",
-
         error:
-          String(error)
+          "Missing id",
       },
-      500
+      400
     );
   }
-}
 
-// ============================================================
-// HEALTH
-// ============================================================
+  const result =
+    await cloudbetFetch(
+      env,
+      `/events/${encodeURIComponent(id)}`
+    );
 
-async function handleHealth(): Promise<Response> {
+  const data =
+    await parseJSON(
+      result.response
+    );
+
   return json({
-    success: true,
+    success:
+      result.response.ok,
 
     worker:
       "cloudbet-live-soccer-detector",
@@ -3083,79 +2583,32 @@ async function handleHealth(): Promise<Response> {
     version:
       VERSION,
 
-    mode:
-      "READ_ONLY",
+    action:
+      "EVENT",
 
-    betting:
-      false,
-
-    cloud0007_diagnostic:
+    read_only:
       true,
 
-    timestamp:
-      nowISO()
-  });
-}
-
-// ============================================================
-// ROOT
-// ============================================================
-
-async function handleRoot(): Promise<Response> {
-  return json({
-    success: true,
-
-    worker:
-      "cloudbet-live-soccer-detector",
-
-    version:
-      VERSION,
-
-    mode:
-      "READ_ONLY",
-
-    betting:
-      false,
-
-    endpoints: [
-      "/",
-      "/health",
-      "/live",
-      "/event?id=...",
-      "/search?q=...",
-      "/diagnostic-live-events",
-      "/diagnostic-cloud0007",
-      "/diagnostic-cloud0007-js"
-    ],
-
-    target: {
-      market:
-        TARGET_MARKET,
-
-      submarket:
-        TARGET_SUBMARKET,
-
-      outcome:
-        TARGET_OUTCOME,
-
-      params:
-        TARGET_PARAMS
+    request: {
+      id,
+      elapsed_ms:
+        result.elapsedMs,
+      http_status:
+        result.response.status,
     },
 
-    important:
-      "V5.7.3 adds JavaScript-bundle discovery only. /live remains unchanged."
+    data,
   });
 }
 
 // ============================================================
-// MAIN FETCH
+// FETCH ROUTER
 // ============================================================
 
 export default {
   async fetch(
     request: Request,
-    env: Env,
-    ctx: ExecutionContext
+    env: Env
   ): Promise<Response> {
     const url =
       new URL(
@@ -3165,128 +2618,81 @@ export default {
     const pathname =
       url.pathname;
 
-    // --------------------------------------------------------
-    // ROOT
-    // --------------------------------------------------------
-
-    if (
-      pathname === "/" ||
-      pathname === ""
-    ) {
-      return handleRoot();
-    }
-
-    // --------------------------------------------------------
-    // HEALTH
-    // --------------------------------------------------------
-
-    if (
-      pathname ===
-      "/health"
-    ) {
-      return handleHealth();
-    }
-
-    // --------------------------------------------------------
-    // LIVE
-    // --------------------------------------------------------
-
-    if (
-      pathname ===
-      "/live"
-    ) {
-      return handleLive(
-        env
-      );
-    }
-
-    // --------------------------------------------------------
-    // EVENT
-    // --------------------------------------------------------
-
-    if (
-      pathname ===
-      "/event"
-    ) {
-      return handleEvent(
-        env,
-        request
-      );
-    }
-
-    // --------------------------------------------------------
-    // SEARCH
-    // --------------------------------------------------------
-
-    if (
-      pathname ===
-      "/search"
-    ) {
-      return handleSearch(
-        env,
-        request
-      );
-    }
-
-    // --------------------------------------------------------
-    // EXISTING CLOUD0007 HTML DIAGNOSTIC
-    // --------------------------------------------------------
-
-    if (
-      pathname ===
-      "/diagnostic-cloud0007"
-    ) {
-      return diagnosticCloud0007(
-        request
-      );
-    }
-
-    // --------------------------------------------------------
-    // NEW V5.7.3 JS BUNDLE DIAGNOSTIC
-    // --------------------------------------------------------
-
-    if (
-      pathname ===
-      "/diagnostic-cloud0007-js"
-    ) {
-      return diagnosticCloud0007JS(
-        request
-      );
-    }
-
-    // --------------------------------------------------------
-    // EXISTING DIRECT EVENTS DIAGNOSTIC
-    // --------------------------------------------------------
-
-    if (
-      pathname ===
-      "/diagnostic-live-events"
-    ) {
-      return diagnosticLiveEvents(
-        env
-      );
-    }
-
-    // --------------------------------------------------------
-    // 404
-    // --------------------------------------------------------
-
-    return json(
-      {
-        success: false,
-
-        worker:
-          "cloudbet-live-soccer-detector",
-
-        version:
-          VERSION,
-
-        error:
-          "NOT_FOUND",
-
+    try {
+      switch (
         pathname
-      },
-      404
-    );
-  }
+      ) {
+        case "/":
+          return handleRoot();
+
+        case "/health":
+          return handleHealth();
+
+        case "/live":
+          return handleLive(
+            env
+          );
+
+        case "/search":
+          return handleSearch(
+            env,
+            request
+          );
+
+        case "/event":
+          return handleEvent(
+            env,
+            request
+          );
+
+        case "/diagnostic-cloud0007":
+          return diagnosticCloud0007();
+
+        case "/diagnostic-cloud0007-js":
+          return diagnosticCloud0007JS();
+
+        case "/diagnostic-cloud0007-api":
+          return diagnosticCloud0007API();
+
+        case "/diagnostic-cloud0007-routes":
+          return diagnosticCloud0007Routes();
+
+        default:
+          return json(
+            {
+              success: false,
+              worker:
+                "cloudbet-live-soccer-detector",
+              version:
+                VERSION,
+              error:
+                "NOT_FOUND",
+              path:
+                pathname,
+            },
+            404
+          );
+      }
+    } catch (
+      error
+    ) {
+      return json(
+        {
+          success: false,
+
+          worker:
+            "cloudbet-live-soccer-detector",
+
+          version:
+            VERSION,
+
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error),
+        },
+        500
+      );
+    }
+  },
 };
