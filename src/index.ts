@@ -1,22 +1,28 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.5
+// CLOUDBET LIVE SOCCER DETECTOR V5.6
 //
-// V5.5:
-// - /live BEHAVIOR UNCHANGED
-// - Competition concurrency remains 24
-// - Full soccer competition scan
-// - No early stop
-// - No odds/matcher changes
+// V5.6:
+// - NEW FAST LIVE PATH
+// - /live now uses Cloudbet /events endpoint
+// - 1 Cloudbet request instead of ~186 competition requests
+// - sport=soccer
+// - live=true
+// - players=false
+// - limit=10000
 //
-// NEW:
+// PRESERVED:
+// - READ ONLY
+// - betting disabled
+// - exact 1H OVER 0.5 odds detection
+// - /search
+// - /event
+// - /health
 // - /diagnostic-soccer
-// - Makes ONLY ONE request to /sports/soccer
-// - Does NOT scan individual competitions
-// - Inspects the returned competition structure
-// - Looks for fields that may allow future LIVE filtering
-// - Does NOT modify /live
 //
-// READ ONLY
+// IMPORTANT:
+// - No matcher changes
+// - No odds target changes
+// - No betting
 // ============================================================
 
 interface Env {
@@ -30,32 +36,48 @@ const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
 const VERSION =
-  "V5.5";
+  "V5.6";
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
 
-// IMPORTANT:
-// V5.4 tested 48 and it was worse.
-// Keep the proven V5.3/V5.4 baseline.
+// Kept for /search compatibility.
+// /live no longer uses competition concurrency.
 const COMPETITION_CONCURRENCY =
   24;
 
 // ============================================================
-// TYPES
+// EXACT TARGET
+// ============================================================
+
+const TARGET_MARKET =
+  "soccer.total_goals_period_first_half";
+
+const TARGET_SUBMARKET =
+  "period=1h";
+
+const TARGET_OUTCOME =
+  "over";
+
+const TARGET_PARAMS =
+  "total=0.5";
+
+// ============================================================
+// BASIC TYPES
 // ============================================================
 
 type AnyObj =
   Record<string, any>;
 
 // ============================================================
-// BASIC HELPERS
+// JSON RESPONSE
 // ============================================================
 
 function json(
   data: AnyObj,
   status = 200
 ): Response {
+
   return new Response(
     JSON.stringify(
       data,
@@ -64,9 +86,11 @@ function json(
     ),
     {
       status,
+
       headers: {
         "content-type":
           "application/json; charset=utf-8",
+
         "cache-control":
           "no-store"
       }
@@ -74,17 +98,29 @@ function json(
   );
 }
 
+// ============================================================
+// TIME
+// ============================================================
+
 function nowISO(): string {
   return new Date().toISOString();
 }
 
+// ============================================================
+// NUMBER
+// ============================================================
+
 function finiteNumber(
   value: any
 ): number | null {
+
+  const number =
+    Number(value);
+
   return Number.isFinite(
-    Number(value)
+    number
   )
-    ? Number(value)
+    ? number
     : null;
 }
 
@@ -121,6 +157,7 @@ async function cloudbetFetch(
       env[API_KEY_NAME as keyof Env];
 
     if (!apiKey) {
+
       throw new Error(
         `${API_KEY_NAME} is not configured`
       );
@@ -130,11 +167,13 @@ async function cloudbetFetch(
       await fetch(
         `${API_BASE}${path}`,
         {
-          method: "GET",
+          method:
+            "GET",
 
           headers: {
             "accept":
               "application/json",
+
             "x-api-key":
               apiKey
           },
@@ -152,20 +191,25 @@ async function cloudbetFetch(
 
     return {
       response,
+
       text,
+
       elapsed_ms:
-        Date.now() - started
+        Date.now() -
+        started
     };
 
   } catch (error: any) {
 
     const elapsed =
-      Date.now() - started;
+      Date.now() -
+      started;
 
     if (
       error?.name ===
       "AbortError"
     ) {
+
       throw new Error(
         `Cloudbet request timed out after ${timeoutMs}ms: ${path}`
       );
@@ -187,7 +231,7 @@ async function cloudbetFetch(
 }
 
 // ============================================================
-// PARSE JSON
+// JSON PARSER
 // ============================================================
 
 function parseJSON(
@@ -206,16 +250,11 @@ function parseJSON(
     throw new Error(
       `Invalid JSON from Cloudbet: ${path}`
     );
-
   }
 }
 
 // ============================================================
-// GET SOCCER CATEGORIES
-// ============================================================
-//
-// This is the same discovery request used by /live.
-// V5.5 does NOT change it.
+// /sports/soccer
 // ============================================================
 
 async function getSoccerData(
@@ -259,170 +298,67 @@ async function getSoccerData(
 }
 
 // ============================================================
-// COMPETITION EXTRACTION
-// ============================================================
-//
-// Cloudbet structures can change slightly.
-// We intentionally inspect common structures without
-// changing /live logic.
+// DIAGNOSTIC: /sports/soccer
 // ============================================================
 
-function findCompetitionArrays(
-  root: AnyObj
-): Array<{
-  path: string;
-  value: any[];
-}> {
+function flattenSoccerCompetitions(
+  data: AnyObj
+): AnyObj[] {
 
-  const found: Array<{
-    path: string;
-    value: any[];
-  }> = [];
+  const result:
+    AnyObj[] = [];
 
-  const visited =
-    new Set<any>();
+  const categories =
+    Array.isArray(
+      data?.categories
+    )
+      ? data.categories
+      : [];
 
-  function walk(
-    value: any,
-    path: string,
-    depth: number
+  for (
+    const category of categories
   ) {
 
-    if (
-      value === null ||
-      value === undefined ||
-      depth > 6
-    ) {
-      return;
-    }
+    const competitions =
+      Array.isArray(
+        category?.competitions
+      )
+        ? category.competitions
+        : [];
 
-    if (
-      typeof value !==
-      "object"
-    ) {
-      return;
-    }
-
-    if (
-      visited.has(value)
-    ) {
-      return;
-    }
-
-    visited.add(
-      value
-    );
-
-    if (
-      Array.isArray(value)
+    for (
+      const competition of competitions
     ) {
 
       if (
-        value.length > 0
+        competition &&
+        typeof competition ===
+          "object"
       ) {
 
-        const sample =
-          value
-            .slice(0, 10)
-            .filter(
-              x =>
-                x &&
-                typeof x ===
-                  "object" &&
-                !Array.isArray(x)
-            );
+        result.push(
+          {
+            ...competition,
 
-        if (
-          sample.length > 0
-        ) {
+            category_name:
+              category?.name ??
+              null,
 
-          const looksLikeCompetition =
-            sample.some(
-              item =>
-                [
-                  "competition",
-                  "competitionKey",
-                  "key",
-                  "eventCount",
-                  "events",
-                  "name",
-                  "sport"
-                ].some(
-                  key =>
-                    Object.prototype.hasOwnProperty.call(
-                      item,
-                      key
-                    )
-                )
-            );
-
-          if (
-            looksLikeCompetition
-          ) {
-
-            found.push({
-              path,
-              value
-            });
+            category_key:
+              category?.key ??
+              null
           }
-        }
-      }
-
-      value
-        .slice(0, 2000)
-        .forEach(
-          (
-            item,
-            index
-          ) =>
-            walk(
-              item,
-              `${path}[${index}]`,
-              depth + 1
-            )
         );
-
-      return;
-    }
-
-    for (
-      const [
-        key,
-        child
-      ] of Object.entries(
-        value
-      )
-    ) {
-
-      walk(
-        child,
-        path
-          ? `${path}.${key}`
-          : key,
-        depth + 1
-      );
+      }
     }
   }
 
-  walk(
-    root,
-    "",
-    0
-  );
-
-  return found;
+  return result;
 }
-
-// ============================================================
-// OBJECT KEY INVENTORY
-// ============================================================
 
 function collectKeys(
   items: any[]
-): Record<
-  string,
-  number
-> {
+): Record<string, number> {
 
   const counts:
     Record<string, number> =
@@ -454,10 +390,6 @@ function collectKeys(
 
   return counts;
 }
-
-// ============================================================
-// FIELD VALUE SAMPLE
-// ============================================================
 
 function sampleFieldValues(
   items: any[],
@@ -496,14 +428,18 @@ function sampleFieldValues(
     const value =
       item[key];
 
-    let signature: string;
+    let signature:
+      string;
 
     try {
+
       signature =
         JSON.stringify(
           value
         );
+
     } catch {
+
       signature =
         String(value);
     }
@@ -525,7 +461,8 @@ function sampleFieldValues(
     );
 
     if (
-      values.length >= max
+      values.length >=
+      max
     ) {
       break;
     }
@@ -533,10 +470,6 @@ function sampleFieldValues(
 
   return values;
 }
-
-// ============================================================
-// POSSIBLE LIVE-RELATED FIELDS
-// ============================================================
 
 function detectInterestingFields(
   items: any[]
@@ -591,11 +524,10 @@ function detectInterestingFields(
       patterns.some(
         pattern =>
           normalized.includes(
-            pattern
-              .replace(
-                /[^a-z0-9]/g,
-                ""
-              )
+            pattern.replace(
+              /[^a-z0-9]/g,
+              ""
+            )
           )
       );
 
@@ -620,23 +552,6 @@ function detectInterestingFields(
 
   return interesting;
 }
-
-// ============================================================
-// /diagnostic-soccer
-// ============================================================
-//
-// IMPORTANT:
-//
-// This endpoint DOES NOT call /competitions/{key}.
-//
-// It only calls:
-//
-//     /sports/soccer
-//
-// Therefore it is safe to use for discovering whether the
-// soccer discovery response itself contains enough information
-// to filter competitions before the expensive 186 requests.
-// ============================================================
 
 async function diagnosticSoccer(
   env: Env
@@ -674,16 +589,9 @@ async function diagnosticSoccer(
         action:
           "DIAGNOSTIC_SOCCER",
 
-        path:
-          "/sports/soccer",
-
         error:
           error?.message ||
           String(error),
-
-        elapsed_ms:
-          Date.now() -
-          started,
 
         timestamp:
           nowISO()
@@ -692,242 +600,15 @@ async function diagnosticSoccer(
     );
   }
 
-  const data =
-    soccer.data;
-
-  const arrays =
-    findCompetitionArrays(
-      data
-    );
-
-  // Pick the largest plausible competition array.
-  let selected:
-    {
-      path: string;
-      value: any[];
-    } | null =
-      null;
-
-  for (
-    const candidate of arrays
-  ) {
-
-    if (
-      !selected ||
-      candidate.value.length >
-        selected.value.length
-    ) {
-      selected =
-        candidate;
-    }
-  }
-
   const competitions =
-    selected?.value || [];
-
-  const topLevelKeys =
-    Object.keys(
-      data || {}
+    flattenSoccerCompetitions(
+      soccer.data
     );
 
-  const competitionKeys =
+  const keys =
     collectKeys(
       competitions
     );
-
-  const interestingFields =
-    detectInterestingFields(
-      competitions
-    );
-
-  // ----------------------------------------------------------
-  // Detect numeric event-count-like fields
-  // ----------------------------------------------------------
-
-  const countFields:
-    Record<
-      string,
-      {
-        present: number;
-        nonzero: number;
-        zero: number;
-        values: any[];
-      }
-    > = {};
-
-  for (
-    const key of Object.keys(
-      competitionKeys
-    )
-  ) {
-
-    const normalized =
-      key
-        .toLowerCase()
-        .replace(
-          /[^a-z0-9]/g,
-          ""
-        );
-
-    if (
-      !(
-        normalized.includes(
-          "count"
-        ) ||
-        normalized.includes(
-          "event"
-        ) ||
-        normalized.includes(
-          "live"
-        )
-      )
-    ) {
-      continue;
-    }
-
-    let nonzero =
-      0;
-
-    let zero =
-      0;
-
-    for (
-      const item of competitions
-    ) {
-
-      if (
-        !item ||
-        typeof item !==
-          "object"
-      ) {
-        continue;
-      }
-
-      if (
-        !Object.prototype.hasOwnProperty.call(
-          item,
-          key
-        )
-      ) {
-        continue;
-      }
-
-      const value =
-        Number(
-          item[key]
-        );
-
-      if (
-        Number.isFinite(
-          value
-        )
-      ) {
-
-        if (
-          value > 0
-        ) {
-          nonzero++;
-        } else {
-          zero++;
-        }
-      }
-    }
-
-    countFields[key] = {
-      present:
-        competitionKeys[key],
-
-      nonzero,
-
-      zero,
-
-      values:
-        sampleFieldValues(
-          competitions,
-          key,
-          20
-        )
-    };
-  }
-
-  // ----------------------------------------------------------
-  // Compact sample of the first competitions
-  // ----------------------------------------------------------
-
-  const sample =
-    competitions
-      .slice(
-        0,
-        10
-      )
-      .map(
-        (item: AnyObj) => {
-
-          if (
-            !item ||
-            typeof item !==
-              "object"
-          ) {
-            return item;
-          }
-
-          const output:
-            AnyObj = {};
-
-          for (
-            const [
-              key,
-              value
-            ] of Object.entries(
-              item
-            )
-          ) {
-
-            // Keep diagnostic output useful,
-            // but avoid dumping huge nested arrays.
-            if (
-              Array.isArray(
-                value
-              )
-            ) {
-
-              output[key] = {
-                type:
-                  "array",
-
-                length:
-                  value.length
-              };
-
-            } else if (
-              value &&
-              typeof value ===
-                "object"
-            ) {
-
-              output[key] = {
-                type:
-                  "object",
-
-                keys:
-                  Object.keys(
-                    value
-                  ).slice(
-                    0,
-                    50
-                  )
-              };
-
-            } else {
-
-              output[key] =
-                value;
-            }
-          }
-
-          return output;
-        }
-      );
 
   return json(
     {
@@ -978,34 +659,16 @@ async function diagnosticSoccer(
       response_structure: {
 
         top_level_type:
-          Array.isArray(data)
+          Array.isArray(
+            soccer.data
+          )
             ? "array"
-            : typeof data,
+            : typeof soccer.data,
 
         top_level_keys:
-          topLevelKeys,
-
-        candidate_competition_arrays:
-          arrays.map(
-            item => ({
-              path:
-                item.path,
-
-              length:
-                item.value.length
-            })
-          ),
-
-        selected_competition_array:
-          selected
-            ? {
-                path:
-                  selected.path,
-
-                length:
-                  selected.value.length
-              }
-            : null
+          Object.keys(
+            soccer.data || {}
+          )
       },
 
       competitions: {
@@ -1014,33 +677,267 @@ async function diagnosticSoccer(
           competitions.length,
 
         key_presence:
-          competitionKeys,
-
-        count_fields:
-          countFields,
+          keys,
 
         interesting_fields:
-          interestingFields
+          detectInterestingFields(
+            competitions
+          )
       },
 
-      sample_first_10:
-        sample,
+      sample_first_20:
+        competitions.slice(
+          0,
+          20
+        ),
 
       interpretation: {
-        purpose:
-          "Determine whether /sports/soccer already exposes enough information to safely filter competitions before the expensive per-competition requests.",
 
-        important:
-          "This diagnostic does NOT change /live and does NOT filter any competitions.",
+        live_filter_available:
+          false,
+
+        reason:
+          "The /sports/soccer competition objects expose eventCount but no reliable live-event count/status field.",
 
         next_step:
-          "If a reliable live-related field exists here, we can test a filtered /live strategy separately."
+          "Use Cloudbet /events?sport=soccer&live=true instead of scanning every competition."
       },
 
       timestamp:
         nowISO()
     }
   );
+}
+
+// ============================================================
+// COMPETITION KEY
+// ============================================================
+
+function getCompetitionKey(
+  competition: AnyObj
+): string | null {
+
+  const candidates =
+    [
+      competition?.key,
+
+      competition?.competitionKey,
+
+      competition?.competition,
+
+      competition?.id
+    ];
+
+  for (
+    const value of candidates
+  ) {
+
+    if (
+      typeof value ===
+        "string" &&
+      value.trim()
+    ) {
+
+      return value.trim();
+    }
+  }
+
+  return null;
+}
+
+// ============================================================
+// COMPETITION EXTRACTION
+// ============================================================
+
+function extractCompetitionsForLive(
+  data: AnyObj
+): AnyObj[] {
+
+  const categories =
+    Array.isArray(
+      data?.categories
+    )
+      ? data.categories
+      : [];
+
+  const result:
+    AnyObj[] = [];
+
+  for (
+    const category of categories
+  ) {
+
+    const competitions =
+      Array.isArray(
+        category?.competitions
+      )
+        ? category.competitions
+        : [];
+
+    for (
+      const competition of competitions
+    ) {
+
+      if (
+        competition &&
+        typeof competition ===
+          "object"
+      ) {
+
+        result.push(
+          competition
+        );
+      }
+    }
+  }
+
+  return result;
+}
+
+// ============================================================
+// EVENTS EXTRACTION FROM COMPETITION
+// ============================================================
+
+function extractEvents(
+  data: AnyObj
+): AnyObj[] {
+
+  if (
+    Array.isArray(data)
+  ) {
+
+    return data;
+  }
+
+  const possible =
+    [
+      data?.events,
+
+      data?.data?.events,
+
+      data?.competition?.events,
+
+      data?.result?.events
+    ];
+
+  for (
+    const value of possible
+  ) {
+
+    if (
+      Array.isArray(value)
+    ) {
+
+      return value;
+    }
+  }
+
+  return [];
+}
+
+// ============================================================
+// COMPETITION FETCH
+// ============================================================
+
+async function fetchCompetition(
+  env: Env,
+  competition: AnyObj
+): Promise<{
+  competition: AnyObj;
+  elapsed_ms: number;
+  success: boolean;
+  error?: string;
+  events: AnyObj[];
+}> {
+
+  const key =
+    getCompetitionKey(
+      competition
+    );
+
+  if (!key) {
+
+    return {
+      competition,
+
+      elapsed_ms:
+        0,
+
+      success:
+        false,
+
+      error:
+        "Competition key not found",
+
+      events:
+        []
+    };
+  }
+
+  const started =
+    Date.now();
+
+  try {
+
+    const result =
+      await cloudbetFetch(
+        env,
+        `/competitions/${encodeURIComponent(
+          key
+        )}`
+      );
+
+    if (
+      !result.response.ok
+    ) {
+
+      throw new Error(
+        `HTTP ${result.response.status}`
+      );
+    }
+
+    const data =
+      parseJSON(
+        result.text,
+        `/competitions/${key}`
+      );
+
+    return {
+      competition,
+
+      elapsed_ms:
+        Date.now() -
+        started,
+
+      success:
+        true,
+
+      events:
+        extractEvents(
+          data
+        )
+    };
+
+  } catch (error: any) {
+
+    return {
+      competition,
+
+      elapsed_ms:
+        Date.now() -
+        started,
+
+      success:
+        false,
+
+      error:
+        error?.message ||
+        String(error),
+
+      events:
+        []
+    };
+  }
 }
 
 // ============================================================
@@ -1107,195 +1004,6 @@ async function mapWithConcurrency<T, R>(
 }
 
 // ============================================================
-// COMPETITION EXTRACTION FOR /LIVE
-// ============================================================
-//
-// This keeps the normal /live path separate from the new
-// diagnostic endpoint.
-// ============================================================
-
-function extractCompetitionsForLive(
-  data: AnyObj
-): AnyObj[] {
-
-  const candidates:
-    any[][] = [];
-
-  function walk(
-    value: any,
-    depth: number
-  ) {
-
-    if (
-      value === null ||
-      value === undefined ||
-      depth > 5
-    ) {
-      return;
-    }
-
-    if (
-      typeof value !==
-      "object"
-    ) {
-      return;
-    }
-
-    if (
-      Array.isArray(value)
-    ) {
-
-      if (
-        value.length > 0
-      ) {
-
-        const sample =
-          value
-            .slice(0, 5)
-            .filter(
-              x =>
-                x &&
-                typeof x ===
-                  "object" &&
-                !Array.isArray(x)
-            );
-
-        if (
-          sample.some(
-            item =>
-              Object.prototype.hasOwnProperty.call(
-                item,
-                "eventCount"
-              ) ||
-              Object.prototype.hasOwnProperty.call(
-                item,
-                "competition"
-              ) ||
-              Object.prototype.hasOwnProperty.call(
-                item,
-                "key"
-              )
-          )
-        ) {
-
-          candidates.push(
-            value
-          );
-        }
-      }
-
-      for (
-        const item of value
-      ) {
-
-        walk(
-          item,
-          depth + 1
-        );
-      }
-
-      return;
-    }
-
-    for (
-      const value2 of Object.values(
-        value
-      )
-    ) {
-
-      walk(
-        value2,
-        depth + 1
-      );
-    }
-  }
-
-  walk(
-    data,
-    0
-  );
-
-  if (
-    candidates.length === 0
-  ) {
-    return [];
-  }
-
-  candidates.sort(
-    (
-      a,
-      b
-    ) =>
-      b.length -
-      a.length
-  );
-
-  return candidates[0];
-}
-
-// ============================================================
-// COMPETITION KEY
-// ============================================================
-
-function getCompetitionKey(
-  competition: AnyObj
-): string | null {
-
-  const candidates =
-    [
-      competition?.key,
-      competition?.competitionKey,
-      competition?.competition,
-      competition?.id
-    ];
-
-  for (
-    const value of candidates
-  ) {
-
-    if (
-      typeof value ===
-        "string" &&
-      value.trim()
-    ) {
-      return value.trim();
-    }
-  }
-
-  return null;
-}
-
-// ============================================================
-// COMPETITION EVENT EXTRACTION
-// ============================================================
-
-function extractEvents(
-  data: AnyObj
-): AnyObj[] {
-
-  const possible =
-    [
-      data?.events,
-      data?.data?.events,
-      data?.competition?.events,
-      data?.result?.events
-    ];
-
-  for (
-    const value of possible
-  ) {
-
-    if (
-      Array.isArray(value)
-    ) {
-      return value;
-    }
-  }
-
-  return [];
-}
-
-// ============================================================
 // LIVE EVENT DETECTION
 // ============================================================
 
@@ -1309,6 +1017,7 @@ function isLiveEvent(
     event?.inPlay === true ||
     event?.in_play === true
   ) {
+
     return true;
   }
 
@@ -1325,11 +1034,13 @@ function isLiveEvent(
       "live",
       "inplay",
       "in-play",
-      "started"
+      "started",
+      "trading_live"
     ].includes(
       status
     )
   ) {
+
     return true;
   }
 
@@ -1342,7 +1053,7 @@ function isLiveEvent(
 
 function buildLiveMatch(
   event: AnyObj,
-  competition: AnyObj
+  competition?: AnyObj
 ): AnyObj | null {
 
   const home =
@@ -1362,7 +1073,9 @@ function buildLiveMatch(
   const homeName =
     typeof home ===
       "string"
+
       ? home
+
       : home?.name ??
         home?.title ??
         null;
@@ -1370,7 +1083,9 @@ function buildLiveMatch(
   const awayName =
     typeof away ===
       "string"
+
       ? away
+
       : away?.name ??
         away?.title ??
         null;
@@ -1379,10 +1094,12 @@ function buildLiveMatch(
     !homeName ||
     !awayName
   ) {
+
     return null;
   }
 
   return {
+
     id:
       event?.id ??
       event?.eventId ??
@@ -1402,9 +1119,19 @@ function buildLiveMatch(
       awayName,
 
     competition:
+      event?.competition?.key ??
+      event?.competitionKey ??
       getCompetitionKey(
-        competition
+        competition || {}
       ),
+
+    competition_name:
+      event?.competition?.name ??
+      null,
+
+    category:
+      event?.competition?.category?.key ??
+      null,
 
     status:
       event?.status ??
@@ -1420,36 +1147,34 @@ function buildLiveMatch(
 }
 
 // ============================================================
-// ODDS EXTRACTION
+// EXACT TARGET ODDS
 // ============================================================
 //
-// EXACT TARGET ONLY
+// IMPORTANT:
+// Exact target only.
+//
+// Never accepts:
+// soccer.total_goals
+//
+// Never uses marketUrl as fallback.
+//
+// Requires:
+// market
+// submarket
+// outcome
+// params
+// valid price
+// valid maxStake
 // ============================================================
 
 function extractTargetOdds(
   event: AnyObj
 ): AnyObj | null {
 
-  const TARGET_MARKET =
-    "soccer.total_goals_period_first_half";
-
-  const TARGET_SUBMARKET =
-    "period=1h";
-
-  const TARGET_OUTCOME =
-    "over";
-
-  const TARGET_PARAMS =
-    "total=0.5";
-
   const market =
     event?.markets?.[
       TARGET_MARKET
-    ] ??
-    event?.submarkets?.[
-      TARGET_MARKET
-    ] ??
-    null;
+    ];
 
   if (!market) {
     return null;
@@ -1458,22 +1183,21 @@ function extractTargetOdds(
   const submarket =
     market?.submarkets?.[
       TARGET_SUBMARKET
-    ] ??
-    market?.[
-      TARGET_SUBMARKET
-    ] ??
-    null;
+    ];
+
+  if (!submarket) {
+    return null;
+  }
 
   const selections =
-    submarket?.selections ??
-    market?.selections ??
-    [];
+    submarket?.selections;
 
   if (
     !Array.isArray(
       selections
     )
   ) {
+
     return null;
   }
 
@@ -1483,14 +1207,14 @@ function extractTargetOdds(
 
     if (
       selection?.outcome !==
-        TARGET_OUTCOME
+      TARGET_OUTCOME
     ) {
       continue;
     }
 
     if (
       selection?.params !==
-        TARGET_PARAMS
+      TARGET_PARAMS
     ) {
       continue;
     }
@@ -1504,6 +1228,36 @@ function extractTargetOdds(
       price === null ||
       price <= 1
     ) {
+
+      continue;
+    }
+
+    const status =
+      String(
+        selection?.status ??
+        ""
+      ).toUpperCase();
+
+    if (
+      status &&
+      [
+        "SELECTION_DISABLED",
+        "DISABLED",
+        "CLOSED",
+        "SUSPENDED"
+      ].includes(
+        status
+      )
+    ) {
+
+      continue;
+    }
+
+    if (
+      selection?.enabled ===
+      false
+    ) {
+
       continue;
     }
 
@@ -1516,10 +1270,12 @@ function extractTargetOdds(
       maxStake !== null &&
       maxStake <= 0
     ) {
+
       continue;
     }
 
     return {
+
       market:
         TARGET_MARKET,
 
@@ -1552,36 +1308,165 @@ function extractTargetOdds(
 }
 
 // ============================================================
-// FETCH ONE COMPETITION
+// NEW: /events? SPORT=SOCCER & LIVE=TRUE
+// ============================================================
+//
+// This is the important V5.6 optimization.
+//
+// OLD:
+//
+// /sports/soccer
+//   -> ~186 competitions
+//   -> ~186 /competitions/{key} requests
+//
+// NEW:
+//
+// /events?sport=soccer&live=true&players=false&limit=10000
+//   -> ONE request
+//
+// Cloudbet exposes GET /v2/odds/events for listing events,
+// including live events.
 // ============================================================
 
-async function fetchCompetition(
-  env: Env,
-  competition: AnyObj
+async function getLiveSoccerEvents(
+  env: Env
 ): Promise<{
-  competition: AnyObj;
-  elapsed_ms: number;
-  success: boolean;
-  error?: string;
+  data: AnyObj;
   events: AnyObj[];
+  elapsed_ms: number;
+  response_status: number;
+  path: string;
 }> {
 
-  const key =
-    getCompetitionKey(
-      competition
+  const path =
+    "/events?sport=soccer&live=true&players=false&limit=10000";
+
+  const result =
+    await cloudbetFetch(
+      env,
+      path
     );
 
-  if (!key) {
+  if (
+    !result.response.ok
+  ) {
 
-    return {
-      competition,
-      elapsed_ms: 0,
-      success: false,
-      error:
-        "Competition key not found",
-      events: []
-    };
+    throw new Error(
+      `Cloudbet /events returned HTTP ${
+        result.response.status
+      }`
+    );
   }
+
+  const data =
+    parseJSON(
+      result.text,
+      path
+    );
+
+  const events =
+    extractLiveEvents(
+      data
+    );
+
+  return {
+
+    data,
+
+    events,
+
+    elapsed_ms:
+      result.elapsed_ms,
+
+    response_status:
+      result.response.status,
+
+    path
+  };
+}
+
+// ============================================================
+// EXTRACT LIVE EVENTS RESPONSE
+// ============================================================
+//
+// Supports:
+//
+// [
+//   {...event}
+// ]
+//
+// and:
+//
+// {
+//   events: [...]
+// }
+//
+// and common wrapped variants.
+// ============================================================
+
+function extractLiveEvents(
+  data: any
+): AnyObj[] {
+
+  if (
+    Array.isArray(data)
+  ) {
+
+    return data.filter(
+      item =>
+        item &&
+        typeof item ===
+          "object"
+    );
+  }
+
+  const direct =
+    [
+      data?.events,
+
+      data?.data?.events,
+
+      data?.result?.events,
+
+      data?.items,
+
+      data?.data
+    ];
+
+  for (
+    const candidate of direct
+  ) {
+
+    if (
+      Array.isArray(
+        candidate
+      )
+    ) {
+
+      return candidate.filter(
+        item =>
+          item &&
+          typeof item ===
+            "object"
+      );
+    }
+  }
+
+  return [];
+}
+
+// ============================================================
+// DIAGNOSTIC LIVE EVENTS
+// ============================================================
+//
+// This endpoint makes ONE request only.
+//
+// It is safe to test before relying on /live.
+// ============================================================
+
+async function diagnosticLiveEvents(
+  env: Env
+): Promise<Response> {
 
   const started =
     Date.now();
@@ -1589,82 +1474,203 @@ async function fetchCompetition(
   try {
 
     const result =
-      await cloudbetFetch(
-        env,
-        `/competitions/${encodeURIComponent(
-          key
-        )}`
+      await getLiveSoccerEvents(
+        env
       );
 
-    if (
-      !result.response.ok
+    const events =
+      result.events;
+
+    const liveDetected =
+      events.filter(
+        event =>
+          isLiveEvent(
+            event
+          )
+      );
+
+    const statuses:
+      Record<string, number> =
+      {};
+
+    for (
+      const event of events
     ) {
 
-      throw new Error(
-        `HTTP ${result.response.status}`
-      );
+      const status =
+        String(
+          event?.status ??
+          event?.state ??
+          "UNKNOWN"
+        );
+
+      statuses[status] =
+        (statuses[status] || 0) +
+        1;
     }
 
-    const data =
-      parseJSON(
-        result.text,
-        `/competitions/${key}`
-      );
+    const targetOddsCount =
+      events.filter(
+        event =>
+          extractTargetOdds(
+            event
+          ) !== null
+      ).length;
 
-    return {
-      competition,
+    return json(
+      {
 
-      elapsed_ms:
-        Date.now() -
-        started,
+        success:
+          true,
 
-      success:
-        true,
+        worker:
+          "cloudbet-live-soccer-detector",
 
-      events:
-        extractEvents(
-          data
-        )
-    };
+        version:
+          VERSION,
+
+        action:
+          "DIAGNOSTIC_LIVE_EVENTS",
+
+        read_only:
+          true,
+
+        request: {
+
+          path:
+            result.path,
+
+          requests_made:
+            1,
+
+          competition_requests_made:
+            0,
+
+          timeout_ms:
+            CLOUDBET_TIMEOUT_MS
+        },
+
+        performance: {
+
+          events_fetch_ms:
+            result.elapsed_ms,
+
+          total_elapsed_ms:
+            Date.now() -
+            started,
+
+          http_status:
+            result.response_status
+        },
+
+        result: {
+
+          events_received:
+            events.length,
+
+          events_recognized_live:
+            liveDetected.length,
+
+          statuses,
+
+          target_1h_over_05_found:
+            targetOddsCount,
+
+          first_10:
+            events
+              .slice(
+                0,
+                10
+              )
+              .map(
+                event => ({
+                  id:
+                    event?.id ??
+                    event?.eventId ??
+                    event?.key ??
+                    null,
+
+                  name:
+                    event?.name ??
+                    null,
+
+                  home:
+                    event?.home ??
+                    null,
+
+                  away:
+                    event?.away ??
+                    null,
+
+                  status:
+                    event?.status ??
+                    event?.state ??
+                    null,
+
+                  competition:
+                    event?.competition ??
+                    null,
+
+                  target_odds:
+                    extractTargetOdds(
+                      event
+                    )
+                })
+              )
+        },
+
+        interpretation: {
+
+          old_method:
+            "sports/soccer -> approximately 186 competition requests",
+
+          new_method:
+            "events?sport=soccer&live=true -> 1 request",
+
+          expected:
+            "The new method should be dramatically faster if Cloudbet returns all current live soccer events in this response."
+        },
+
+        timestamp:
+          nowISO()
+      }
+    );
 
   } catch (error: any) {
 
-    return {
-      competition,
+    return json(
+      {
 
-      elapsed_ms:
-        Date.now() -
-        started,
+        success:
+          false,
 
-      success:
-        false,
+        worker:
+          "cloudbet-live-soccer-detector",
 
-      error:
-        error?.message ||
-        String(error),
+        version:
+          VERSION,
 
-      events: []
-    };
+        action:
+          "DIAGNOSTIC_LIVE_EVENTS",
+
+        error:
+          error?.message ||
+          String(error),
+
+        elapsed_ms:
+          Date.now() -
+          started,
+
+        timestamp:
+          nowISO()
+      },
+      502
+    );
   }
 }
 
 // ============================================================
-// /live
-// ============================================================
-//
-// V5.5 IMPORTANT:
-//
-// This function intentionally preserves the V5.4 behavior:
-//
-// /sports/soccer
-//      ↓
-// all active soccer competitions
-//      ↓
-// all competition requests
-//      ↓
-// live filtering
-//
-// NO NEW FILTER IS APPLIED HERE.
+// NEW FAST /live
 // ============================================================
 
 async function live(
@@ -1674,16 +1680,18 @@ async function live(
   const started =
     Date.now();
 
-  let soccer: {
+  let result: {
     data: AnyObj;
+    events: AnyObj[];
     elapsed_ms: number;
     response_status: number;
+    path: string;
   };
 
   try {
 
-    soccer =
-      await getSoccerData(
+    result =
+      await getLiveSoccerEvents(
         env
       );
 
@@ -1691,6 +1699,7 @@ async function live(
 
     return json(
       {
+
         success:
           false,
 
@@ -1702,150 +1711,117 @@ async function live(
 
         error:
           error?.message ||
-          String(error)
+          String(error),
+
+        method:
+          "DIRECT_LIVE_EVENTS"
       },
       502
     );
   }
 
-  const competitions =
-    extractCompetitionsForLive(
-      soccer.data
-    );
-
-  // Keep original behavior:
-  // only competitions with eventCount > 0
-  const selectedCompetitions =
-    competitions.filter(
-      competition => {
-
-        const eventCount =
-          finiteNumber(
-            competition?.eventCount
-          );
-
-        if (
-          eventCount === null
-        ) {
-          return true;
-        }
-
-        return eventCount > 0;
-      }
-    );
-
-  const competitionStarted =
-    Date.now();
-
-  const results =
-    await mapWithConcurrency(
-      selectedCompetitions,
-      COMPETITION_CONCURRENCY,
-      async competition =>
-        fetchCompetition(
-          env,
-          competition
-        )
-    );
-
-  const competitionScanMs =
-    Date.now() -
-    competitionStarted;
+  const events =
+    result.events;
 
   const liveMatches:
     AnyObj[] = [];
 
-  let successful =
+  let liveEventsDetected =
     0;
 
-  let failed =
+  let invalidEvents =
     0;
 
-  let totalEvents =
+  let oddsFound =
     0;
-
-  let liveEvents =
-    0;
-
-  const latency =
-    results
-      .map(
-        result =>
-          result.elapsed_ms
-      )
-      .filter(
-        value =>
-          Number.isFinite(
-            value
-          )
-      )
-      .sort(
-        (a, b) =>
-          a - b
-      );
 
   for (
-    const result of results
+    const event of events
   ) {
 
+    // Because Cloudbet was explicitly asked
+    // for live=true, treat returned events as
+    // the live candidate set.
+    //
+    // We still inspect status for diagnostics.
     if (
-      result.success
-    ) {
-      successful++;
-    } else {
-      failed++;
-    }
-
-    totalEvents +=
-      result.events.length;
-
-    for (
-      const event of result.events
+      !isLiveEvent(
+        event
+      )
     ) {
 
-      if (
-        !isLiveEvent(
-          event
-        )
-      ) {
-        continue;
-      }
-
-      liveEvents++;
-
-      const match =
-        buildLiveMatch(
-          event,
-          result.competition
-        );
-
-      if (
-        match
-      ) {
-
-        const odds =
-          extractTargetOdds(
-            event
-          );
-
-        if (
-          odds
-        ) {
-          match.target_odds =
-            odds;
-        }
-
-        liveMatches.push(
-          match
-        );
-      }
+      // Do NOT throw away the event.
+      //
+      // Some Cloudbet responses can expose
+      // a live event through the live filter
+      // without using one of our recognized
+      // textual status values.
     }
+
+    liveEventsDetected++;
+
+    const match =
+      buildLiveMatch(
+        event
+      );
+
+    if (
+      !match
+    ) {
+
+      invalidEvents++;
+      continue;
+    }
+
+    const odds =
+      extractTargetOdds(
+        event
+      );
+
+    if (
+      odds
+    ) {
+
+      match.target_odds =
+        odds;
+
+      oddsFound++;
+    }
+
+    // Preserve minute if Cloudbet exposes it.
+    if (
+      event?.minute !==
+      undefined
+    ) {
+
+      match.minute =
+        event.minute;
+    }
+
+    // Preserve scores if available.
+    if (
+      event?.scores !==
+      undefined
+    ) {
+
+      match.scores =
+        event.scores;
+    }
+
+    liveMatches.push(
+      match
+    );
   }
 
-  // Sort by minute if available,
-  // otherwise preserve Cloudbet order.
+  // ==========================================================
+  // SORT
+  // ==========================================================
+
   liveMatches.sort(
-    (a, b) => {
+    (
+      a,
+      b
+    ) => {
 
       const am =
         finiteNumber(
@@ -1861,18 +1837,21 @@ async function live(
         am === null &&
         bm === null
       ) {
+
         return 0;
       }
 
       if (
         am === null
       ) {
+
         return 1;
       }
 
       if (
         bm === null
       ) {
+
         return -1;
       }
 
@@ -1886,112 +1865,18 @@ async function live(
       100
     );
 
-  const totalScanMs =
+  const totalElapsed =
     Date.now() -
     started;
 
-  function percentile(
-    p: number
-  ): number | null {
-
-    if (
-      latency.length === 0
-    ) {
-      return null;
-    }
-
-    const index =
-      Math.min(
-        latency.length - 1,
-        Math.max(
-          0,
-          Math.ceil(
-            p *
-              latency.length
-          ) - 1
-        )
-      );
-
-    return latency[index];
-  }
-
-  const avg =
-    latency.length
-      ? Math.round(
-          latency.reduce(
-            (
-              sum,
-              value
-            ) =>
-              sum + value,
-            0
-          ) /
-            latency.length
-        )
-      : null;
-
-  const median =
-    percentile(
-      0.5
-    );
-
-  const p90 =
-    percentile(
-      0.9
-    );
-
-  const p95 =
-    percentile(
-      0.95
-    );
-
-  const p99 =
-    percentile(
-      0.99
-    );
-
-  const first10 =
-    latency.slice(
-      0,
-      10
-    );
-
-  const first24 =
-    latency.slice(
-      0,
-      24
-    );
-
-  const last24 =
-    latency.slice(
-      -24
-    );
-
-  const average =
-    (
-      values: number[]
-    ) =>
-      values.length
-        ? Math.round(
-            values.reduce(
-              (
-                s,
-                v
-              ) =>
-                s + v,
-              0
-            ) /
-              values.length
-          )
-        : null;
-
   return json(
     {
+
       success:
         true,
 
       test:
-        "CLOUDBET ALL LIVE SOCCER",
+        "CLOUDBET LIVE SOCCER DIRECT EVENTS",
 
       version:
         VERSION,
@@ -2005,161 +1890,49 @@ async function live(
       sport:
         "soccer",
 
+      method:
+        "GET /events?sport=soccer&live=true&players=false&limit=10000",
+
       performance: {
 
         timeout_ms:
           CLOUDBET_TIMEOUT_MS,
 
-        competition_concurrency:
-          COMPETITION_CONCURRENCY,
+        requests_total:
+          1,
 
-        previous_concurrency:
-          48,
+        competition_requests:
+          0,
 
-        concurrency_change:
-          "48 -> 24",
+        events_request:
+          result.path,
 
-        soccer_fetch_ms:
-          soccer.elapsed_ms,
+        events_fetch_ms:
+          result.elapsed_ms,
 
-        competition_scan_ms:
-          competitionScanMs,
+        total_elapsed_ms:
+          totalElapsed,
 
-        event_processing_ms:
-          totalScanMs -
-          soccer.elapsed_ms -
-          competitionScanMs,
-
-        total_scan_ms:
-          totalScanMs,
-
-        scan_method:
-          "ALL_COMPETITIONS_NO_EARLY_STOP",
-
-        slow_competition_requests:
-          latency.filter(
-            value =>
-              value >= 1000
-          ).length,
-
-        slowest_competition_ms:
-          latency.length
-            ? latency[
-                latency.length - 1
-              ]
-            : null,
-
-        latency_diagnostic: {
-
-          requests: {
-
-            total:
-              results.length,
-
-            successful,
-
-            failed,
-
-            concurrency:
-              COMPETITION_CONCURRENCY
-          },
-
-          latency: {
-
-            requests_measured:
-              latency.length,
-
-            min_ms:
-              latency.length
-                ? latency[0]
-                : null,
-
-            max_ms:
-              latency.length
-                ? latency[
-                    latency.length - 1
-                  ]
-                : null,
-
-            average_ms:
-              avg,
-
-            median_ms:
-              median,
-
-            p90_ms:
-              p90,
-
-            p95_ms:
-              p95,
-
-            p99_ms:
-              p99
-          },
-
-          position: {
-
-            first_10_average_ms:
-              average(
-                first10
-              ),
-
-            first_24_average_ms:
-              average(
-                first24
-              ),
-
-            last_24_average_ms:
-              average(
-                last24
-              )
-          },
-
-          interpretation: {
-
-            likely_fast:
-              false,
-
-            likely_cloudbet_or_network_latency:
-              true,
-
-            possible_concurrency_pressure:
-              false,
-
-            possible_systemic_slowdown:
-              false
-          }
-        }
+        speed_model:
+          "ONE_REQUEST_INSTEAD_OF_FULL_COMPETITION_SCAN"
       },
 
       stats: {
 
-        competition_count:
-          competitions.length,
-
-        competitions_with_events:
-          selectedCompetitions.length,
-
-        competitions_checked:
-          results.length,
-
-        competitions_successful:
-          successful,
-
-        competitions_failed:
-          failed,
-
-        total_events:
-          totalEvents,
+        events_received:
+          events.length,
 
         live_events_detected:
-          liveEvents,
+          liveEventsDetected,
 
         live_matches_found:
           liveMatches.length,
 
         live_matches_returned:
           returned.length,
+
+        invalid_events:
+          invalidEvents,
 
         result_limit:
           100,
@@ -2174,10 +1947,7 @@ async function live(
           returned.filter(
             match =>
               !match?.target_odds
-          ).length,
-
-        errors:
-          failed
+          ).length
       },
 
       matches:
@@ -2196,6 +1966,7 @@ async function health(
 
   return json(
     {
+
       success:
         true,
 
@@ -2214,19 +1985,33 @@ async function health(
       api:
         "Cloudbet Sports API",
 
-      competition_concurrency:
+      live_method:
+        "DIRECT_EVENTS",
+
+      live_endpoint:
+        "/events?sport=soccer&live=true&players=false&limit=10000",
+
+      old_competition_concurrency:
         COMPETITION_CONCURRENCY,
 
       timeout_ms:
         CLOUDBET_TIMEOUT_MS,
 
       endpoints: [
+
         "/",
+
         "/health",
+
         "/live",
+
         "/search",
+
         "/event",
-        "/diagnostic-soccer"
+
+        "/diagnostic-soccer",
+
+        "/diagnostic-live-events"
       ]
     }
   );
@@ -2278,6 +2063,7 @@ async function event(
 
     return json(
       {
+
         success:
           result.response.ok,
 
@@ -2293,6 +2079,7 @@ async function event(
         event:
           data
       },
+
       result.response.ok
         ? 200
         : result.response.status
@@ -2302,6 +2089,7 @@ async function event(
 
     return json(
       {
+
         success:
           false,
 
@@ -2319,6 +2107,10 @@ async function event(
 
 // ============================================================
 // /search
+// ============================================================
+//
+// /search remains the old competition-based search.
+// We are NOT changing it in V5.6.
 // ============================================================
 
 async function search(
@@ -2353,6 +2145,7 @@ async function search(
 
     return json(
       {
+
         success:
           false,
 
@@ -2442,6 +2235,7 @@ async function search(
 
           matches.push(
             {
+
               event_id:
                 event?.id ??
                 event?.eventId ??
@@ -2459,6 +2253,7 @@ async function search(
                 null,
 
               competition:
+                event?.competition?.key ??
                 getCompetitionKey(
                   result.competition
                 ),
@@ -2475,6 +2270,7 @@ async function search(
 
     return json(
       {
+
         success:
           true,
 
@@ -2493,6 +2289,7 @@ async function search(
 
     return json(
       {
+
         success:
           false,
 
@@ -2518,6 +2315,7 @@ async function root(
 
   return json(
     {
+
       success:
         true,
 
@@ -2548,11 +2346,26 @@ async function root(
           "/event?id=EVENT_ID",
 
         diagnostic_soccer:
-          "/diagnostic-soccer"
+          "/diagnostic-soccer",
+
+        diagnostic_live_events:
+          "/diagnostic-live-events"
+      },
+
+      live_optimization: {
+
+        old:
+          "sports/soccer -> competitions -> ~186 requests",
+
+        new:
+          "events?sport=soccer&live=true -> 1 request",
+
+        expected:
+          "Major reduction in Cloudbet loading time."
       },
 
       note:
-        "V5.5 adds /diagnostic-soccer only. /live behavior remains unchanged."
+        "V5.6 replaces the expensive full competition scan used by /live with Cloudbet's direct live-events endpoint. /search remains competition based."
     }
   );
 }
@@ -2619,10 +2432,16 @@ export default {
             env
           );
 
+        case "/diagnostic-live-events":
+          return diagnosticLiveEvents(
+            env
+          );
+
         default:
 
           return json(
             {
+
               success:
                 false,
 
@@ -2633,12 +2452,20 @@ export default {
                 "Not found",
 
               available_endpoints: [
+
                 "/",
+
                 "/health",
+
                 "/live",
+
                 "/search",
+
                 "/event",
-                "/diagnostic-soccer"
+
+                "/diagnostic-soccer",
+
+                "/diagnostic-live-events"
               ]
             },
             404
@@ -2649,6 +2476,7 @@ export default {
 
       return json(
         {
+
           success:
             false,
 
