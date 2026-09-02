@@ -1,8 +1,8 @@
 // ============================================================
-// CLOUDBET — FAST LIVE SOCCER DETECTOR V5.2
+// CLOUDBET — FAST LIVE SOCCER DETECTOR V5.3
 // READ ONLY
 //
-// V5.2 PERFORMANCE TEST
+// V5.3 LATENCY DIAGNOSTIC
 //
 // - /search остава търсене на САМИЯ МАЧ по HOME + AWAY
 // - /live проверява ВСИЧКИ активни soccer competitions
@@ -10,11 +10,14 @@
 // - НЕ се използва early-stop
 // - НЕ се пропуска competition
 //
-// V5.2 CHANGE:
-// - competition concurrency 12 -> 24
-// - запазен пълният scan на всички competitions
-// - добавено batch/in-flight timing
-// - запазена цялата V5.1 odds логика
+// V5.3 CHANGE:
+// - запазена concurrency = 24
+// - запазен пълният scan
+// - добавена подробна latency диагностика
+// - min / max / average / median / p90 / p95 / p99
+// - latency buckets
+// - измерване по launch order
+// - измерване на първите/последните заявки
 //
 // НЕ променя matcher логиката
 // НЕ поставя залог
@@ -29,20 +32,11 @@ const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
 // ============================================================
-// V5.2 PERFORMANCE CONFIG
+// V5.3 PERFORMANCE CONFIG
 // ============================================================
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
-
-// V5.1 = 12
-// V5.2 TEST = 24
-//
-// ВАЖНО:
-// Всички selected competitions се проверяват.
-// Няма early-stop.
-//
-// ============================================================
 
 const COMPETITION_CONCURRENCY =
   24;
@@ -64,11 +58,9 @@ function json(
     ),
     {
       status,
-
       headers: {
         "content-type":
           "application/json; charset=UTF-8",
-
         "cache-control":
           "no-store"
       }
@@ -95,74 +87,51 @@ function safeString(v) {
 const TEAM_ALIASES = {
   "man city":
     "manchester city",
-
   "man utd":
     "manchester united",
-
   "man united":
     "manchester united",
-
   "man u":
     "manchester united",
-
   "manchester utd":
     "manchester united",
-
   "psg":
     "paris saint germain",
-
   "paris sg":
     "paris saint germain",
-
   "inter":
     "inter milan",
-
   "inter milano":
     "inter milan",
-
   "internazionale":
     "inter milan",
-
   "fc internazionale":
     "inter milan",
-
   "atletico":
     "atletico madrid",
-
   "atletico de madrid":
     "atletico madrid",
-
   "sporting cp":
     "sporting lisbon",
-
   "sporting lisboa":
     "sporting lisbon",
-
   "red star":
     "crvena zvezda",
-
   "red star belgrade":
     "crvena zvezda",
-
   "psv eindhoven":
     "psv",
-
   "bayern munchen":
     "bayern munich",
-
   "utd":
     "united",
-
   "ath":
     "athletic",
-
   "dep":
     "deportivo",
-
   "depor":
     "deportivo"
 };
-
 
 const GENERIC_WORDS =
   new Set([
@@ -193,7 +162,6 @@ const GENERIC_WORDS =
     "soccer"
   ]);
 
-
 function normalizeText(v) {
   return safeString(v)
     .normalize("NFD")
@@ -221,7 +189,6 @@ function normalizeText(v) {
     .trim();
 }
 
-
 function applyAliases(v) {
   let r =
     normalizeText(v);
@@ -231,7 +198,6 @@ function applyAliases(v) {
       TEAM_ALIASES
     )
   ) {
-
     const escaped =
       alias.replace(
         /[.*+?^${}()|[\]\\]/g,
@@ -256,7 +222,6 @@ function applyAliases(v) {
     .trim();
 }
 
-
 function normalizeTeam(v) {
   return applyAliases(v)
     .split(" ")
@@ -272,7 +237,6 @@ function normalizeTeam(v) {
     .join(" ")
     .trim();
 }
-
 
 function teamTokens(v) {
   return normalizeTeam(v)
@@ -323,7 +287,6 @@ function levenshtein(
     i <= a.length;
     i++
   ) {
-
     curr[0] = i;
 
     for (
@@ -331,7 +294,6 @@ function levenshtein(
       j <= b.length;
       j++
     ) {
-
       const cost =
         a[i - 1] ===
         b[j - 1]
@@ -359,7 +321,6 @@ function levenshtein(
     b.length
   ];
 }
-
 
 function characterSimilarity(
   a,
@@ -426,7 +387,6 @@ function teamScore(
     A.includes(B) ||
     B.includes(A)
   ) {
-
     return {
       score:
         Math.max(
@@ -440,7 +400,6 @@ function teamScore(
             B.length
           )
         ),
-
       method:
         "CONTAINMENT"
     };
@@ -456,7 +415,6 @@ function teamScore(
   if (
     common.length >= 1
   ) {
-
     const score =
       common.length /
       Math.max(
@@ -467,13 +425,10 @@ function teamScore(
     if (
       score >= 0.75
     ) {
-
       return {
         score,
-
         method:
           "TOKEN_STRONG",
-
         common_tokens:
           common
       };
@@ -486,12 +441,10 @@ function teamScore(
         A,
         B
       ),
-
     method:
       "CHARACTER_SIMILARITY"
   };
 }
-
 
 function strictMatch(
   homeA,
@@ -499,7 +452,6 @@ function strictMatch(
   homeB,
   awayB
 ) {
-
   const normalHome =
     teamScore(
       homeA,
@@ -548,38 +500,28 @@ function strictMatch(
     normalValid &&
     normalScore >= reverseScore
   ) {
-
     return {
       matched: true,
-
       direction:
         "NORMAL",
-
       home_score:
         normalHome.score,
-
       away_score:
         normalAway.score,
-
       combined_score:
         normalScore
     };
   }
 
   if (reverseValid) {
-
     return {
       matched: true,
-
       direction:
         "REVERSED",
-
       home_score:
         reverseHome.score,
-
       away_score:
         reverseAway.score,
-
       combined_score:
         reverseScore
     };
@@ -587,22 +529,18 @@ function strictMatch(
 
   return {
     matched: false,
-
     direction:
       normalScore >= reverseScore
         ? "NORMAL"
         : "REVERSED",
-
     home_score:
       normalScore >= reverseScore
         ? normalHome.score
         : reverseHome.score,
-
     away_score:
       normalScore >= reverseScore
         ? normalAway.score
         : reverseAway.score,
-
     combined_score:
       Math.max(
         normalScore,
@@ -617,7 +555,6 @@ function strictMatch(
 // ============================================================
 
 function getApiKey(env) {
-
   const key =
     env?.[API_KEY_NAME];
 
@@ -625,7 +562,6 @@ function getApiKey(env) {
     !key ||
     typeof key !== "string"
   ) {
-
     throw new Error(
       `${API_KEY_NAME} secret is missing`
     );
@@ -643,7 +579,6 @@ async function cloudbetFetch(
   path,
   env
 ) {
-
   const controller =
     new AbortController();
 
@@ -658,7 +593,6 @@ async function cloudbetFetch(
     Date.now();
 
   try {
-
     const response =
       await fetch(
         `${API_BASE}${path}`,
@@ -688,14 +622,11 @@ async function cloudbetFetch(
     let data = {};
 
     try {
-
       data =
         text
           ? JSON.parse(text)
           : {};
-
     } catch {
-
       data = {
         raw: text
       };
@@ -704,7 +635,6 @@ async function cloudbetFetch(
     if (
       !response.ok
     ) {
-
       throw new Error(
         `Cloudbet HTTP ${response.status}`
       );
@@ -715,7 +645,6 @@ async function cloudbetFetch(
   } catch (
     error
   ) {
-
     const elapsed =
       Date.now() -
       started;
@@ -724,7 +653,6 @@ async function cloudbetFetch(
       error?.name ===
       "AbortError"
     ) {
-
       throw new Error(
         `Cloudbet ${path} timed out after ${elapsed}ms`
       );
@@ -738,7 +666,6 @@ async function cloudbetFetch(
     );
 
   } finally {
-
     clearTimeout(
       timeout
     );
@@ -747,14 +674,344 @@ async function cloudbetFetch(
 
 
 // ============================================================
-// LIMITED CONCURRENCY
+// LATENCY DIAGNOSTIC HELPERS
 // ============================================================
-//
-// V5.2:
-// - максимум 24 заявки едновременно
-// - всички competitions се обработват
-// - няма early-stop
-//
+
+function percentile(
+  values,
+  p
+) {
+  if (
+    !Array.isArray(values) ||
+    values.length === 0
+  ) {
+    return null;
+  }
+
+  const sorted =
+    [...values].sort(
+      (a, b) => a - b
+    );
+
+  const index =
+    (sorted.length - 1) * p;
+
+  const lower =
+    Math.floor(index);
+
+  const upper =
+    Math.ceil(index);
+
+  if (
+    lower === upper
+  ) {
+    return sorted[lower];
+  }
+
+  return Math.round(
+    sorted[lower] +
+      (
+        sorted[upper] -
+        sorted[lower]
+      ) *
+        (index - lower)
+  );
+}
+
+function buildLatencyStats(
+  records
+) {
+  const successful =
+    records.filter(
+      x =>
+        Number.isFinite(
+          x.elapsed_ms
+        )
+    );
+
+  const values =
+    successful.map(
+      x =>
+        x.elapsed_ms
+    );
+
+  if (
+    values.length === 0
+  ) {
+    return {
+      requests_measured: 0,
+      min_ms: null,
+      max_ms: null,
+      average_ms: null,
+      median_ms: null,
+      p90_ms: null,
+      p95_ms: null,
+      p99_ms: null,
+      buckets: {
+        under_500ms: 0,
+        ms_500_to_999: 0,
+        ms_1000_to_1499: 0,
+        ms_1500_to_1999: 0,
+        over_2000ms: 0
+      }
+    };
+  }
+
+  const total =
+    values.reduce(
+      (sum, value) =>
+        sum + value,
+      0
+    );
+
+  let under500 = 0;
+  let b500 = 0;
+  let b1000 = 0;
+  let b1500 = 0;
+  let over2000 = 0;
+
+  for (
+    const value
+    of values
+  ) {
+    if (
+      value < 500
+    ) {
+      under500++;
+    } else if (
+      value < 1000
+    ) {
+      b500++;
+    } else if (
+      value < 1500
+    ) {
+      b1000++;
+    } else if (
+      value < 2000
+    ) {
+      b1500++;
+    } else {
+      over2000++;
+    }
+  }
+
+  return {
+    requests_measured:
+      values.length,
+
+    min_ms:
+      Math.min(
+        ...values
+      ),
+
+    max_ms:
+      Math.max(
+        ...values
+      ),
+
+    average_ms:
+      Math.round(
+        total /
+          values.length
+      ),
+
+    median_ms:
+      percentile(
+        values,
+        0.50
+      ),
+
+    p90_ms:
+      percentile(
+        values,
+        0.90
+      ),
+
+    p95_ms:
+      percentile(
+        values,
+        0.95
+      ),
+
+    p99_ms:
+      percentile(
+        values,
+        0.99
+      ),
+
+    buckets: {
+      under_500ms:
+        under500,
+
+      ms_500_to_999:
+        b500,
+
+      ms_1000_to_1499:
+        b1000,
+
+      ms_1500_to_1999:
+        b1500,
+
+      over_2000ms:
+        over2000
+    }
+  };
+}
+
+function buildPositionStats(
+  records
+) {
+  const successful =
+    records
+      .filter(
+        x =>
+          Number.isFinite(
+            x.elapsed_ms
+          )
+      )
+      .sort(
+        (a, b) =>
+          a.launch_order -
+          b.launch_order
+      );
+
+  const first10 =
+    successful.slice(
+      0,
+      10
+    );
+
+  const first24 =
+    successful.slice(
+      0,
+      24
+    );
+
+  const last24 =
+    successful.slice(
+      -24
+    );
+
+  const avg =
+    list => {
+
+      if (
+        !list.length
+      ) {
+        return null;
+      }
+
+      return Math.round(
+        list.reduce(
+          (sum, x) =>
+            sum +
+            x.elapsed_ms,
+          0
+        ) /
+          list.length
+      );
+    };
+
+  return {
+    first_10_average_ms:
+      avg(first10),
+
+    first_24_average_ms:
+      avg(first24),
+
+    last_24_average_ms:
+      avg(last24),
+
+    first_request_ms:
+      successful[0]?.elapsed_ms ??
+      null,
+
+    last_request_ms:
+      successful[
+        successful.length - 1
+      ]?.elapsed_ms ??
+      null
+  };
+}
+
+function buildLatencyDiagnostic(
+  records,
+  concurrency,
+  competitionCount,
+  scanElapsed
+) {
+  const latency =
+    buildLatencyStats(
+      records
+    );
+
+  const position =
+    buildPositionStats(
+      records
+    );
+
+  const failed =
+    records.filter(
+      x =>
+        x.error
+    );
+
+  return {
+    requests: {
+      total:
+        records.length,
+
+      successful:
+        records.length -
+        failed.length,
+
+      failed:
+        failed.length,
+
+      concurrency
+    },
+
+    latency,
+
+    position,
+
+    scan: {
+      competition_count:
+        competitionCount,
+
+      wall_clock_ms:
+        scanElapsed,
+
+      theoretical_note:
+        "With dynamic concurrency, launch order is diagnostic only; it is not a strict batch number."
+    },
+
+    interpretation: {
+      likely_fast:
+        latency.p95_ms !== null &&
+        latency.p95_ms < 1000,
+
+      likely_cloudbet_or_network_latency:
+        latency.p95_ms !== null &&
+        latency.p95_ms >= 1500,
+
+      possible_concurrency_pressure:
+        position.first_24_average_ms !== null &&
+        position.last_24_average_ms !== null &&
+        position.last_24_average_ms >
+          position.first_24_average_ms * 1.25,
+
+      possible_systemic_slowdown:
+        latency.buckets.over_2000ms +
+          latency.buckets.ms_1500_to_1999 >
+          latency.requests_measured * 0.50
+    }
+  };
+}
+
+
+// ============================================================
+// LIMITED CONCURRENCY
 // ============================================================
 
 async function mapWithConcurrency(
@@ -762,7 +1019,6 @@ async function mapWithConcurrency(
   worker,
   concurrency
 ) {
-
   const results =
     new Array(
       items.length
@@ -775,12 +1031,11 @@ async function mapWithConcurrency(
   }
 
   let nextIndex = 0;
+  let launchOrder = 0;
 
   const workerLoop =
     async () => {
-
       while (true) {
-
         const index =
           nextIndex++;
 
@@ -788,14 +1043,17 @@ async function mapWithConcurrency(
           index >=
           items.length
         ) {
-
           return;
         }
+
+        const currentLaunchOrder =
+          launchOrder++;
 
         results[index] =
           await worker(
             items[index],
-            index
+            index,
+            currentLaunchOrder
           );
       }
     };
@@ -833,7 +1091,6 @@ async function mapWithConcurrency(
 async function getSoccer(
   env
 ) {
-
   return cloudbetFetch(
     "/sports/soccer",
     env
@@ -848,7 +1105,6 @@ async function getSoccer(
 function getCompetitions(
   soccer
 ) {
-
   const result = [];
 
   const categories =
@@ -862,7 +1118,6 @@ function getCompetitions(
     const category
     of categories
   ) {
-
     const competitions =
       Array.isArray(
         category?.competitions
@@ -874,7 +1129,6 @@ function getCompetitions(
       const competition
       of competitions
     ) {
-
       if (
         !competition?.key
       ) {
@@ -910,7 +1164,6 @@ async function getCompetition(
   env,
   key
 ) {
-
   return cloudbetFetch(
     `/competitions/${encodeURIComponent(key)}`,
     env
@@ -926,7 +1179,6 @@ async function getEvent(
   env,
   id
 ) {
-
   return cloudbetFetch(
     `/events/${encodeURIComponent(id)}`,
     env
@@ -941,7 +1193,6 @@ async function getEvent(
 function isLive(
   event
 ) {
-
   if (
     event?.status ===
     "TRADING_LIVE"
@@ -998,12 +1249,10 @@ function isLive(
 function teamName(
   value
 ) {
-
   if (
     typeof value ===
     "string"
   ) {
-
     return value.trim();
   }
 
@@ -1012,7 +1261,6 @@ function teamName(
     typeof value ===
     "object"
   ) {
-
     return String(
       value.name ||
       value.key ||
@@ -1032,7 +1280,6 @@ function teamName(
 function getMatchName(
   event
 ) {
-
   const direct =
     event?.name ||
     event?.match ||
@@ -1059,7 +1306,6 @@ function getMatchName(
     home &&
     away
   ) {
-
     return `${home} - ${away}`;
   }
 
@@ -1074,7 +1320,6 @@ function getMatchName(
 function findMinute(
   event
 ) {
-
   const values = [
     event?.minute,
     event?.matchMinute,
@@ -1096,7 +1341,6 @@ function findMinute(
     const value
     of values
   ) {
-
     if (
       typeof value ===
         "number" &&
@@ -1104,12 +1348,10 @@ function findMinute(
         value
       )
     ) {
-
       if (
         value >= 0 &&
         value <= 130
       ) {
-
         return Math.floor(
           value
         );
@@ -1120,7 +1362,6 @@ function findMinute(
       typeof value ===
       "string"
     ) {
-
       const text =
         value.trim();
 
@@ -1130,7 +1371,6 @@ function findMinute(
         );
 
       if (match) {
-
         return Number(
           match[1]
         );
@@ -1142,7 +1382,6 @@ function findMinute(
         );
 
       if (match) {
-
         return Number(
           match[1]
         );
@@ -1153,7 +1392,6 @@ function findMinute(
           text
         )
       ) {
-
         const n =
           Number(
             text
@@ -1163,7 +1401,6 @@ function findMinute(
           n >= 0 &&
           n <= 130
         ) {
-
           return n;
         }
       }
@@ -1181,7 +1418,6 @@ function findMinute(
 function getScore(
   event
 ) {
-
   const score =
     event?.score ||
     event?.scores ||
@@ -1193,7 +1429,6 @@ function getScore(
     typeof score !==
       "object"
   ) {
-
     return {
       home: null,
       away: null
@@ -1239,7 +1474,6 @@ function getScore(
 function normalizeOddsText(
   value
 ) {
-
   return safeString(
     value
   )
@@ -1255,11 +1489,9 @@ function normalizeOddsText(
     .trim();
 }
 
-
 function getNumericPrice(
   value
 ) {
-
   if (
     typeof value ===
       "number" &&
@@ -1267,7 +1499,6 @@ function getNumericPrice(
       value
     )
   ) {
-
     return value > 1
       ? value
       : null;
@@ -1277,7 +1508,6 @@ function getNumericPrice(
     typeof value ===
     "string"
   ) {
-
     const n =
       Number(
         value.trim()
@@ -1289,7 +1519,6 @@ function getNumericPrice(
       ) &&
       n > 1
     ) {
-
       return n;
     }
   }
@@ -1297,11 +1526,9 @@ function getNumericPrice(
   return null;
 }
 
-
 function isOverSelection(
   node
 ) {
-
   if (
     !node ||
     typeof node !==
@@ -1310,43 +1537,25 @@ function isOverSelection(
     return false;
   }
 
-  const outcome =
+  const values = [
     normalizeOddsText(
       node?.outcome
-    );
-
-  const key =
+    ),
     normalizeOddsText(
       node?.key
-    );
-
-  const name =
+    ),
     normalizeOddsText(
       node?.name
-    );
-
-  const label =
+    ),
     normalizeOddsText(
       node?.label
-    );
-
-  const side =
+    ),
     normalizeOddsText(
       node?.side
-    );
-
-  const type =
+    ),
     normalizeOddsText(
       node?.type
-    );
-
-  const values = [
-    outcome,
-    key,
-    name,
-    label,
-    side,
-    type
+    )
   ];
 
   return values.some(
@@ -1361,11 +1570,9 @@ function isOverSelection(
   );
 }
 
-
 function isHalfTimeMarketText(
   value
 ) {
-
   const text =
     normalizeOddsText(
       value
@@ -1379,44 +1586,34 @@ function isHalfTimeMarketText(
     text.includes(
       "total goals period first half"
     ) ||
-
     text.includes(
       "first half total goals"
     ) ||
-
     text.includes(
       "first half goals"
     ) ||
-
     text.includes(
       "1st half total goals"
     ) ||
-
     text.includes(
       "total goals 1st half"
     ) ||
-
     text.includes(
       "period=1h"
     ) ||
-
     text.includes(
       "period 1h"
     ) ||
-
     text === "1h" ||
-
     text.includes(
       "first half"
     )
   );
 }
 
-
 function isOver05Text(
   value
 ) {
-
   const text =
     normalizeOddsText(
       value
@@ -1430,23 +1627,18 @@ function isOver05Text(
     text.includes(
       "total=0.5"
     ) ||
-
     text.includes(
       "total 0.5"
     ) ||
-
     text.includes(
       "over 0.5"
     ) ||
-
     text.includes(
       "over0.5"
     ) ||
-
     text.includes(
       "0.5 over"
     ) ||
-
     text === "0.5"
   );
 }
@@ -1459,13 +1651,11 @@ function isOver05Text(
 function extractPriceFromSelection(
   selection
 ) {
-
   if (
     !selection ||
     typeof selection !==
-      "object"
+    "object"
   ) {
-
     return null;
   }
 
@@ -1480,7 +1670,6 @@ function extractPriceFromSelection(
     const value
     of priceCandidates
   ) {
-
     const price =
       getNumericPrice(
         value
@@ -1489,7 +1678,6 @@ function extractPriceFromSelection(
     if (
       price !== null
     ) {
-
       return price;
     }
   }
@@ -1507,19 +1695,16 @@ function findOver05OddsRecursive(
   context = {},
   depth = 0
 ) {
-
   if (
     node === null ||
     node === undefined
   ) {
-
     return null;
   }
 
   if (
     depth > 12
   ) {
-
     return null;
   }
 
@@ -1527,7 +1712,6 @@ function findOver05OddsRecursive(
     typeof node !==
     "object"
   ) {
-
     return null;
   }
 
@@ -1563,12 +1747,10 @@ function findOver05OddsRecursive(
     const key
     of contextKeys
   ) {
-
     if (
       node?.[key] !==
       undefined
     ) {
-
       localTexts.push(
         safeString(
           node[key]
@@ -1579,14 +1761,8 @@ function findOver05OddsRecursive(
 
   const combinedText =
     [
-      ...(
-        localTexts
-      ),
-
-      ...(
-        context?.texts ||
-        []
-      )
+      ...localTexts,
+      ...(context?.texts || [])
     ]
       .join(" ")
       .toLowerCase();
@@ -1609,7 +1785,6 @@ function findOver05OddsRecursive(
   if (
     selectionLike
   ) {
-
     const price =
       extractPriceFromSelection(
         node
@@ -1618,7 +1793,6 @@ function findOver05OddsRecursive(
     if (
       price !== null
     ) {
-
       const ownText =
         localTexts.join(
           " "
@@ -1640,16 +1814,14 @@ function findOver05OddsRecursive(
         validLine &&
         validHalf
       ) {
-
         return price;
       }
 
       if (
         validLine &&
         context?.firstHalf ===
-          true
+        true
       ) {
-
         return price;
       }
     }
@@ -1657,11 +1829,7 @@ function findOver05OddsRecursive(
 
   const nextTexts =
     [
-      ...(
-        context?.texts ||
-        []
-      ),
-
+      ...(context?.texts || []),
       ...localTexts
     ];
 
@@ -1671,7 +1839,7 @@ function findOver05OddsRecursive(
 
     firstHalf:
       context?.firstHalf ===
-        true ||
+      true ||
       hasFirstHalf
   };
 
@@ -1680,12 +1848,10 @@ function findOver05OddsRecursive(
       node
     )
   ) {
-
     for (
       const child
       of node
     ) {
-
       const result =
         findOver05OddsRecursive(
           child,
@@ -1696,7 +1862,6 @@ function findOver05OddsRecursive(
       if (
         result !== null
       ) {
-
         return result;
       }
     }
@@ -1710,7 +1875,6 @@ function findOver05OddsRecursive(
       node
     )
   ) {
-
     const child =
       node[key];
 
@@ -1742,7 +1906,6 @@ function findOver05OddsRecursive(
     if (
       result !== null
     ) {
-
       return result;
     }
   }
@@ -1758,13 +1921,11 @@ function findOver05OddsRecursive(
 function extractOver05Odds(
   event
 ) {
-
   if (
     !event ||
     typeof event !==
-      "object"
+    "object"
   ) {
-
     return null;
   }
 
@@ -1783,20 +1944,16 @@ function extractOver05Odds(
   if (
     firstHalfMarket
   ) {
-
     const periodCandidates = [
       firstHalfMarket?.[
         "period=1h"
       ],
-
       firstHalfMarket?.[
         "period_1h"
       ],
-
       firstHalfMarket?.[
         "1h"
       ],
-
       firstHalfMarket?.[
         "period1h"
       ]
@@ -1806,7 +1963,6 @@ function extractOver05Odds(
       const period
       of periodCandidates
     ) {
-
       if (!period) {
         continue;
       }
@@ -1818,13 +1974,11 @@ function extractOver05Odds(
         Array.isArray(
           selections
         )
-      ) {
-
+      {
         for (
           const selection
           of selections
         ) {
-
           if (
             isOverSelection(
               selection
@@ -1835,7 +1989,6 @@ function extractOver05Odds(
               )
             )
           ) {
-
             const price =
               extractPriceFromSelection(
                 selection
@@ -1844,7 +1997,6 @@ function extractOver05Odds(
             if (
               price !== null
             ) {
-
               return price;
             }
           }
@@ -1854,16 +2006,14 @@ function extractOver05Odds(
       if (
         selections &&
         typeof selections ===
-          "object"
+        "object"
       ) {
-
         for (
           const key
           of Object.keys(
             selections
           )
         ) {
-
           const selection =
             selections[key];
 
@@ -1896,7 +2046,6 @@ function extractOver05Odds(
           if (
             price !== null
           ) {
-
             return price;
           }
         }
@@ -1918,7 +2067,6 @@ function buildMatch(
   event,
   competition
 ) {
-
   const home =
     teamName(
       event?.home
@@ -1954,7 +2102,6 @@ function buildMatch(
       ),
 
     home,
-
     away,
 
     status:
@@ -2011,13 +2158,8 @@ async function scan(
   env,
   request
 ) {
-
   const scanStarted =
     Date.now();
-
-  // ==========================================================
-  // SOCCER FETCH
-  // ==========================================================
 
   const soccerStarted =
     Date.now();
@@ -2030,10 +2172,6 @@ async function scan(
   const soccerElapsed =
     Date.now() -
     soccerStarted;
-
-  // ==========================================================
-  // COMPETITIONS
-  // ==========================================================
 
   const competitions =
     getCompetitions(
@@ -2058,7 +2196,6 @@ async function scan(
       limit
     )
   ) {
-
     limit = 100;
   }
 
@@ -2099,13 +2236,15 @@ async function scan(
     await mapWithConcurrency(
       selected,
 
-      async competition => {
+      async (
+        competition,
+        index,
+        launchOrder
+      ) => {
+        const requestStarted =
+          Date.now();
 
         try {
-
-          const dataStarted =
-            Date.now();
-
           const data =
             await getCompetition(
               env,
@@ -2114,7 +2253,7 @@ async function scan(
 
           const requestElapsed =
             Date.now() -
-            dataStarted;
+            requestStarted;
 
           const events =
             Array.isArray(
@@ -2127,13 +2266,22 @@ async function scan(
             competition,
             events,
             error: null,
+
             elapsed_ms:
-              requestElapsed
+              requestElapsed,
+
+            launch_order:
+              launchOrder,
+
+            index
           };
 
         } catch (
           error
         ) {
+          const requestElapsed =
+            Date.now() -
+            requestStarted;
 
           return {
             competition,
@@ -2144,7 +2292,12 @@ async function scan(
               String(error),
 
             elapsed_ms:
-              null
+              requestElapsed,
+
+            launch_order:
+              launchOrder,
+
+            index
           };
         }
       },
@@ -2155,6 +2308,18 @@ async function scan(
   const competitionElapsed =
     Date.now() -
     competitionStarted;
+
+  // ==========================================================
+  // LATENCY DIAGNOSTIC
+  // ==========================================================
+
+  const latencyDiagnostic =
+    buildLatencyDiagnostic(
+      results,
+      COMPETITION_CONCURRENCY,
+      selected.length,
+      competitionElapsed
+    );
 
   // ==========================================================
   // RESULTS / EVENTS
@@ -2182,14 +2347,12 @@ async function scan(
     const result
     of results
   ) {
-
     totalEvents +=
       result.events.length;
 
     if (
       result.error
     ) {
-
       competitionsFailed++;
 
       errors.push({
@@ -2203,7 +2366,10 @@ async function scan(
           result.error,
 
         elapsed_ms:
-          result.elapsed_ms
+          result.elapsed_ms,
+
+        launch_order:
+          result.launch_order
       });
 
       continue;
@@ -2216,12 +2382,10 @@ async function scan(
         result.elapsed_ms
       )
     ) {
-
       if (
         result.elapsed_ms >=
         1000
       ) {
-
         slowCompetitionRequests++;
       }
 
@@ -2229,7 +2393,6 @@ async function scan(
         result.elapsed_ms >
         slowestCompetitionMs
       ) {
-
         slowestCompetitionMs =
           result.elapsed_ms;
 
@@ -2242,13 +2405,11 @@ async function scan(
       const event
       of result.events
     ) {
-
       if (
         !isLive(
           event
         )
       ) {
-
         continue;
       }
 
@@ -2264,7 +2425,6 @@ async function scan(
         !match.home ||
         !match.away
       ) {
-
         continue;
       }
 
@@ -2278,16 +2438,11 @@ async function scan(
     Date.now() -
     processingStarted;
 
-  // ==========================================================
-  // SORT
-  // ==========================================================
-
   matches.sort(
     (
       a,
       b
     ) => {
-
       const am =
         a.minute === null
           ? 999
@@ -2302,19 +2457,11 @@ async function scan(
     }
   );
 
-  // ==========================================================
-  // LIMIT
-  // ==========================================================
-
   const limitedMatches =
     matches.slice(
       0,
       limit
     );
-
-  // ==========================================================
-  // ODDS STATISTICS
-  // ==========================================================
 
   const oddsFound =
     limitedMatches.filter(
@@ -2338,10 +2485,6 @@ async function scan(
     Date.now() -
     scanStarted;
 
-  // ==========================================================
-  // RESPONSE
-  // ==========================================================
-
   return {
     success: true,
 
@@ -2349,7 +2492,7 @@ async function scan(
       "CLOUDBET ALL LIVE SOCCER",
 
     version:
-      "V5.2",
+      "V5.3",
 
     filter:
       "SOCCER + LIVE ONLY",
@@ -2389,7 +2532,10 @@ async function scan(
         slowestCompetitionMs,
 
       slowest_competition:
-        slowestCompetitionKey
+        slowestCompetitionKey,
+
+      latency_diagnostic:
+        latencyDiagnostic
     },
 
     stats: {
@@ -2452,7 +2598,6 @@ async function searchMatch(
   env,
   request
 ) {
-
   const started =
     Date.now();
 
@@ -2479,7 +2624,6 @@ async function searchMatch(
     !requestedHome ||
     !requestedAway
   ) {
-
     return {
       success: false,
 
@@ -2531,9 +2675,7 @@ async function searchMatch(
       selected,
 
       async competition => {
-
         try {
-
           const data =
             await getCompetition(
               env,
@@ -2556,7 +2698,6 @@ async function searchMatch(
         } catch (
           error
         ) {
-
           return {
             competition,
             events: [],
@@ -2575,14 +2716,12 @@ async function searchMatch(
     const result
     of results
   ) {
-
     totalEventsChecked +=
       result.events.length;
 
     if (
       result.error
     ) {
-
       competitionsFailed++;
 
       errors.push({
@@ -2605,7 +2744,6 @@ async function searchMatch(
       const event
       of result.events
     ) {
-
       const eventHome =
         teamName(
           event?.home
@@ -2620,7 +2758,6 @@ async function searchMatch(
         !eventHome ||
         !eventAway
       ) {
-
         continue;
       }
 
@@ -2635,7 +2772,6 @@ async function searchMatch(
       if (
         !score.matched
       ) {
-
         continue;
       }
 
@@ -2675,7 +2811,6 @@ async function searchMatch(
     null;
 
   if (!best) {
-
     return {
       success: true,
 
@@ -2862,24 +2997,20 @@ async function searchMatch(
 function health(
   env
 ) {
-
   let secret = false;
   let length = 0;
 
   try {
-
     const key =
       getApiKey(
         env
       );
 
     secret = true;
-
     length =
       key.length;
 
   } catch {
-
     secret = false;
   }
 
@@ -2890,7 +3021,7 @@ function health(
       "cloudbet-live-soccer",
 
     version:
-      "V5.2",
+      "V5.3",
 
     mode:
       "READ ONLY",
@@ -2981,6 +3112,23 @@ function health(
         false
     },
 
+    diagnostic: {
+      enabled: true,
+
+      measures:
+        [
+          "min",
+          "max",
+          "average",
+          "median",
+          "p90",
+          "p95",
+          "p99",
+          "latency_buckets",
+          "launch_order"
+        ]
+    },
+
     timestamp:
       new Date().toISOString()
   };
@@ -2992,12 +3140,10 @@ function health(
 // ============================================================
 
 export default {
-
   async fetch(
     request,
     env
   ) {
-
     const url =
       new URL(
         request.url
@@ -3010,16 +3156,10 @@ export default {
       ) || "/";
 
     try {
-
-      // ------------------------------------------------------
-      // HEALTH
-      // ------------------------------------------------------
-
       if (
         path === "/" ||
         path === "/health"
       ) {
-
         return json(
           health(
             env
@@ -3027,15 +3167,9 @@ export default {
         );
       }
 
-
-      // ------------------------------------------------------
-      // LIVE
-      // ------------------------------------------------------
-
       if (
         path === "/live"
       ) {
-
         return json(
           await scan(
             env,
@@ -3044,15 +3178,9 @@ export default {
         );
       }
 
-
-      // ------------------------------------------------------
-      // SEARCH MATCH
-      // ------------------------------------------------------
-
       if (
         path === "/search"
       ) {
-
         return json(
           await searchMatch(
             env,
@@ -3061,15 +3189,9 @@ export default {
         );
       }
 
-
-      // ------------------------------------------------------
-      // EVENT TEST
-      // ------------------------------------------------------
-
       if (
         path === "/event"
       ) {
-
         const id =
           url.searchParams.get(
             "id"
@@ -3079,7 +3201,6 @@ export default {
           !id ||
           !/^\d+$/.test(id)
         ) {
-
           return json(
             {
               success: false,
@@ -3107,7 +3228,7 @@ export default {
             "CLOUDBET EVENT",
 
           version:
-            "V5.2",
+            "V5.3",
 
           event_id:
             id,
@@ -3129,11 +3250,6 @@ export default {
             new Date().toISOString()
         });
       }
-
-
-      // ------------------------------------------------------
-      // 404
-      // ------------------------------------------------------
 
       return json(
         {
@@ -3157,7 +3273,6 @@ export default {
     } catch (
       error
     ) {
-
       return json(
         {
           success: false,
@@ -3166,7 +3281,7 @@ export default {
             "cloudbet-live-soccer",
 
           version:
-            "V5.2",
+            "V5.3",
 
           error:
             error?.message ||
