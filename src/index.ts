@@ -133,7 +133,6 @@ async function cloudbetFetch(
     Date.now();
 
   const apiKey =
-    env[CLOUD​BET_API_KEY as keyof Env] ??
     env.CLOUDBET_API_KEY;
 
   const url =
