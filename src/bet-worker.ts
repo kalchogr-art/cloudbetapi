@@ -1,22 +1,20 @@
 // ============================================================
-// CLOUDBET BET WORKER V5.8.8
+// CLOUDBET BET WORKER V5.8.9
 // DRY RUN · EXACT 1H TOTAL GOALS OVER 0.5
 //
 // FLOW:
 // TRACKER → MATCHER → CLOUDBET EVENT → EXACT TARGET → RETRY
 //
-// EXACT TARGET ONLY:
-// market    = soccer.total_goals_period_first_half
-// submarket = period=1h
-// outcome   = over
-// params    = total=0.5
-//
-// RETRY:
-// 20 attempts
-// 30 seconds between attempts
-// SAME Cloudbet event
-//
-// REAL BETTING: DISABLED
+// V5.8.9:
+// - /run service timeout protection
+// - TRACKER / MATCHER / CLOUDBET independently diagnosed
+// - Promise.allSettled() prevents one service from hanging /run
+// - EXACT target only
+// - SAME Cloudbet event retry
+// - 20 attempts
+// - 30 seconds between attempts
+// - /lines diagnostic
+// - Real betting disabled
 // ============================================================
 
 interface Env {
@@ -28,7 +26,7 @@ interface Env {
 
 type Obj = Record<string, any>;
 
-const VERSION = "V5.8.8";
+const VERSION = "V5.8.9";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -52,7 +50,12 @@ const TARGET_OUTCOME =
 const TARGET_PARAMS =
   "total=0.5";
 
-// ─── RETRY ─────────────────────────────────────────────────
+// ─── TIMEOUT / RETRY ──────────────────────────────────────
+
+// Timeout applies to individual service requests.
+// It does NOT replace the 20 × 30 sec odds retry.
+
+const SERVICE_TIMEOUT_MS = 10_000;
 
 const ODDS_EVENT_MAX_RETRIES = 20;
 const ODDS_EVENT_RETRY_DELAY_MS = 30_000;
@@ -135,17 +138,23 @@ function norm(v: any): string {
 }
 
 function json(data: any, status = 200): Response {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=UTF-8",
-      "cache-control": "no-store"
+  return new Response(
+    JSON.stringify(data, null, 2),
+    {
+      status,
+      headers: {
+        "content-type":
+          "application/json; charset=UTF-8",
+        "cache-control": "no-store"
+      }
     }
-  });
+  );
 }
 
 function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise(resolve =>
+    setTimeout(resolve, ms)
+  );
 }
 
 // ─── TEAM NORMALIZATION ────────────────────────────────────
@@ -153,14 +162,19 @@ function sleep(ms: number): Promise<void> {
 function normalizeTeam(value: any): string {
   let result = norm(value);
 
-  for (const [alias, full] of Object.entries(TEAM_ALIASES)) {
+  for (const [alias, full] of Object.entries(
+    TEAM_ALIASES
+  )) {
     const escaped = alias.replace(
       /[.*+?^${}()|[\]\\]/g,
       "\\$&"
     );
 
     result = result.replace(
-      new RegExp(`(^|\\s)${escaped}(?=\\s|$)`, "g"),
+      new RegExp(
+        `(^|\\s)${escaped}(?=\\s|$)`,
+        "g"
+      ),
       `$1${full}`
     );
   }
@@ -190,18 +204,29 @@ function splitMatch(value: any): {
 } {
   const text = safe(value);
 
-  for (const separator of [" - ", " v ", " vs ", " VS ", " @ "]) {
+  for (const separator of [
+    " - ",
+    " v ",
+    " vs ",
+    " VS ",
+    " @ "
+  ]) {
     const i = text.indexOf(separator);
 
     if (i >= 0) {
       return {
         home: text.slice(0, i).trim(),
-        away: text.slice(i + separator.length).trim()
+        away: text.slice(
+          i + separator.length
+        ).trim()
       };
     }
   }
 
-  return { home: "", away: "" };
+  return {
+    home: "",
+    away: ""
+  };
 }
 
 function extractHome(m: Obj): string {
@@ -216,7 +241,10 @@ function extractHome(m: Obj): string {
     m?.home_team?.name ??
     m?.teams?.home?.name;
 
-  if (typeof direct === "string" && direct.trim()) {
+  if (
+    typeof direct === "string" &&
+    direct.trim()
+  ) {
     return direct.trim();
   }
 
@@ -239,7 +267,10 @@ function extractAway(m: Obj): string {
     m?.away_team?.name ??
     m?.teams?.away?.name;
 
-  if (typeof direct === "string" && direct.trim()) {
+  if (
+    typeof direct === "string" &&
+    direct.trim()
+  ) {
     return direct.trim();
   }
 
@@ -273,7 +304,10 @@ function extractMatchId(m: Obj): string {
   );
 }
 
-function teamsPresent(home: any, away: any): boolean {
+function teamsPresent(
+  home: any,
+  away: any
+): boolean {
   return (
     normalizeTeam(home).length > 0 &&
     normalizeTeam(away).length > 0
@@ -282,7 +316,10 @@ function teamsPresent(home: any, away: any): boolean {
 
 // ─── TEAM MATCHING ─────────────────────────────────────────
 
-function levenshtein(a: string, b: string): number {
+function levenshtein(
+  a: string,
+  b: string
+): number {
   const aa = norm(a);
   const bb = norm(b);
 
@@ -291,10 +328,18 @@ function levenshtein(a: string, b: string): number {
     (_, i) => i
   );
 
-  for (let i = 1; i <= aa.length; i++) {
+  for (
+    let i = 1;
+    i <= aa.length;
+    i++
+  ) {
     const current = [i];
 
-    for (let j = 1; j <= bb.length; j++) {
+    for (
+      let j = 1;
+      j <= bb.length;
+      j++
+    ) {
       current[j] =
         aa[i - 1] === bb[j - 1]
           ? previous[j - 1]
@@ -305,7 +350,11 @@ function levenshtein(a: string, b: string): number {
             );
     }
 
-    for (let j = 0; j < current.length; j++) {
+    for (
+      let j = 0;
+      j < current.length;
+      j++
+    ) {
       previous[j] = current[j];
     }
   }
@@ -313,23 +362,34 @@ function levenshtein(a: string, b: string): number {
   return previous[bb.length];
 }
 
-function characterSimilarity(a: string, b: string): number {
+function characterSimilarity(
+  a: string,
+  b: string
+): number {
   const aa = normalizeTeam(a);
   const bb = normalizeTeam(b);
 
   if (!aa || !bb) return 0;
   if (aa === bb) return 1;
 
-  const max = Math.max(aa.length, bb.length);
+  const max = Math.max(
+    aa.length,
+    bb.length
+  );
+
   if (!max) return 0;
 
   return Math.max(
     0,
-    1 - levenshtein(aa, bb) / max
+    1 -
+      levenshtein(aa, bb) / max
   );
 }
 
-function teamScore(a: string, b: string): Obj {
+function teamScore(
+  a: string,
+  b: string
+): Obj {
   const aa = normalizeTeam(a);
   const bb = normalizeTeam(b);
 
@@ -349,31 +409,48 @@ function teamScore(a: string, b: string): Obj {
     };
   }
 
-  if (aa.includes(bb) || bb.includes(aa)) {
+  if (
+    aa.includes(bb) ||
+    bb.includes(aa)
+  ) {
     const score = Math.max(
       CONTAINMENT_MIN_SCORE,
-      Math.min(aa.length, bb.length) /
-        Math.max(aa.length, bb.length)
+      Math.min(
+        aa.length,
+        bb.length
+      ) /
+        Math.max(
+          aa.length,
+          bb.length
+        )
     );
 
     return {
       score,
       method: "CONTAINMENT",
-      accepted: score >= TEAM_MATCH_MIN_SCORE
+      accepted:
+        score >= TEAM_MATCH_MIN_SCORE
     };
   }
 
-  const aTokens = new Set(teamTokens(aa));
-  const bTokens = new Set(teamTokens(bb));
-
-  const common = [...aTokens].filter(x =>
-    bTokens.has(x)
-  ).length;
-
-  const denominator = Math.max(
-    aTokens.size,
-    bTokens.size
+  const aTokens = new Set(
+    teamTokens(aa)
   );
+
+  const bTokens = new Set(
+    teamTokens(bb)
+  );
+
+  const common =
+    [...aTokens].filter(x =>
+      bTokens.has(x)
+    ).length;
+
+  const denominator =
+    Math.max(
+      aTokens.size,
+      bTokens.size
+    );
 
   const ratio =
     denominator > 0
@@ -391,13 +468,18 @@ function teamScore(a: string, b: string): Obj {
     };
   }
 
-  const score = characterSimilarity(aa, bb);
+  const score =
+    characterSimilarity(
+      aa,
+      bb
+    );
 
   return {
     score,
     method: "CHARACTER",
     accepted:
-      score >= CHARACTER_SIMILARITY_MIN_SCORE
+      score >=
+      CHARACTER_SIMILARITY_MIN_SCORE
   };
 }
 
@@ -407,39 +489,58 @@ function twoSidedTeamScore(
   homeB: string,
   awayB: string
 ): Obj {
-  const normalHome = teamScore(homeA, homeB);
-  const normalAway = teamScore(awayA, awayB);
+  const normalHome =
+    teamScore(homeA, homeB);
 
-  const normal = Math.min(
-    normalHome.score,
-    normalAway.score
-  );
+  const normalAway =
+    teamScore(awayA, awayB);
 
-  const reverseHome = teamScore(homeA, awayB);
-  const reverseAway = teamScore(awayA, homeB);
+  const normal =
+    Math.min(
+      normalHome.score,
+      normalAway.score
+    );
 
-  const reverse = Math.min(
-    reverseHome.score,
-    reverseAway.score
-  );
+  const reverseHome =
+    teamScore(homeA, awayB);
+
+  const reverseAway =
+    teamScore(awayA, homeB);
+
+  const reverse =
+    Math.min(
+      reverseHome.score,
+      reverseAway.score
+    );
 
   const normalAccepted =
-    normalHome.score >= TEAM_MATCH_MIN_SCORE &&
-    normalAway.score >= TEAM_MATCH_MIN_SCORE;
+    normalHome.score >=
+      TEAM_MATCH_MIN_SCORE &&
+    normalAway.score >=
+      TEAM_MATCH_MIN_SCORE;
 
   const reverseAccepted =
-    reverseHome.score >= TEAM_MATCH_MIN_SCORE &&
-    reverseAway.score >= TEAM_MATCH_MIN_SCORE;
+    reverseHome.score >=
+      TEAM_MATCH_MIN_SCORE &&
+    reverseAway.score >=
+      TEAM_MATCH_MIN_SCORE;
 
-  if (normalAccepted && normal >= reverse) {
+  if (
+    normalAccepted &&
+    normal >= reverse
+  ) {
     return {
       matched: true,
       direction: "NORMAL",
       combined_score: normal,
-      home_score: normalHome.score,
-      away_score: normalAway.score,
-      home_method: normalHome.method,
-      away_method: normalAway.method
+      home_score:
+        normalHome.score,
+      away_score:
+        normalAway.score,
+      home_method:
+        normalHome.method,
+      away_method:
+        normalAway.method
     };
   }
 
@@ -448,57 +549,176 @@ function twoSidedTeamScore(
       matched: true,
       direction: "REVERSED",
       combined_score: reverse,
-      home_score: reverseHome.score,
-      away_score: reverseAway.score,
-      home_method: reverseHome.method,
-      away_method: reverseAway.method
+      home_score:
+        reverseHome.score,
+      away_score:
+        reverseAway.score,
+      home_method:
+        reverseHome.method,
+      away_method:
+        reverseAway.method
     };
   }
 
   return {
     matched: false,
     direction: null,
-    combined_score: Math.max(normal, reverse),
-    home_score: Math.max(
-      normalHome.score,
-      reverseHome.score
-    ),
-    away_score: Math.max(
-      normalAway.score,
-      reverseAway.score
-    )
+    combined_score:
+      Math.max(
+        normal,
+        reverse
+      ),
+    home_score:
+      Math.max(
+        normalHome.score,
+        reverseHome.score
+      ),
+    away_score:
+      Math.max(
+        normalAway.score,
+        reverseAway.score
+      )
   };
 }
 
-// ─── SERVICE FETCH ─────────────────────────────────────────
+// ─── SERVICE ERROR ─────────────────────────────────────────
+
+class ServiceRequestError
+  extends Error {
+  service: string;
+  path: string;
+  code: string;
+  status: number | null;
+
+  constructor(
+    service: string,
+    path: string,
+    code: string,
+    message: string,
+    status: number | null = null
+  ) {
+    super(message);
+
+    this.name =
+      "ServiceRequestError";
+
+    this.service =
+      service;
+
+    this.path =
+      path;
+
+    this.code =
+      code;
+
+    this.status =
+      status;
+  }
+
+  toJSON(): Obj {
+    return {
+      service: this.service,
+      path: this.path,
+      code: this.code,
+      status: this.status,
+      message: this.message
+    };
+  }
+}
+
+// ─── SERVICE FETCH WITH TIMEOUT ────────────────────────────
 
 async function fetchServiceJSON(
   service: Fetcher,
-  path: string
+  path: string,
+  serviceName = "UNKNOWN",
+  timeoutMs = SERVICE_TIMEOUT_MS
 ): Promise<Obj> {
-  const response = await service.fetch(
-    new Request(`https://service${path}`, {
-      method: "GET",
-      headers: {
-        accept: "application/json"
-      }
-    })
-  );
+  const controller =
+    new AbortController();
 
-  const text = await response.text();
-
-  if (!response.ok) {
-    throw new Error(
-      `HTTP ${response.status} ${path}: ${text.slice(0, 500)}`
+  const timer =
+    setTimeout(
+      () => controller.abort(),
+      timeoutMs
     );
-  }
-
-  if (!text.trim()) return {};
 
   try {
-    return JSON.parse(text);
-  } catch {
-    throw new Error(`Invalid JSON from ${path}`);
+    const response =
+      await service.fetch(
+        new Request(
+          `https://service${path}`,
+          {
+            method: "GET",
+            headers: {
+              accept:
+                "application/json"
+            },
+            signal:
+              controller.signal
+          }
+        )
+      );
+
+    const text =
+      await response.text();
+
+    if (!response.ok) {
+      throw new ServiceRequestError(
+        serviceName,
+        path,
+        "HTTP_ERROR",
+        `HTTP ${response.status}: ${text.slice(
+          0,
+          500
+        )}`,
+        response.status
+      );
+    }
+
+    if (!text.trim()) {
+      return {};
+    }
+
+    try {
+      return JSON.parse(text);
+    } catch {
+      throw new ServiceRequestError(
+        serviceName,
+        path,
+        "INVALID_JSON",
+        `Invalid JSON from ${serviceName} ${path}`
+      );
+    }
+  } catch (error) {
+    if (
+      error instanceof ServiceRequestError
+    ) {
+      throw error;
+    }
+
+    if (
+      error instanceof Error &&
+      error.name === "AbortError"
+    ) {
+      throw new ServiceRequestError(
+        serviceName,
+        path,
+        "SERVICE_TIMEOUT",
+        `${serviceName} ${path} timed out after ${timeoutMs}ms`
+      );
+    }
+
+    throw new ServiceRequestError(
+      serviceName,
+      path,
+      "SERVICE_FETCH_ERROR",
+      error instanceof Error
+        ? error.message
+        : String(error)
+    );
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -506,20 +726,32 @@ async function fetchCloudbetEvent(
   env: Env,
   eventId: string
 ): Promise<Obj> {
-  if (!eventId || !/^\d+$/.test(eventId)) {
-    throw new Error(
+  if (
+    !eventId ||
+    !/^\d+$/.test(eventId)
+  ) {
+    throw new ServiceRequestError(
+      "CLOUDBET",
+      `/event?id=${eventId}`,
+      "INVALID_CLOUDBET_EVENT_ID",
       `INVALID_CLOUDBET_EVENT_ID:${eventId}`
     );
   }
 
-  const data = await fetchServiceJSON(
-    env.CLOUDBET,
-    `/event?id=${encodeURIComponent(eventId)}`
-  );
+  const data =
+    await fetchServiceJSON(
+      env.CLOUDBET,
+      `/event?id=${encodeURIComponent(
+        eventId
+      )}`,
+      "CLOUDBET",
+      SERVICE_TIMEOUT_MS
+    );
 
   if (
     data?.data &&
-    typeof data.data === "object" &&
+    typeof data.data ===
+      "object" &&
     !Array.isArray(data.data)
   ) {
     return data.data;
@@ -530,7 +762,9 @@ async function fetchCloudbetEvent(
 
 // ─── TRACKER ───────────────────────────────────────────────
 
-function extractSignals(data: Obj): Obj[] {
+function extractSignals(
+  data: Obj
+): Obj[] {
   const source =
     data?.signals ??
     data?.entries ??
@@ -547,7 +781,9 @@ function extractSignals(data: Obj): Obj[] {
     : [];
 }
 
-function isHunterEntry(signal: Obj): boolean {
+function isHunterEntry(
+  signal: Obj
+): boolean {
   return (
     safe(
       signal?.type ??
@@ -558,7 +794,9 @@ function isHunterEntry(signal: Obj): boolean {
   );
 }
 
-function signalId(signal: Obj): string {
+function signalId(
+  signal: Obj
+): string {
   return safe(
     signal?.match_id ??
     signal?.matchId ??
@@ -567,21 +805,27 @@ function signalId(signal: Obj): string {
   );
 }
 
-function signalHome(signal: Obj): string {
+function signalHome(
+  signal: Obj
+): string {
   return safe(
     signal?.v27?.home ??
     extractHome(signal)
   );
 }
 
-function signalAway(signal: Obj): string {
+function signalAway(
+  signal: Obj
+): string {
   return safe(
     signal?.v27?.away ??
     extractAway(signal)
   );
 }
 
-function signalMatch(signal: Obj): string {
+function signalMatch(
+  signal: Obj
+): string {
   return safe(
     signal?.match ??
     signal?.name ??
@@ -591,7 +835,9 @@ function signalMatch(signal: Obj): string {
 
 // ─── MATCHER ───────────────────────────────────────────────
 
-function matcherMatches(data: Obj): Obj[] {
+function matcherMatches(
+  data: Obj
+): Obj[] {
   const source =
     data?.matches ??
     data?.results ??
@@ -599,10 +845,14 @@ function matcherMatches(data: Obj): Obj[] {
     data?.candidates ??
     [];
 
-  return Array.isArray(source) ? source : [];
+  return Array.isArray(source)
+    ? source
+    : [];
 }
 
-function matcherScore(item: Obj): number {
+function matcherScore(
+  item: Obj
+): number {
   const n = Number(
     item?.scoring?.total ??
     item?.scoring?.score ??
@@ -612,14 +862,24 @@ function matcherScore(item: Obj): number {
     0
   );
 
-  return Number.isFinite(n) ? n : 0;
+  return Number.isFinite(n)
+    ? n
+    : 0;
 }
 
-function matcherV27(item: Obj): Obj {
-  return item?.v27 ?? item?.source ?? item;
+function matcherV27(
+  item: Obj
+): Obj {
+  return (
+    item?.v27 ??
+    item?.source ??
+    item
+  );
 }
 
-function matcherCloudbet(item: Obj): Obj | null {
+function matcherCloudbet(
+  item: Obj
+): Obj | null {
   return (
     item?.cloudbet ??
     item?.target ??
@@ -628,7 +888,9 @@ function matcherCloudbet(item: Obj): Obj | null {
   );
 }
 
-function matcherClassification(item: Obj): string {
+function matcherClassification(
+  item: Obj
+): string {
   return safe(
     item?.classification ??
     item?.match_classification ??
@@ -636,7 +898,9 @@ function matcherClassification(item: Obj): string {
   );
 }
 
-function matcherMethod(item: Obj): string {
+function matcherMethod(
+  item: Obj
+): string {
   return safe(
     item?.match_method ??
     item?.method ??
@@ -648,12 +912,20 @@ function validateMatcher(
   signal: Obj,
   item: Obj
 ): Obj {
-  const v27 = matcherV27(item);
+  const v27 =
+    matcherV27(item);
 
-  const sh = signalHome(signal);
-  const sa = signalAway(signal);
-  const vh = extractHome(v27);
-  const va = extractAway(v27);
+  const sh =
+    signalHome(signal);
+
+  const sa =
+    signalAway(signal);
+
+  const vh =
+    extractHome(v27);
+
+  const va =
+    extractAway(v27);
 
   if (
     !teamsPresent(sh, sa) ||
@@ -661,32 +933,41 @@ function validateMatcher(
   ) {
     return {
       accepted: false,
-      reason: "TEAMS_MISSING"
+      reason:
+        "TEAMS_MISSING"
     };
   }
 
-  const teams = twoSidedTeamScore(
-    sh,
-    sa,
-    vh,
-    va
-  );
+  const teams =
+    twoSidedTeamScore(
+      sh,
+      sa,
+      vh,
+      va
+    );
 
   if (!teams.matched) {
     return {
       accepted: false,
-      reason: "STRICT_TWO_SIDED_TEAM_VALIDATION_FAILED",
+      reason:
+        "STRICT_TWO_SIDED_TEAM_VALIDATION_FAILED",
       team_scores: teams
     };
   }
 
-  const score = matcherScore(item);
+  const score =
+    matcherScore(item);
 
-  if (score < MIN_MATCHER_SCORE) {
+  if (
+    score <
+    MIN_MATCHER_SCORE
+  ) {
     return {
       accepted: false,
-      reason: "MATCHER_SCORE_BELOW_MINIMUM",
-      matcher_score: score
+      reason:
+        "MATCHER_SCORE_BELOW_MINIMUM",
+      matcher_score:
+        score
     };
   }
 
@@ -700,7 +981,8 @@ function validateMatcher(
   ) {
     return {
       accepted: false,
-      reason: "MATCH_NOT_CONFIDENT"
+      reason:
+        "MATCH_NOT_CONFIDENT"
     };
   }
 
@@ -710,11 +992,15 @@ function validateMatcher(
     classification:
       classification || null,
     method:
-      matcherMethod(item) || null,
-    matcher_score: score,
+      matcherMethod(item) ||
+      null,
+    matcher_score:
+      score,
     v27,
-    cloudbet: matcherCloudbet(item),
-    team_scores: teams
+    cloudbet:
+      matcherCloudbet(item),
+    team_scores:
+      teams
   };
 }
 
@@ -722,22 +1008,37 @@ function findBestMatcher(
   signal: Obj,
   data: Obj
 ): Obj {
-  let best: Obj | null = null;
-  const diagnostics: Obj[] = [];
+  let best: Obj | null =
+    null;
 
-  for (const item of matcherMatches(data)) {
-    const result = validateMatcher(
-      signal,
-      item
-    );
+  const diagnostics: Obj[] =
+    [];
+
+  for (
+    const item of
+    matcherMatches(data)
+  ) {
+    const result =
+      validateMatcher(
+        signal,
+        item
+      );
 
     if (!result.accepted) {
       diagnostics.push({
-        reason: result.reason,
-        score: matcherScore(item),
-        match: displayMatch(matcherV27(item)),
-        team_scores: result.team_scores ?? null
+        reason:
+          result.reason,
+        score:
+          matcherScore(item),
+        match:
+          displayMatch(
+            matcherV27(item)
+          ),
+        team_scores:
+          result.team_scores ??
+          null
       });
+
       continue;
     }
 
@@ -767,14 +1068,18 @@ function findBestMatcher(
 
 // ─── CLOUDBET LIVE ─────────────────────────────────────────
 
-function cloudbetMatches(data: Obj): Obj[] {
-  for (const source of [
-    data?.data?.matches,
-    data?.matches,
-    data?.live_matches,
-    data?.events,
-    data?.data
-  ]) {
+function cloudbetMatches(
+  data: Obj
+): Obj[] {
+  for (
+    const source of [
+      data?.data?.matches,
+      data?.matches,
+      data?.live_matches,
+      data?.events,
+      data?.data
+    ]
+  ) {
     if (Array.isArray(source)) {
       return source;
     }
@@ -783,12 +1088,20 @@ function cloudbetMatches(data: Obj): Obj[] {
   return [];
 }
 
-function isCloudbetLive(m: Obj): boolean {
-  const status = safe(m?.status).toUpperCase();
-  const state = safe(m?.state).toUpperCase();
+function isCloudbetLive(
+  m: Obj
+): boolean {
+  const status =
+    safe(m?.status)
+      .toUpperCase();
+
+  const state =
+    safe(m?.state)
+      .toUpperCase();
 
   return (
-    status === "TRADING_LIVE" ||
+    status ===
+      "TRADING_LIVE" ||
     state === "LIVE" ||
     m?.live === true
   );
@@ -798,37 +1111,49 @@ function findCloudbet(
   signal: Obj,
   liveMatches: Obj[]
 ): Obj {
-  const id = signalId(signal);
+  const id =
+    signalId(signal);
 
   if (id) {
-    const exact = liveMatches.find(
-      m => extractMatchId(m) === id
-    );
+    const exact =
+      liveMatches.find(
+        m =>
+          extractMatchId(m) ===
+          id
+      );
 
     if (exact) {
       return {
         found: true,
-        source: "CLOUDBET_ID",
+        source:
+          "CLOUDBET_ID",
         cloudbet: exact
       };
     }
   }
 
-  let best: Obj | null = null;
+  let best: Obj | null =
+    null;
 
-  for (const match of liveMatches) {
-    const score = twoSidedTeamScore(
-      signalHome(signal),
-      signalAway(signal),
-      extractHome(match),
-      extractAway(match)
-    );
+  for (
+    const match of liveMatches
+  ) {
+    const score =
+      twoSidedTeamScore(
+        signalHome(signal),
+        signalAway(signal),
+        extractHome(match),
+        extractAway(match)
+      );
 
     if (
       score.matched &&
-      (!best ||
+      (
+        !best ||
         score.combined_score >
-          best.team_scores.combined_score)
+          best.team_scores
+            .combined_score
+      )
     ) {
       best = {
         cloudbet: match,
@@ -847,9 +1172,12 @@ function findCloudbet(
 
   return {
     found: true,
-    source: "STRICT_TWO_SIDED_TEAMS",
-    cloudbet: best.cloudbet,
-    team_scores: best.team_scores
+    source:
+      "STRICT_TWO_SIDED_TEAMS",
+    cloudbet:
+      best.cloudbet,
+    team_scores:
+      best.team_scores
   };
 }
 
@@ -858,56 +1186,73 @@ function verifyCloudbet(
   matcher: Obj,
   liveMatches: Obj[]
 ): Obj {
-  const matcherCloudbet = matcher?.cloudbet;
-  const matcherId = extractMatchId(
-    matcherCloudbet ?? {}
-  );
+  const matcherCloudbet =
+    matcher?.cloudbet;
 
-  if (matcherId) {
-    const exact = liveMatches.find(
-      m => extractMatchId(m) === matcherId
+  const matcherId =
+    extractMatchId(
+      matcherCloudbet ?? {}
     );
 
-    if (exact) {
-      const score = twoSidedTeamScore(
-        signalHome(signal),
-        signalAway(signal),
-        extractHome(exact),
-        extractAway(exact)
+  if (matcherId) {
+    const exact =
+      liveMatches.find(
+        m =>
+          extractMatchId(m) ===
+          matcherId
       );
+
+    if (exact) {
+      const score =
+        twoSidedTeamScore(
+          signalHome(signal),
+          signalAway(signal),
+          extractHome(exact),
+          extractAway(exact)
+        );
 
       if (score.matched) {
         return {
           verified: true,
-          source: "MATCHER_CLOUDBET_ID",
+          source:
+            "MATCHER_CLOUDBET_ID",
           cloudbet: exact,
-          cloudbet_id: matcherId,
-          team_scores: score
+          cloudbet_id:
+            matcherId,
+          team_scores:
+            score
         };
       }
     }
   }
 
-  const direct = findCloudbet(
-    signal,
-    liveMatches
-  );
+  const direct =
+    findCloudbet(
+      signal,
+      liveMatches
+    );
 
   if (direct.found) {
     return {
       verified: true,
-      source: direct.source,
-      cloudbet: direct.cloudbet,
+      source:
+        direct.source,
+      cloudbet:
+        direct.cloudbet,
       cloudbet_id:
-        extractMatchId(direct.cloudbet),
+        extractMatchId(
+          direct.cloudbet
+        ),
       team_scores:
-        direct.team_scores ?? null
+        direct.team_scores ??
+        null
     };
   }
 
   return {
     verified: false,
-    source: "NOT_VERIFIED",
+    source:
+      "NOT_VERIFIED",
     cloudbet: null,
     cloudbet_id: null
   };
@@ -915,9 +1260,13 @@ function verifyCloudbet(
 
 // ─── EXACT TARGET EXTRACTION ───────────────────────────────
 
-function enabled(selection: Obj): boolean {
+function enabled(
+  selection: Obj
+): boolean {
   const status =
-    safe(selection?.status).toUpperCase();
+    safe(
+      selection?.status
+    ).toUpperCase();
 
   return (
     !status ||
@@ -935,9 +1284,13 @@ function targetSelection(
   selection: Obj
 ): boolean {
   return (
-    safe(selection?.outcome).toLowerCase() ===
+    safe(
+      selection?.outcome
+    ).toLowerCase() ===
       TARGET_OUTCOME &&
-    safe(selection?.params).toLowerCase() ===
+    safe(
+      selection?.params
+    ).toLowerCase() ===
       TARGET_PARAMS
   );
 }
@@ -945,15 +1298,24 @@ function targetSelection(
 function validTarget(
   selection: Obj
 ): boolean {
-  if (!targetSelection(selection)) {
+  if (
+    !targetSelection(
+      selection
+    )
+  ) {
     return false;
   }
 
-  if (!enabled(selection)) {
+  if (
+    !enabled(selection)
+  ) {
     return false;
   }
 
-  const price = Number(selection?.price);
+  const price =
+    Number(
+      selection?.price
+    );
 
   if (
     !Number.isFinite(price) ||
@@ -962,12 +1324,15 @@ function validTarget(
     return false;
   }
 
-  const maxStake = Number(
-    selection?.maxStake
-  );
+  const maxStake =
+    Number(
+      selection?.maxStake
+    );
 
   if (
-    Number.isFinite(maxStake) &&
+    Number.isFinite(
+      maxStake
+    ) &&
     maxStake <= 0
   ) {
     return false;
@@ -976,11 +1341,21 @@ function validTarget(
   return true;
 }
 
-function marketEntries(event: Obj): Obj[] {
-  const result: Obj[] = [];
+function marketEntries(
+  event: Obj
+): Obj[] {
+  const result: Obj[] =
+    [];
 
-  if (Array.isArray(event?.markets)) {
-    for (const market of event.markets) {
+  if (
+    Array.isArray(
+      event?.markets
+    )
+  ) {
+    for (
+      const market of
+      event.markets
+    ) {
       result.push({
         ...market,
         _market_key: safe(
@@ -993,22 +1368,32 @@ function marketEntries(event: Obj): Obj[] {
     }
   } else if (
     event?.markets &&
-    typeof event.markets === "object"
+    typeof event.markets ===
+      "object"
   ) {
-    for (const [key, value] of Object.entries(
-      event.markets
-    )) {
+    for (
+      const [
+        key,
+        value
+      ] of Object.entries(
+        event.markets
+      )
+    ) {
       if (
         value &&
-        typeof value === "object"
+        typeof value ===
+          "object"
       ) {
         result.push({
           ...(value as Obj),
-          _market_key: safe(
-            (value as Obj)?.market_key ??
-            (value as Obj)?.marketKey ??
-            key
-          )
+          _market_key:
+            safe(
+              (value as Obj)
+                ?.market_key ??
+              (value as Obj)
+                ?.marketKey ??
+              key
+            )
         });
       }
     }
@@ -1020,38 +1405,57 @@ function marketEntries(event: Obj): Obj[] {
 function submarketEntries(
   market: Obj
 ): Obj[] {
-  const result: Obj[] = [];
+  const result: Obj[] =
+    [];
 
-  if (Array.isArray(market?.submarkets)) {
-    for (const sub of market.submarkets) {
+  if (
+    Array.isArray(
+      market?.submarkets
+    )
+  ) {
+    for (
+      const sub of
+      market.submarkets
+    ) {
       result.push({
         ...sub,
-        _submarket_key: safe(
-          sub?.submarket_key ??
-          sub?.submarketKey ??
-          sub?.key ??
-          sub?.market
-        )
+        _submarket_key:
+          safe(
+            sub?.submarket_key ??
+            sub?.submarketKey ??
+            sub?.key ??
+            sub?.market
+          )
       });
     }
   } else if (
     market?.submarkets &&
-    typeof market.submarkets === "object"
+    typeof market.submarkets ===
+      "object"
   ) {
-    for (const [key, value] of Object.entries(
-      market.submarkets
-    )) {
+    for (
+      const [
+        key,
+        value
+      ] of Object.entries(
+        market.submarkets
+      )
+    ) {
       if (
         value &&
-        typeof value === "object"
+        typeof value ===
+          "object"
       ) {
         result.push({
           ...(value as Obj),
-          _submarket_key: safe(
-            (value as Obj)?.submarket_key ??
-            (value as Obj)?.submarketKey ??
-            key
-          )
+          _submarket_key:
+            safe(
+              (value as Obj)
+                ?.submarket_key ??
+              (value as Obj)
+                ?.submarketKey ??
+              key
+            )
         });
       }
     }
@@ -1063,30 +1467,50 @@ function submarketEntries(
 function findExactSelection(
   event: Obj
 ): Obj | null {
-  for (const market of marketEntries(event)) {
+  for (
+    const market of
+    marketEntries(event)
+  ) {
     if (
-      safe(market?._market_key).toLowerCase() !==
+      safe(
+        market?._market_key
+      ).toLowerCase() !==
       TARGET_MARKET
     ) {
       continue;
     }
 
-    for (const sub of submarketEntries(market)) {
+    for (
+      const sub of
+      submarketEntries(
+        market
+      )
+    ) {
       if (
-        safe(sub?._submarket_key).toLowerCase() !==
+        safe(
+          sub?._submarket_key
+        ).toLowerCase() !==
         TARGET_SUBMARKET
       ) {
         continue;
       }
 
-      const selections = Array.isArray(
-        sub?.selections
-      )
-        ? sub.selections
-        : [];
+      const selections =
+        Array.isArray(
+          sub?.selections
+        )
+          ? sub.selections
+          : [];
 
-      for (const selection of selections) {
-        if (validTarget(selection)) {
+      for (
+        const selection of
+        selections
+      ) {
+        if (
+          validTarget(
+            selection
+          )
+        ) {
           return selection;
         }
       }
@@ -1100,17 +1524,22 @@ function extractOdds(
   event: Obj
 ): number | null {
   const selection =
-    findExactSelection(event);
+    findExactSelection(
+      event
+    );
 
   if (!selection) {
     return null;
   }
 
-  const price = Number(
-    selection.price
-  );
+  const price =
+    Number(
+      selection.price
+    );
 
-  return Number.isFinite(price)
+  return Number.isFinite(
+    price
+  )
     ? price
     : null;
 }
@@ -1125,102 +1554,242 @@ function buildOddsDiagnostic(
   let selectionPresent = false;
   let selectionValid = false;
 
-  const rows: Obj[] = [];
+  const rows: Obj[] =
+    [];
 
-  for (const market of marketEntries(event)) {
+  for (
+    const market of
+    marketEntries(event)
+  ) {
     const marketKey =
-      safe(market?._market_key).toLowerCase();
+      safe(
+        market?._market_key
+      ).toLowerCase();
 
-    if (marketKey !== TARGET_MARKET) {
+    if (
+      marketKey !==
+      TARGET_MARKET
+    ) {
       continue;
     }
 
     marketFound = true;
 
-    for (const sub of submarketEntries(market)) {
+    for (
+      const sub of
+      submarketEntries(
+        market
+      )
+    ) {
       const subKey =
-        safe(sub?._submarket_key).toLowerCase();
+        safe(
+          sub?._submarket_key
+        ).toLowerCase();
 
-      if (subKey !== TARGET_SUBMARKET) {
+      if (
+        subKey !==
+        TARGET_SUBMARKET
+      ) {
         continue;
       }
 
       submarketFound = true;
 
       const selections =
-        Array.isArray(sub?.selections)
+        Array.isArray(
+          sub?.selections
+        )
           ? sub.selections
           : [];
 
-      for (const selection of selections) {
+      for (
+        const selection of
+        selections
+      ) {
         const outcome =
-          safe(selection?.outcome).toLowerCase();
+          safe(
+            selection?.outcome
+          ).toLowerCase();
 
         const params =
-          safe(selection?.params).toLowerCase();
+          safe(
+            selection?.params
+          ).toLowerCase();
 
-        const price = Number(
-          selection?.price
-        );
+        const price =
+          Number(
+            selection?.price
+          );
 
-        const maxStake = Number(
-          selection?.maxStake
-        );
+        const maxStake =
+          Number(
+            selection?.maxStake
+          );
 
         const exact =
-          outcome === TARGET_OUTCOME &&
-          params === TARGET_PARAMS;
+          outcome ===
+            TARGET_OUTCOME &&
+          params ===
+            TARGET_PARAMS;
 
         const valid =
           exact &&
-          enabled(selection) &&
-          Number.isFinite(price) &&
+          enabled(
+            selection
+          ) &&
+          Number.isFinite(
+            price
+          ) &&
           price > 1 &&
           (
-            !Number.isFinite(maxStake) ||
+            !Number.isFinite(
+              maxStake
+            ) ||
             maxStake > 0
           );
 
         if (exact) {
-          selectionPresent = true;
+          selectionPresent =
+            true;
         }
 
         if (valid) {
-          selectionValid = true;
+          selectionValid =
+            true;
         }
 
         rows.push({
-          market_key: marketKey,
-          submarket_key: subKey,
+          market_key:
+            marketKey,
+
+          submarket_key:
+            subKey,
+
           outcome,
+
           params,
+
           price:
-            Number.isFinite(price)
+            Number.isFinite(
+              price
+            )
               ? price
               : null,
+
           raw_price:
-            selection?.price ?? null,
+            selection?.price ??
+            null,
+
           status:
-            selection?.status ?? null,
+            selection?.status ??
+            null,
+
+          enabled:
+            selection?.enabled ??
+            null,
+
           maxStake:
-            Number.isFinite(maxStake)
+            Number.isFinite(
+              maxStake
+            )
               ? maxStake
               : null,
-          exact_target: exact,
-          target: valid,
-          raw_selection: selection
+
+          exact_target:
+            exact,
+
+          target:
+            valid,
+
+          raw_selection:
+            selection
         });
       }
     }
   }
 
+  let reason =
+    "TARGET_MARKET_MISSING";
+
+  if (marketFound) {
+    reason =
+      "TARGET_SUBMARKET_MISSING";
+  }
+
+  if (submarketFound) {
+    reason =
+      selectionPresent
+        ? "TARGET_SELECTION_INVALID"
+        : "TARGET_SELECTION_MISSING";
+  }
+
+  if (selectionValid) {
+    reason = "VALID";
+  } else if (
+    selectionPresent
+  ) {
+    const target =
+      rows.find(
+        x =>
+          x.exact_target
+      );
+
+    if (
+      target?.status &&
+      ![
+        "SELECTION_ENABLED",
+        "ENABLED",
+        "TRADING",
+        "OPEN",
+        "ACTIVE"
+      ].includes(
+        String(
+          target.status
+        ).toUpperCase()
+      )
+    ) {
+      reason =
+        "SELECTION_DISABLED";
+    } else if (
+      !Number.isFinite(
+        Number(
+          target?.price
+        )
+      ) ||
+      Number(
+        target?.price
+      ) <= 1
+    ) {
+      reason =
+        "INVALID_PRICE";
+    } else if (
+      Number.isFinite(
+        Number(
+          target?.maxStake
+        )
+      ) &&
+      Number(
+        target?.maxStake
+      ) <= 0
+    ) {
+      reason =
+        "MAX_STAKE_ZERO";
+    }
+  }
+
   return {
     target: {
-      market: TARGET_MARKET,
-      submarket: TARGET_SUBMARKET,
-      outcome: TARGET_OUTCOME,
-      params: TARGET_PARAMS
+      market:
+        TARGET_MARKET,
+      submarket:
+        TARGET_SUBMARKET,
+      outcome:
+        TARGET_OUTCOME,
+      params:
+        TARGET_PARAMS
     },
+
+    reason,
 
     extractor_result:
       extractOdds(event),
@@ -1237,7 +1806,8 @@ function buildOddsDiagnostic(
     target_selection_valid:
       selectionValid,
 
-    selections: rows,
+    selections:
+      rows,
 
     event_id:
       extractMatchId(event),
@@ -1249,11 +1819,8 @@ function buildOddsDiagnostic(
 
 // ─── RETRY SAME EVENT ──────────────────────────────────────
 //
-// IMPORTANT:
-//
 // Attempt 1 = immediately
 // Attempt 2 = +30 sec
-// Attempt 3 = +30 sec
 // ...
 // Attempt 20 = +30 sec
 //
@@ -1273,7 +1840,9 @@ async function resolveOddsWithRetry(
   cloudbet: Obj
 ): Promise<Obj> {
   const eventId =
-    extractMatchId(cloudbet);
+    extractMatchId(
+      cloudbet
+    );
 
   if (!eventId) {
     return {
@@ -1281,19 +1850,25 @@ async function resolveOddsWithRetry(
       event: cloudbet,
       odds: null,
       attempts: 0,
-      error: "CLOUDBET_EVENT_ID_MISSING",
+      error:
+        "CLOUDBET_EVENT_ID_MISSING",
       attempts_detail: []
     };
   }
 
-  const attempts: Obj[] = [];
+  const attempts: Obj[] =
+    [];
 
-  let lastEvent: Obj | null = null;
-  let lastDiagnostic: Obj | null = null;
+  let lastEvent: Obj | null =
+    null;
+
+  let lastDiagnostic: Obj | null =
+    null;
 
   for (
     let attempt = 1;
-    attempt <= ODDS_EVENT_MAX_RETRIES;
+    attempt <=
+      ODDS_EVENT_MAX_RETRIES;
     attempt++
   ) {
     try {
@@ -1303,59 +1878,110 @@ async function resolveOddsWithRetry(
           eventId
         );
 
-      lastEvent = event;
+      lastEvent =
+        event;
 
       const diagnostic =
-        buildOddsDiagnostic(event);
+        buildOddsDiagnostic(
+          event
+        );
 
-      lastDiagnostic = diagnostic;
+      lastDiagnostic =
+        diagnostic;
 
       const odds =
-        extractOdds(event);
+        extractOdds(
+          event
+        );
 
       attempts.push({
         attempt,
-        event_id: eventId,
+        event_id:
+          eventId,
         success: true,
         odds,
+
+        reason:
+          diagnostic.reason,
+
         target_selection_present:
-          diagnostic.target_selection_present,
+          diagnostic
+            .target_selection_present,
+
         target_selection_valid:
-          diagnostic.target_selection_valid
+          diagnostic
+            .target_selection_valid
       });
 
-      if (odds !== null) {
+      if (
+        odds !== null
+      ) {
         return {
           success: true,
-          source: "CLOUDBET_EVENT_SAME_EVENT_RETRY",
+
+          source:
+            "CLOUDBET_EVENT_SAME_EVENT_RETRY",
+
           event,
+
           odds,
+
           attempts: attempt,
+
           error: null,
+
           retry: {
             max_attempts:
               ODDS_EVENT_MAX_RETRIES,
+
             delay_ms:
               ODDS_EVENT_RETRY_DELAY_MS,
+
             attempts_used:
               attempt,
+
             valid_on_attempt:
               attempt
           },
-          attempts_detail: attempts,
+
+          attempts_detail:
+            attempts,
+
           diagnostic
         };
       }
     } catch (error) {
       attempts.push({
         attempt,
-        event_id: eventId,
+        event_id:
+          eventId,
+
         success: false,
+
         odds: null,
+
         error:
           error instanceof Error
             ? error.message
-            : String(error)
+            : String(error),
+
+        service:
+          error instanceof
+          ServiceRequestError
+            ? error.service
+            : "CLOUDBET",
+
+        path:
+          error instanceof
+          ServiceRequestError
+            ? error.path
+            : null,
+
+        code:
+          error instanceof
+          ServiceRequestError
+            ? error.code
+            : null
       });
     }
 
@@ -1371,27 +1997,45 @@ async function resolveOddsWithRetry(
 
   return {
     success: false,
-    source: "CLOUDBET_EVENT_RETRY_EXHAUSTED",
+
+    source:
+      "CLOUDBET_EVENT_RETRY_EXHAUSTED",
+
     event:
       lastEvent ??
       cloudbet,
+
     odds: null,
-    attempts: attempts.length,
+
+    attempts:
+      attempts.length,
+
     error:
       "TARGET_1H_OVER_0_5_NOT_FOUND_AFTER_20_ATTEMPTS",
+
     retry: {
       max_attempts:
         ODDS_EVENT_MAX_RETRIES,
+
       delay_ms:
         ODDS_EVENT_RETRY_DELAY_MS,
+
       attempts_used:
         attempts.length,
-      valid_on_attempt: null
+
+      valid_on_attempt:
+        null
     },
-    attempts_detail: attempts,
+
+    attempts_detail:
+      attempts,
+
     diagnostic:
       lastDiagnostic ??
-      buildOddsDiagnostic(cloudbet)
+      buildOddsDiagnostic(
+        lastEvent ??
+        cloudbet
+      )
   };
 }
 
@@ -1419,8 +2063,12 @@ function buildBet(
         : "ODDS_UNAVAILABLE",
 
     mode: MODE,
-    betting_enabled: BETTING_ENABLED,
-    dry_run: DRY_RUN,
+
+    betting_enabled:
+      BETTING_ENABLED,
+
+    dry_run:
+      DRY_RUN,
 
     signal_type:
       safe(
@@ -1453,22 +2101,36 @@ function buildBet(
       ),
 
     v27: {
-      id: signalId(signal),
-      home: signalHome(signal),
-      away: signalAway(signal)
+      id:
+        signalId(signal),
+
+      home:
+        signalHome(signal),
+
+      away:
+        signalAway(signal)
     },
 
     matcher: {
       classification:
-        matcher.classification ?? null,
+        matcher.classification ??
+        null,
+
       method:
-        matcher.method ?? null,
+        matcher.method ??
+        null,
+
       matcher_score:
-        matcher.matcher_score ?? null,
+        matcher.matcher_score ??
+        null,
+
       team_scores:
-        matcher.team_scores ?? null,
+        matcher.team_scores ??
+        null,
+
       source:
-        matcher.source ?? "MATCHER"
+        matcher.source ??
+        "MATCHER"
     },
 
     cloudbet: {
@@ -1485,13 +2147,17 @@ function buildBet(
         extractAway(event),
 
       status:
-        event?.status ?? null,
+        event?.status ??
+        null,
 
       state:
-        event?.state ?? null,
+        event?.state ??
+        null,
 
       live:
-        isCloudbetLive(event),
+        isCloudbetLive(
+          event
+        ),
 
       market:
         BET_MARKET,
@@ -1512,7 +2178,9 @@ function buildBet(
 
     odds_diagnostic:
       oddsResult.diagnostic ??
-      buildOddsDiagnostic(event),
+      buildOddsDiagnostic(
+        event
+      ),
 
     full_event_fetch: {
       success:
@@ -1525,13 +2193,16 @@ function buildBet(
         oddsResult.attempts,
 
       retry:
-        oddsResult.retry ?? null,
+        oddsResult.retry ??
+        null,
 
       error:
-        oddsResult.error ?? null,
+        oddsResult.error ??
+        null,
 
       attempts_detail:
-        oddsResult.attempts_detail ?? []
+        oddsResult.attempts_detail ??
+        []
     },
 
     stake_eur:
@@ -1550,35 +2221,45 @@ function buildCandidate(
 ): Obj {
   const odds =
     extractOdds(
-      bet?.cloudbet ?? {}
+      bet?.cloudbet ??
+      {}
     );
 
   return {
-    status: "BET_CANDIDATE",
+    status:
+      "BET_CANDIDATE",
 
-    mode: MODE,
+    mode:
+      MODE,
 
-    betting_enabled: false,
+    betting_enabled:
+      false,
 
-    dry_run: true,
+    dry_run:
+      true,
 
-    bet_placed: false,
+    bet_placed:
+      false,
 
     bet_action:
       "SIMULATED_ONLY",
 
     match:
-      bet?.match ?? null,
+      bet?.match ??
+      null,
 
     signal_match_id:
-      bet?.signal_match_id ?? null,
+      bet?.signal_match_id ??
+      null,
 
     hunter_score:
-      bet?.hunter_score ?? null,
+      bet?.hunter_score ??
+      null,
 
     cloudbet_id:
       extractMatchId(
-        bet?.cloudbet ?? {}
+        bet?.cloudbet ??
+        {}
       ),
 
     market:
@@ -1604,16 +2285,20 @@ function buildCandidate(
         : null,
 
     cloudbet:
-      bet?.cloudbet ?? null,
+      bet?.cloudbet ??
+      null,
 
     odds_diagnostic:
-      bet?.odds_diagnostic ?? null,
+      bet?.odds_diagnostic ??
+      null,
 
     full_event_fetch:
-      bet?.full_event_fetch ?? null,
+      bet?.full_event_fetch ??
+      null,
 
     matcher:
-      bet?.matcher ?? null,
+      bet?.matcher ??
+      null,
 
     simulated:
       true
@@ -1622,9 +2307,13 @@ function buildCandidate(
 
 // ─── D1 ARCHIVE ────────────────────────────────────────────
 
-function archiveKey(bet: Obj): string {
+function archiveKey(
+  bet: Obj
+): string {
   const id =
-    safe(bet?.signal_match_id);
+    safe(
+      bet?.signal_match_id
+    );
 
   if (id) {
     return `signal:${id}`;
@@ -1647,7 +2336,8 @@ async function archiveBets(
     return {
       success: false,
       inserted: 0,
-      error: "DB_BINDING_MISSING"
+      error:
+        "DB_BINDING_MISSING"
     };
   }
 
@@ -1662,7 +2352,8 @@ async function archiveBets(
     bets.map(bet => {
       const matcherScore =
         Number(
-          bet?.matcher?.matcher_score
+          bet?.matcher
+            ?.matcher_score
         );
 
       const hunterScore =
@@ -1672,7 +2363,8 @@ async function archiveBets(
 
       const combined =
         Number(
-          bet?.matcher?.team_scores
+          bet?.matcher
+            ?.team_scores
             ?.combined_score
         );
 
@@ -1702,29 +2394,59 @@ async function archiveBets(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
       `).bind(
         archiveKey(bet),
-        safe(bet?.signal_match_id) || null,
-        safe(bet?.match) || null,
-        safe(bet?.v27?.home) || null,
-        safe(bet?.v27?.away) || null,
-        Number.isFinite(minute) ? minute : null,
-        Number.isFinite(hunterScore)
+
+        safe(
+          bet?.signal_match_id
+        ) || null,
+
+        safe(
+          bet?.match
+        ) || null,
+
+        safe(
+          bet?.v27?.home
+        ) || null,
+
+        safe(
+          bet?.v27?.away
+        ) || null,
+
+        Number.isFinite(
+          minute
+        )
+          ? minute
+          : null,
+
+        Number.isFinite(
+          hunterScore
+        )
           ? hunterScore
           : null,
+
         safe(
           bet?.cloudbet?.id
         ) || null,
+
         safe(
           bet?.cloudbet?.match
         ) || null,
+
         safe(
           bet?.matcher?.source
         ) || "MATCHER",
-        Number.isFinite(matcherScore)
+
+        Number.isFinite(
+          matcherScore
+        )
           ? matcherScore
           : null,
-        Number.isFinite(combined)
+
+        Number.isFinite(
+          combined
+        )
           ? combined
           : null,
+
         safe(
           bet?.matcher
             ?.team_scores
@@ -1735,18 +2457,23 @@ async function archiveBets(
 
   try {
     const result =
-      await env.DB.batch(statements);
+      await env.DB.batch(
+        statements
+      );
 
     return {
       success: true,
-      inserted: result.length,
-      attempted: bets.length
+      inserted:
+        result.length,
+      attempted:
+        bets.length
     };
   } catch (error) {
     return {
       success: false,
       inserted: 0,
-      attempted: bets.length,
+      attempted:
+        bets.length,
       error:
         error instanceof Error
           ? error.message
@@ -1764,7 +2491,8 @@ async function savePending(
   if (!env.DB) {
     return {
       success: false,
-      error: "DB_BINDING_MISSING"
+      error:
+        "DB_BINDING_MISSING"
     };
   }
 
@@ -1776,14 +2504,16 @@ async function savePending(
   if (!cloudbetId) {
     return {
       success: false,
-      error: "CLOUDBET_ID_MISSING"
+      error:
+        "CLOUDBET_ID_MISSING"
     };
   }
 
   let payload = "{}";
 
   try {
-    payload = JSON.stringify(bet);
+    payload =
+      JSON.stringify(bet);
   } catch {}
 
   try {
@@ -1841,18 +2571,35 @@ async function savePending(
         updated_at = datetime('now')
     `).bind(
       archiveKey(bet),
+
       safe(
         bet?.signal_match_id
       ) || null,
+
       cloudbetId,
-      safe(bet?.match) || null,
-      safe(bet?.v27?.home) || null,
-      safe(bet?.v27?.away) || null,
+
+      safe(
+        bet?.match
+      ) || null,
+
+      safe(
+        bet?.v27?.home
+      ) || null,
+
+      safe(
+        bet?.v27?.away
+      ) || null,
+
       Number.isFinite(
-        Number(bet?.entry_minute)
+        Number(
+          bet?.entry_minute
+        )
       )
-        ? Number(bet.entry_minute)
+        ? Number(
+            bet.entry_minute
+          )
         : null,
+
       BET_MARKET,
       BET_SELECTION,
       BET_STAKE_EUR,
@@ -1862,9 +2609,12 @@ async function savePending(
 
     return {
       success: true,
-      status: "PENDING_ODDS",
-      archive_key: archiveKey(bet),
-      cloudbet_id: cloudbetId
+      status:
+        "PENDING_ODDS",
+      archive_key:
+        archiveKey(bet),
+      cloudbet_id:
+        cloudbetId
     };
   } catch (error) {
     return {
@@ -1893,7 +2643,10 @@ async function pendingRows(
       ORDER BY created_at ASC
     `).all();
 
-  return (result.results ?? []) as Obj[];
+  return (
+    result.results ??
+    []
+  ) as Obj[];
 }
 
 async function invalidate(
@@ -1944,7 +2697,9 @@ async function reschedule(
 
 // ─── PENDING VALIDATION ────────────────────────────────────
 
-function numberValue(v: any): number | null {
+function numberValue(
+  v: any
+): number | null {
   const n = Number(v);
 
   return Number.isFinite(n)
@@ -1952,36 +2707,65 @@ function numberValue(v: any): number | null {
     : null;
 }
 
-function scorePair(m: Obj): {
+function scorePair(
+  m: Obj
+): {
   home: number | null;
   away: number | null;
 } {
   const pairs = [
-    [m?.home_score, m?.away_score],
-    [m?.homeScore, m?.awayScore],
-    [m?.score?.home, m?.score?.away],
-    [m?.scores?.home, m?.scores?.away],
-    [m?.result?.home, m?.result?.away],
-    [m?.home?.score, m?.away?.score]
+    [
+      m?.home_score,
+      m?.away_score
+    ],
+    [
+      m?.homeScore,
+      m?.awayScore
+    ],
+    [
+      m?.score?.home,
+      m?.score?.away
+    ],
+    [
+      m?.scores?.home,
+      m?.scores?.away
+    ],
+    [
+      m?.result?.home,
+      m?.result?.away
+    ],
+    [
+      m?.home?.score,
+      m?.away?.score
+    ]
   ];
 
-  for (const [h, a] of pairs) {
-    const home = numberValue(h);
-    const away = numberValue(a);
+  for (
+    const [h, a] of pairs
+  ) {
+    const home =
+      numberValue(h);
+
+    const away =
+      numberValue(a);
 
     if (
       home !== null &&
       away !== null
     ) {
-      return { home, away };
+      return {
+        home,
+        away
+      };
     }
   }
 
-  const text = safe(
-    m?.score ??
-    m?.result ??
-    m?.current_score
-  );
+  const text =
+    safe(
+      m?.score ??
+      m?.result ??
+      m?.current_score
+    );
 
   const match =
     text.match(
@@ -1990,8 +2774,10 @@ function scorePair(m: Obj): {
 
   if (match) {
     return {
-      home: Number(match[1]),
-      away: Number(match[2])
+      home:
+        Number(match[1]),
+      away:
+        Number(match[2])
     };
   }
 
@@ -2001,8 +2787,11 @@ function scorePair(m: Obj): {
   };
 }
 
-function hasGoal(m: Obj): boolean {
-  const score = scorePair(m);
+function hasGoal(
+  m: Obj
+): boolean {
+  const score =
+    scorePair(m);
 
   return (
     score.home !== null &&
@@ -2014,18 +2803,23 @@ function hasGoal(m: Obj): boolean {
   );
 }
 
-function isFirstHalf(m: Obj): boolean {
-  if (hasGoal(m)) {
+function isFirstHalf(
+  m: Obj
+): boolean {
+  if (
+    hasGoal(m)
+  ) {
     return false;
   }
 
-  const period = norm(
-    m?.period ??
-    m?.match_period ??
-    m?.phase ??
-    m?.state ??
-    m?.status
-  );
+  const period =
+    norm(
+      m?.period ??
+      m?.match_period ??
+      m?.phase ??
+      m?.state ??
+      m?.status
+    );
 
   if (
     /\bfirst half\b|\b1st half\b|\b1h\b/.test(
@@ -2058,34 +2852,49 @@ function pendingValid(
   if (!cloudbet) {
     return {
       valid: false,
-      reason: "CLOUDBET_EVENT_NOT_FOUND"
+      reason:
+        "CLOUDBET_EVENT_NOT_FOUND"
     };
   }
 
-  if (!isCloudbetLive(cloudbet)) {
+  if (
+    !isCloudbetLive(
+      cloudbet
+    )
+  ) {
     return {
       valid: false,
-      reason: "CLOUDBET_NO_LONGER_LIVE"
+      reason:
+        "CLOUDBET_NO_LONGER_LIVE"
     };
   }
 
-  if (hasGoal(cloudbet)) {
+  if (
+    hasGoal(cloudbet)
+  ) {
     return {
       valid: false,
-      reason: "GOAL_ALREADY_SCORED"
+      reason:
+        "GOAL_ALREADY_SCORED"
     };
   }
 
-  if (!isFirstHalf(cloudbet)) {
+  if (
+    !isFirstHalf(
+      cloudbet
+    )
+  ) {
     return {
       valid: false,
-      reason: "FIRST_HALF_ENDED"
+      reason:
+        "FIRST_HALF_ENDED"
     };
   }
 
   return {
     valid: true,
-    reason: "BET_STILL_VALID"
+    reason:
+      "BET_STILL_VALID"
   };
 }
 
@@ -2094,12 +2903,15 @@ function pendingValid(
 async function processPending(
   env: Env
 ): Promise<Obj> {
-  const started = Date.now();
+  const started =
+    Date.now();
 
   const result: Obj = {
     success: true,
-    version: VERSION,
-    action: "PENDING_ODDS_CRON",
+    version:
+      VERSION,
+    action:
+      "PENDING_ODDS_CRON",
     pending_loaded: 0,
     checked: 0,
     odds_found: 0,
@@ -2110,14 +2922,17 @@ async function processPending(
   };
 
   const rows =
-    await pendingRows(env);
+    await pendingRows(
+      env
+    );
 
   result.pending_loaded =
     rows.length;
 
   if (!rows.length) {
     result.elapsed_ms =
-      Date.now() - started;
+      Date.now() -
+      started;
 
     return result;
   }
@@ -2128,59 +2943,91 @@ async function processPending(
     liveData =
       await fetchServiceJSON(
         env.CLOUDBET,
-        "/live"
+        "/live",
+        "CLOUDBET",
+        SERVICE_TIMEOUT_MS
       );
   } catch (error) {
     return {
       ...result,
       success: false,
-      errors: rows.length,
+      errors:
+        rows.length,
       error:
         error instanceof Error
           ? error.message
-          : String(error)
+          : String(error),
+
+      service_error:
+        error instanceof
+        ServiceRequestError
+          ? error.toJSON()
+          : null
     };
   }
 
   const liveMatches =
-    cloudbetMatches(liveData);
+    cloudbetMatches(
+      liveData
+    );
 
   const byId =
-    new Map<string, Obj>();
+    new Map<
+      string,
+      Obj
+    >();
 
-  for (const match of liveMatches) {
+  for (
+    const match of
+    liveMatches
+  ) {
     const id =
-      extractMatchId(match);
+      extractMatchId(
+        match
+      );
 
     if (id) {
-      byId.set(id, match);
+      byId.set(
+        id,
+        match
+      );
     }
   }
 
-  for (const row of rows) {
+  for (
+    const row of rows
+  ) {
     result.checked++;
 
     const id =
-      Number(row?.id);
+      Number(
+        row?.id
+      );
 
     const cloudbetId =
-      safe(row?.cloudbet_id);
+      safe(
+        row?.cloudbet_id
+      );
 
     if (
       !Number.isInteger(id) ||
       !cloudbetId
     ) {
       result.errors++;
+
       continue;
     }
 
     const live =
-      byId.get(cloudbetId);
+      byId.get(
+        cloudbetId
+      );
 
     if (!live) {
       const missing =
         Number(
-          row?.missing_count ?? 0
+          row?.missing_count ??
+          0
         ) + 1;
 
       if (
@@ -2196,10 +3043,13 @@ async function processPending(
 
         result.details.push({
           id,
+
           cloudbet_id:
             cloudbetId,
+
           status:
             "INVALIDATED",
+
           reason:
             "CLOUDBET_EVENT_NOT_FOUND"
         });
@@ -2208,7 +3058,8 @@ async function processPending(
           env,
           id,
           Number(
-            row?.retry_count ?? 0
+            row?.retry_count ??
+            0
           ),
           missing
         );
@@ -2217,12 +3068,16 @@ async function processPending(
 
         result.details.push({
           id,
+
           cloudbet_id:
             cloudbetId,
+
           status:
             "PENDING_ODDS",
+
           reason:
             "CLOUDBET_EVENT_TEMPORARILY_MISSING",
+
           missing_count:
             missing
         });
@@ -2232,9 +3087,13 @@ async function processPending(
     }
 
     const validity =
-      pendingValid(live);
+      pendingValid(
+        live
+      );
 
-    if (!validity.valid) {
+    if (
+      !validity.valid
+    ) {
       await invalidate(
         env,
         id
@@ -2244,20 +3103,19 @@ async function processPending(
 
       result.details.push({
         id,
+
         cloudbet_id:
           cloudbetId,
+
         status:
           "INVALIDATED",
+
         reason:
           validity.reason
       });
 
       continue;
     }
-
-    // ========================================================
-    // SAME EVENT · 20 × 30 SEC
-    // ========================================================
 
     const oddsResult =
       await resolveOddsWithRetry(
@@ -2273,7 +3131,8 @@ async function processPending(
         env,
         id,
         Number(
-          row?.retry_count ?? 0
+          row?.retry_count ??
+          0
         ) + 1,
         0
       );
@@ -2282,18 +3141,25 @@ async function processPending(
 
       result.details.push({
         id,
+
         cloudbet_id:
           cloudbetId,
+
         status:
           "PENDING_ODDS",
+
         reason:
           oddsResult.error,
+
         attempts:
           oddsResult.attempts,
+
         retry:
           oddsResult.retry,
+
         attempts_detail:
           oddsResult.attempts_detail,
+
         diagnostic:
           oddsResult.diagnostic
       });
@@ -2315,13 +3181,20 @@ async function processPending(
     }
 
     bet.cloudbet = {
-      ...(bet.cloudbet ?? {}),
-      ...(oddsResult.event ?? {}),
-      id: cloudbetId,
+      ...(bet.cloudbet ??
+        {}),
+      ...(oddsResult.event ??
+        {}),
+
+      id:
+        cloudbetId,
+
       odds:
         oddsResult.odds,
+
       odds_available:
         true,
+
       odds_source:
         "CLOUDBET_EVENT"
     };
@@ -2338,12 +3211,16 @@ async function processPending(
     bet.full_event_fetch = {
       success:
         oddsResult.success,
+
       source:
         oddsResult.source,
+
       attempts:
         oddsResult.attempts,
+
       retry:
         oddsResult.retry,
+
       error:
         oddsResult.error
     };
@@ -2365,21 +3242,27 @@ async function processPending(
 
     result.details.push({
       id,
+
       cloudbet_id:
         cloudbetId,
+
       status:
         "READY",
+
       odds:
         oddsResult.odds,
+
       attempts:
         oddsResult.attempts,
+
       retry:
         oddsResult.retry
     });
   }
 
   result.elapsed_ms =
-    Date.now() - started;
+    Date.now() -
+    started;
 
   return result;
 }
@@ -2389,42 +3272,223 @@ async function processPending(
 async function runWorker(
   env: Env
 ): Promise<Obj> {
-  const started = Date.now();
+  const started =
+    Date.now();
 
-  const [
-    trackerData,
-    matcherData,
-    cloudbetData
-  ] = await Promise.all([
-    fetchServiceJSON(
-      env.TRACKER,
-      "/entries"
-    ),
+  // ========================================================
+  // IMPORTANT:
+  // Promise.allSettled prevents one service from hanging
+  // the complete /run request.
+  // ========================================================
 
-    fetchServiceJSON(
-      env.MATCHER,
-      `/match?threshold=${MATCHER_THRESHOLD}`
-    ),
+  const results =
+    await Promise.allSettled([
+      fetchServiceJSON(
+        env.TRACKER,
+        "/entries",
+        "TRACKER",
+        SERVICE_TIMEOUT_MS
+      ),
 
-    fetchServiceJSON(
-      env.CLOUDBET,
-      "/live"
-    )
-  ]);
+      fetchServiceJSON(
+        env.MATCHER,
+        `/match?threshold=${MATCHER_THRESHOLD}`,
+        "MATCHER",
+        SERVICE_TIMEOUT_MS
+      ),
+
+      fetchServiceJSON(
+        env.CLOUDBET,
+        "/live",
+        "CLOUDBET",
+        SERVICE_TIMEOUT_MS
+      )
+    ]);
+
+  const trackerResult =
+    results[0];
+
+  const matcherResult =
+    results[1];
+
+  const cloudbetResult =
+    results[2];
+
+  const serviceDiagnostics: Obj[] =
+    [];
+
+  if (
+    trackerResult.status ===
+    "rejected"
+  ) {
+    serviceDiagnostics.push({
+      service:
+        "TRACKER",
+      ...(trackerResult.reason instanceof
+      ServiceRequestError
+        ? trackerResult.reason.toJSON()
+        : {
+            code:
+              "UNKNOWN_ERROR",
+            message:
+              trackerResult.reason instanceof
+              Error
+                ? trackerResult.reason.message
+                : String(
+                    trackerResult.reason
+                  )
+          })
+    });
+  }
+
+  if (
+    matcherResult.status ===
+    "rejected"
+  ) {
+    serviceDiagnostics.push({
+      service:
+        "MATCHER",
+      ...(matcherResult.reason instanceof
+      ServiceRequestError
+        ? matcherResult.reason.toJSON()
+        : {
+            code:
+              "UNKNOWN_ERROR",
+            message:
+              matcherResult.reason instanceof
+              Error
+                ? matcherResult.reason.message
+                : String(
+                    matcherResult.reason
+                  )
+          })
+    });
+  }
+
+  if (
+    cloudbetResult.status ===
+    "rejected"
+  ) {
+    serviceDiagnostics.push({
+      service:
+        "CLOUDBET",
+      ...(cloudbetResult.reason instanceof
+      ServiceRequestError
+        ? cloudbetResult.reason.toJSON()
+        : {
+            code:
+              "UNKNOWN_ERROR",
+            message:
+              cloudbetResult.reason instanceof
+              Error
+                ? cloudbetResult.reason.message
+                : String(
+                    cloudbetResult.reason
+                  )
+          })
+    });
+  }
+
+  // ========================================================
+  // If ANY required service failed, return immediately.
+  // No more waiting and no blind processing.
+  // ========================================================
+
+  if (
+    serviceDiagnostics.length
+  ) {
+    return {
+      success: false,
+
+      worker:
+        "cloudbet-bet-worker",
+
+      version:
+        VERSION,
+
+      mode:
+        MODE,
+
+      betting:
+        "DISABLED",
+
+      dry_run:
+        true,
+
+      action:
+        "RUN",
+
+      error:
+        "REQUIRED_SERVICE_FAILED",
+
+      timeout_ms:
+        SERVICE_TIMEOUT_MS,
+
+      failed_services:
+        serviceDiagnostics,
+
+      services: {
+        TRACKER:
+          trackerResult.status ===
+          "fulfilled"
+            ? "OK"
+            : "FAILED",
+
+        MATCHER:
+          matcherResult.status ===
+          "fulfilled"
+            ? "OK"
+            : "FAILED",
+
+        CLOUDBET:
+          cloudbetResult.status ===
+          "fulfilled"
+            ? "OK"
+            : "FAILED"
+      },
+
+      elapsed_ms:
+        Date.now() -
+        started
+    };
+  }
+
+  const trackerData =
+    trackerResult.value as Obj;
+
+  const matcherData =
+    matcherResult.value as Obj;
+
+  const cloudbetData =
+    cloudbetResult.value as Obj;
 
   const signals =
-    extractSignals(trackerData)
-      .filter(isHunterEntry);
+    extractSignals(
+      trackerData
+    ).filter(
+      isHunterEntry
+    );
 
   const liveMatches =
-    cloudbetMatches(cloudbetData);
+    cloudbetMatches(
+      cloudbetData
+    );
 
-  const prepared: Obj[] = [];
-  const matcherFailures: Obj[] = [];
-  const verificationFailures: Obj[] = [];
-  const oddsFailures: Obj[] = [];
+  const prepared: Obj[] =
+    [];
 
-  for (const signal of signals) {
+  const matcherFailures: Obj[] =
+    [];
+
+  const verificationFailures: Obj[] =
+    [];
+
+  const oddsFailures: Obj[] =
+    [];
+
+  for (
+    const signal of signals
+  ) {
     const matcher =
       findBestMatcher(
         signal,
@@ -2434,11 +3498,18 @@ async function runWorker(
     if (!matcher.found) {
       matcherFailures.push({
         match:
-          signalMatch(signal),
+          signalMatch(
+            signal
+          ),
+
         signal_match_id:
-          signalId(signal),
+          signalId(
+            signal
+          ),
+
         reason:
           matcher.reason,
+
         diagnostics:
           matcher.diagnostics
       });
@@ -2453,12 +3524,20 @@ async function runWorker(
         liveMatches
       );
 
-    if (!verification.verified) {
+    if (
+      !verification.verified
+    ) {
       verificationFailures.push({
         match:
-          signalMatch(signal),
+          signalMatch(
+            signal
+          ),
+
         signal_match_id:
-          signalId(signal),
+          signalId(
+            signal
+          ),
+
         reason:
           "CLOUDBET_NOT_VERIFIED"
       });
@@ -2466,9 +3545,9 @@ async function runWorker(
       continue;
     }
 
-    // ========================================================
+    // ======================================================
     // EXACT SAME EVENT RETRY
-    // ========================================================
+    // ======================================================
 
     const oddsResult =
       await resolveOddsWithRetry(
@@ -2476,22 +3555,35 @@ async function runWorker(
         verification.cloudbet
       );
 
-    if (!oddsResult.success) {
+    if (
+      !oddsResult.success
+    ) {
       oddsFailures.push({
         match:
-          signalMatch(signal),
+          signalMatch(
+            signal
+          ),
+
         signal_match_id:
-          signalId(signal),
+          signalId(
+            signal
+          ),
+
         cloudbet_id:
           verification.cloudbet_id,
+
         error:
           oddsResult.error,
+
         attempts:
           oddsResult.attempts,
+
         retry:
           oddsResult.retry,
+
         attempts_detail:
           oddsResult.attempts_detail,
+
         diagnostic:
           oddsResult.diagnostic
       });
@@ -2511,8 +3603,10 @@ async function runWorker(
     prepared.filter(
       bet =>
         bet?.candidate_complete !==
-        false &&
-        bet?.cloudbet?.odds_available === true
+          false &&
+        bet?.cloudbet
+          ?.odds_available ===
+          true
     );
 
   const incomplete =
@@ -2521,13 +3615,18 @@ async function runWorker(
         !(
           bet?.candidate_complete !==
             false &&
-          bet?.cloudbet?.odds_available === true
+          bet?.cloudbet
+            ?.odds_available ===
+            true
         )
     );
 
-  const pendingResults: Obj[] = [];
+  const pendingResults: Obj[] =
+    [];
 
-  for (const bet of incomplete) {
+  for (
+    const bet of incomplete
+  ) {
     pendingResults.push(
       await savePending(
         env,
@@ -2590,6 +3689,9 @@ async function runWorker(
       exact_params:
         TARGET_PARAMS,
 
+      service_timeout_ms:
+        SERVICE_TIMEOUT_MS,
+
       odds_endpoint:
         "/event?id=CLOUDBET_EVENT_ID",
 
@@ -2621,9 +3723,22 @@ async function runWorker(
         false
     },
 
+    services: {
+      TRACKER:
+        "OK",
+
+      MATCHER:
+        "OK",
+
+      CLOUDBET:
+        "OK"
+    },
+
     tracker: {
       signals_received:
-        extractSignals(trackerData).length,
+        extractSignals(
+          trackerData
+        ).length,
 
       hunter_entries:
         signals.length
@@ -2666,7 +3781,9 @@ async function runWorker(
 
       pending_saved:
         pendingResults.filter(
-          x => x?.success === true
+          x =>
+            x?.success ===
+            true
         ).length,
 
       pending:
@@ -2680,13 +3797,15 @@ async function runWorker(
       complete:
         candidates.filter(
           x =>
-            x?.candidate_complete === true
+            x?.candidate_complete ===
+            true
         ).length,
 
       incomplete:
         candidates.filter(
           x =>
-            x?.candidate_complete !== true
+            x?.candidate_complete !==
+            true
         ).length
     },
 
@@ -2708,7 +3827,8 @@ async function runWorker(
       oddsFailures,
 
     elapsed_ms:
-      Date.now() - started
+      Date.now() -
+      started
   };
 }
 
@@ -2787,16 +3907,26 @@ async function linesResponse(
     return json(
       {
         success: false,
+
         worker:
           "cloudbet-bet-worker",
+
         version:
           VERSION,
+
         event_id:
           id,
+
         error:
           error instanceof Error
             ? error.message
-            : String(error)
+            : String(error),
+
+        service_error:
+          error instanceof
+          ServiceRequestError
+            ? error.toJSON()
+            : null
       },
       500
     );
@@ -2840,6 +3970,9 @@ function healthResponse(
         !!env.DB
     },
 
+    service_timeout_ms:
+      SERVICE_TIMEOUT_MS,
+
     exact_target: {
       market:
         TARGET_MARKET,
@@ -2862,7 +3995,8 @@ function healthResponse(
         ODDS_EVENT_RETRY_DELAY_MS,
 
       delay_seconds:
-        ODDS_EVENT_RETRY_DELAY_MS / 1000,
+        ODDS_EVENT_RETRY_DELAY_MS /
+        1000,
 
       retry_same_event:
         true,
@@ -2933,15 +4067,18 @@ async function pendingResponse(
         "PENDING_ODDS",
 
       count:
-        result.results?.length ?? 0,
+        result.results?.length ??
+        0,
 
       pending:
-        result.results ?? []
+        result.results ??
+        []
     });
   } catch (error) {
     return json(
       {
         success: false,
+
         error:
           error instanceof Error
             ? error.message
@@ -3004,19 +4141,23 @@ async function archiveResponse(
 
       total:
         Number(
-          totalResult?.total ?? 0
+          totalResult?.total ??
+          0
         ),
 
       returned:
-        result.results?.length ?? 0,
+        result.results?.length ??
+        0,
 
       archive:
-        result.results ?? []
+        result.results ??
+        []
     });
   } catch (error) {
     return json(
       {
         success: false,
+
         error:
           error instanceof Error
             ? error.message
@@ -3041,14 +4182,18 @@ export default {
       url.pathname === "/" ||
       url.pathname === "/health"
     ) {
-      return healthResponse(env);
+      return healthResponse(
+        env
+      );
     }
 
     if (
-      url.pathname === "/lines"
+      url.pathname ===
+      "/lines"
     ) {
       if (
-        request.method !== "GET"
+        request.method !==
+        "GET"
       ) {
         return json(
           {
@@ -3067,10 +4212,12 @@ export default {
     }
 
     if (
-      url.pathname === "/run"
+      url.pathname ===
+      "/run"
     ) {
       if (
-        request.method !== "GET"
+        request.method !==
+        "GET"
       ) {
         return json(
           {
@@ -3084,7 +4231,9 @@ export default {
 
       try {
         return json(
-          await runWorker(env)
+          await runWorker(
+            env
+          )
         );
       } catch (error) {
         return json(
@@ -3119,16 +4268,21 @@ export default {
     }
 
     if (
-      url.pathname === "/pending"
+      url.pathname ===
+      "/pending"
     ) {
-      return pendingResponse(env);
+      return pendingResponse(
+        env
+      );
     }
 
     if (
-      url.pathname === "/archive"
+      url.pathname ===
+      "/archive"
     ) {
       if (
-        request.method !== "GET"
+        request.method !==
+        "GET"
       ) {
         return json(
           {
@@ -3140,7 +4294,9 @@ export default {
         );
       }
 
-      return archiveResponse(env);
+      return archiveResponse(
+        env
+      );
     }
 
     return json(
@@ -3176,7 +4332,8 @@ export default {
           console.log(
             JSON.stringify({
               cron: true,
-              version: VERSION,
+              version:
+                VERSION,
               ...result
             })
           );
@@ -3185,7 +4342,8 @@ export default {
           console.error(
             JSON.stringify({
               cron: true,
-              version: VERSION,
+              version:
+                VERSION,
               success: false,
               error:
                 error instanceof Error
