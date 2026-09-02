@@ -1,15 +1,22 @@
 // ============================================================
 // CLOUDBET LIVE SOCCER DETECTOR
-// V5.7.6
+// V5.7.7
 //
 // FIX:
 // - Cloudbet /events returns:
 //     { competitions: [ { events: [...] } ] }
-// - extractEvents() now explicitly supports
+// - extractEvents() explicitly supports
 //     competitions[].events[]
 // - TRADING_LIVE is recognized as live
-// - READ ONLY
-// - NO BETTING
+//
+// NEW V5.7.7:
+// - /diagnostic-target-market
+// - Inspects every live event
+// - Checks exact target market/submarket/selection
+// - Shows disabled selections, price and maxStake
+//
+// READ ONLY
+// NO BETTING
 // ============================================================
 
 interface Env {
@@ -25,7 +32,7 @@ const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
 const VERSION =
-  "V5.7.6";
+  "V5.7.7";
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
@@ -57,6 +64,7 @@ function json(
   data: AnyObj,
   status = 200
 ): Response {
+
   return new Response(
     JSON.stringify(
       data,
@@ -68,6 +76,7 @@ function json(
       headers: {
         "content-type":
           "application/json; charset=utf-8",
+
         "cache-control":
           "no-store",
       },
@@ -142,7 +151,8 @@ async function cloudbetFetch(
     await fetchWithTimeout(
       url,
       {
-        method: "GET",
+        method:
+          "GET",
 
         headers: {
           "accept":
@@ -157,6 +167,7 @@ async function cloudbetFetch(
 
   return {
     response,
+
     elapsedMs:
       Date.now() -
       started,
@@ -202,11 +213,14 @@ function extractEvents(
 ): AnyObj[] {
 
   // ----------------------------------------------------------
-  // V5.7.6 PRIMARY STRUCTURE
+  // PRIMARY CLOUDBET STRUCTURE
   //
   // {
   //   competitions: [
   //     {
+  //       name: "...",
+  //       key: "...",
+  //       sport: {...},
   //       events: [...]
   //     }
   //   ]
@@ -248,24 +262,27 @@ function extractEvents(
             "object"
         ) {
 
-          result.push(
-            {
-              ...event,
+          result.push({
 
-              competition:
-                event.competition ??
-                {
-                  name:
-                    competition.name,
+            ...event,
 
-                  key:
-                    competition.key,
+            competition:
+              event.competition ??
+              {
+                name:
+                  competition.name ??
+                  null,
 
-                  category:
-                    competition.category,
-                },
-            }
-          );
+                key:
+                  competition.key ??
+                  null,
+
+                category:
+                  competition.category ??
+                  null,
+              },
+
+          });
 
         }
 
@@ -301,7 +318,7 @@ function extractEvents(
 
 
   // ----------------------------------------------------------
-  // FALLBACK: data[]
+  // FALLBACK: array
   // ----------------------------------------------------------
 
   if (
@@ -342,36 +359,15 @@ function isLiveEvent(
       .trim()
       .toUpperCase();
 
-  if (
+  return (
     status ===
-      "TRADING_LIVE"
-  ) {
-    return true;
-  }
-
-  if (
+      "TRADING_LIVE" ||
     status ===
-      "LIVE"
-  ) {
-    return true;
-  }
-
-  if (
-    status ===
-      "TRADING_LIVE"
-  ) {
-    return true;
-  }
-
-  if (
+      "LIVE" ||
     status.includes(
       "LIVE"
     )
-  ) {
-    return true;
-  }
-
-  return false;
+  );
 }
 
 
@@ -429,6 +425,7 @@ function findTargetSelection(
     typeof markets !==
       "object"
   ) {
+
     return null;
   }
 
@@ -442,6 +439,7 @@ function findTargetSelection(
     typeof market !==
       "object"
   ) {
+
     return null;
   }
 
@@ -453,6 +451,7 @@ function findTargetSelection(
     typeof submarkets !==
       "object"
   ) {
+
     return null;
   }
 
@@ -466,6 +465,7 @@ function findTargetSelection(
     typeof submarket !==
       "object"
   ) {
+
     return null;
   }
 
@@ -514,6 +514,7 @@ function findTargetSelection(
         status
       )
     ) {
+
       continue;
     }
 
@@ -526,6 +527,7 @@ function findTargetSelection(
       price === null ||
       price <= 1
     ) {
+
       continue;
     }
 
@@ -538,6 +540,7 @@ function findTargetSelection(
       maxStake !== null &&
       maxStake <= 0
     ) {
+
       continue;
     }
 
@@ -579,6 +582,7 @@ function buildLiveMatch(
     );
 
   return {
+
     id:
       event?.id ??
       null,
@@ -621,8 +625,6 @@ function buildLiveMatch(
     target_available:
       !!target,
 
-    raw_event:
-      event,
   };
 }
 
@@ -637,24 +639,26 @@ function detectInterestingFields(
 
   const result:
     AnyObj = {
-      top_level_type:
-        Array.isArray(data)
-          ? "array"
-          : typeof data,
 
-      top_level_keys:
-        data &&
-        typeof data ===
-          "object" &&
-        !Array.isArray(data)
-          ? Object.keys(
-              data
-            ).slice(
-              0,
-              100
-            )
-          : [],
-    };
+    top_level_type:
+      Array.isArray(data)
+        ? "array"
+        : typeof data,
+
+    top_level_keys:
+      data &&
+      typeof data ===
+        "object" &&
+      !Array.isArray(data)
+        ? Object.keys(
+            data
+          ).slice(
+            0,
+            100
+          )
+        : [],
+
+  };
 
   if (
     data?.competitions &&
@@ -676,6 +680,7 @@ function detectInterestingFields(
           (
             c: AnyObj
           ) => ({
+
             name:
               c?.name ??
               null,
@@ -694,8 +699,10 @@ function detectInterestingFields(
               )
                 ? c.events.length
                 : 0,
+
           })
         );
+
   }
 
   return result;
@@ -747,6 +754,7 @@ async function getLiveSoccerEvents(
   return {
 
     request: {
+
       path,
 
       requests_made:
@@ -757,6 +765,7 @@ async function getLiveSoccerEvents(
 
       http_status:
         result.response.status,
+
     },
 
     events_received:
@@ -777,12 +786,13 @@ async function getLiveSoccerEvents(
       detectInterestingFields(
         data
       ),
+
   };
 }
 
 
 // ============================================================
-// SEARCH
+// SEARCH NORMALIZE
 // ============================================================
 
 function normalize(
@@ -808,6 +818,10 @@ function normalize(
     .trim();
 }
 
+
+// ============================================================
+// SEARCH
+// ============================================================
 
 function searchEvents(
   events: AnyObj[],
@@ -847,6 +861,7 @@ function searchEvents(
           home.includes(q) ||
           away.includes(q)
         );
+
       }
     )
     .map(
@@ -881,7 +896,9 @@ async function getEvent(
     );
 
   return {
+
     request: {
+
       path,
 
       elapsed_ms:
@@ -889,6 +906,7 @@ async function getEvent(
 
       http_status:
         result.response.status,
+
     },
 
     event:
@@ -898,6 +916,7 @@ async function getEvent(
       findTargetSelection(
         data
       ),
+
   };
 }
 
@@ -928,6 +947,7 @@ async function fetchCloud0007Page():
       await fetch(
         CLOUD0007_URL,
         {
+
           method:
             "GET",
 
@@ -935,15 +955,18 @@ async function fetchCloud0007Page():
             "follow",
 
           headers: {
+
             "accept":
               "text/html,application/xhtml+xml",
 
             "user-agent":
               "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+
           },
 
           signal:
             controller.signal,
+
         }
       );
 
@@ -951,6 +974,7 @@ async function fetchCloud0007Page():
       await response.text();
 
     return {
+
       url:
         CLOUD0007_URL,
 
@@ -999,6 +1023,7 @@ async function fetchCloud0007Page():
           0,
           2000
         ),
+
     };
 
   } catch (
@@ -1006,6 +1031,7 @@ async function fetchCloud0007Page():
   ) {
 
     return {
+
       url:
         CLOUD0007_URL,
 
@@ -1023,6 +1049,7 @@ async function fetchCloud0007Page():
         error instanceof Error
           ? error.message
           : String(error),
+
     };
 
   } finally {
@@ -1036,7 +1063,7 @@ async function fetchCloud0007Page():
 
 
 // ============================================================
-// CLOUD0007 JS EXTRACTION
+// CLOUD0007 SCRIPT URLS
 // ============================================================
 
 function extractScriptUrls(
@@ -1095,6 +1122,7 @@ function extractScriptUrls(
     urls.push(
       url
     );
+
   }
 
   return [
@@ -1137,7 +1165,9 @@ async function mapWithConcurrency<T>(
         index >=
         items.length
       ) {
+
         break;
+
       }
 
       try {
@@ -1153,15 +1183,18 @@ async function mapWithConcurrency<T>(
       ) {
 
         results[index] = {
+
           error:
             error instanceof Error
               ? error.message
               : String(error),
+
         };
 
       }
 
     }
+
   }
 
   const workers =
@@ -1212,6 +1245,7 @@ async function fetchCloud0007JS(
       await fetch(
         url,
         {
+
           method:
             "GET",
 
@@ -1219,6 +1253,7 @@ async function fetchCloud0007JS(
             "follow",
 
           headers: {
+
             "accept":
               "application/javascript,text/javascript,*/*",
 
@@ -1233,10 +1268,12 @@ async function fetchCloud0007JS(
 
             "referer":
               CLOUD0007_URL,
+
           },
 
           signal:
             controller.signal,
+
         }
       );
 
@@ -1244,6 +1281,7 @@ async function fetchCloud0007JS(
       await response.text();
 
     return {
+
       url,
 
       status:
@@ -1260,6 +1298,7 @@ async function fetchCloud0007JS(
         text.length,
 
       text,
+
     };
 
   } catch (
@@ -1267,6 +1306,7 @@ async function fetchCloud0007JS(
   ) {
 
     return {
+
       url,
 
       status:
@@ -1289,6 +1329,7 @@ async function fetchCloud0007JS(
         error instanceof Error
           ? error.message
           : String(error),
+
     };
 
   } finally {
@@ -1335,7 +1376,9 @@ function extractContexts(
       index ===
         -1
     ) {
+
       break;
+
     }
 
     const start =
@@ -1354,6 +1397,7 @@ function extractContexts(
       );
 
     results.push({
+
       index,
 
       before:
@@ -1377,11 +1421,13 @@ function extractContexts(
           start,
           end
         ),
+
     });
 
     position =
       index +
       keyword.length;
+
   }
 
   return results;
@@ -1406,6 +1452,7 @@ async function diagnosticCloud0007API():
   ) {
 
     return json({
+
       success:
         false,
 
@@ -1419,16 +1466,22 @@ async function diagnosticCloud0007API():
         "DIAGNOSTIC_CLOUD0007_API",
 
       page,
+
     });
+
   }
+
+  const pageResponse =
+    await fetch(
+      CLOUD0007_URL
+    );
+
+  const html =
+    await pageResponse.text();
 
   const scriptUrls =
     extractScriptUrls(
-      await (
-        await fetch(
-          CLOUD0007_URL
-        )
-      ).text()
+      html
     );
 
   const scripts =
@@ -1463,13 +1516,21 @@ async function diagnosticCloud0007API():
       );
 
   const endpoints = [
+
     "/sports-api/v6/sports",
+
     "/sports-api/c/v6/sports",
+
     "/sports-betting/v4/lines",
+
     "/events",
+
     "/live",
+
     "/app-api/pulse/feed",
+
     "/app-api/pulse/feed-version",
+
   ];
 
   const endpointContexts:
@@ -1489,6 +1550,7 @@ async function diagnosticCloud0007API():
         3000,
         20
       );
+
   }
 
   return json({
@@ -1509,12 +1571,15 @@ async function diagnosticCloud0007API():
       true,
 
     performance: {
+
       total_elapsed_ms:
         Date.now() -
         started,
+
     },
 
     page: {
+
       status:
         page.status,
 
@@ -1523,9 +1588,11 @@ async function diagnosticCloud0007API():
 
       next_data:
         page.next_data,
+
     },
 
     scripts: {
+
       discovered:
         scriptUrls.length,
 
@@ -1534,11 +1601,13 @@ async function diagnosticCloud0007API():
 
       total_chars:
         combined.length,
+
     },
 
     endpoints_found:
       endpoints.map(
         endpoint => ({
+
           endpoint,
 
           occurrences:
@@ -1553,6 +1622,7 @@ async function diagnosticCloud0007API():
                 )
               ) || []
             ).length,
+
         })
       ),
 
@@ -1560,6 +1630,7 @@ async function diagnosticCloud0007API():
       endpointContexts,
 
     interpretation: {
+
       purpose:
         "Inspect frontend JavaScript around discovered Cloud0007 API routes.",
 
@@ -1567,7 +1638,8 @@ async function diagnosticCloud0007API():
         "Cloud0007 restricted API endpoints must not be used to bypass Cloudbet API controls.",
 
       next_step:
-        "Use the endpoint contexts to identify the exact frontend request parameters and determine whether the official Cloudbet API already provides the required data.",
+        "Use endpoint contexts only for diagnostics and compare them with the official Cloudbet API.",
+
     },
 
   });
@@ -1604,6 +1676,7 @@ async function probeCloud0007Path(
       await fetch(
         url,
         {
+
           method:
             "GET",
 
@@ -1611,6 +1684,7 @@ async function probeCloud0007Path(
             "follow",
 
           headers: {
+
             "accept":
               "application/json,text/plain,*/*",
 
@@ -1625,10 +1699,12 @@ async function probeCloud0007Path(
 
             "referer":
               CLOUD0007_URL,
+
           },
 
           signal:
             controller.signal,
+
         }
       );
 
@@ -1713,6 +1789,7 @@ async function probeCloud0007Path(
           0,
           1500
         ),
+
     };
 
   } catch (
@@ -1739,6 +1816,7 @@ async function probeCloud0007Path(
         error instanceof Error
           ? error.message
           : String(error),
+
     };
 
   } finally {
@@ -1810,9 +1888,11 @@ async function diagnosticCloud0007Routes():
       "UNCHANGED",
 
     performance: {
+
       total_elapsed_ms:
         Date.now() -
         started,
+
     },
 
     probes:
@@ -1911,6 +1991,7 @@ async function diagnosticEventsRaw(
       ) {
 
         candidates.push({
+
           key,
 
           length:
@@ -1928,6 +2009,7 @@ async function diagnosticEventsRaw(
           first_item:
             value[0] ??
             null,
+
         });
 
       }
@@ -2055,6 +2137,602 @@ async function diagnosticEventsRaw(
 
 
 // ============================================================
+// TARGET MARKET DIAGNOSTIC
+// ============================================================
+
+function diagnoseTargetMarket(
+  event: AnyObj
+): AnyObj {
+
+  const result:
+    AnyObj = {
+
+    event_id:
+      event?.id ??
+      null,
+
+    home:
+      event?.home?.name ??
+      null,
+
+    away:
+      event?.away?.name ??
+      null,
+
+    status:
+      event?.status ??
+      null,
+
+    target_market:
+      TARGET_MARKET,
+
+    target_submarket:
+      TARGET_SUBMARKET,
+
+    target_outcome:
+      TARGET_OUTCOME,
+
+    target_params:
+      TARGET_PARAMS,
+
+    market_exists:
+      false,
+
+    submarket_exists:
+      false,
+
+    selections:
+      [],
+
+    exact_target_found:
+      false,
+
+    exact_target_enabled:
+      false,
+
+    exact_target_price:
+      null,
+
+    exact_target_maxStake:
+      null,
+
+    reason:
+      null,
+
+  };
+
+
+  // ----------------------------------------------------------
+  // MARKETS
+  // ----------------------------------------------------------
+
+  const markets =
+    event?.markets;
+
+  if (
+    !markets ||
+    typeof markets !==
+      "object"
+  ) {
+
+    result.reason =
+      "NO_MARKETS_OBJECT";
+
+    return result;
+  }
+
+
+  // ----------------------------------------------------------
+  // TARGET MARKET
+  // ----------------------------------------------------------
+
+  const market =
+    markets[
+      TARGET_MARKET
+    ];
+
+  if (
+    !market ||
+    typeof market !==
+      "object"
+  ) {
+
+    result.reason =
+      "TARGET_MARKET_NOT_PRESENT";
+
+    result.available_markets =
+      Object.keys(
+        markets
+      );
+
+    return result;
+  }
+
+  result.market_exists =
+    true;
+
+
+  // ----------------------------------------------------------
+  // SUBMARKETS
+  // ----------------------------------------------------------
+
+  const submarkets =
+    market.submarkets;
+
+  if (
+    !submarkets ||
+    typeof submarkets !==
+      "object"
+  ) {
+
+    result.reason =
+      "NO_SUBMARKETS_OBJECT";
+
+    return result;
+  }
+
+
+  const submarket =
+    submarkets[
+      TARGET_SUBMARKET
+    ];
+
+  if (
+    !submarket ||
+    typeof submarket !==
+      "object"
+  ) {
+
+    result.reason =
+      "TARGET_SUBMARKET_NOT_PRESENT";
+
+    result.available_submarkets =
+      Object.keys(
+        submarkets
+      );
+
+    return result;
+  }
+
+  result.submarket_exists =
+    true;
+
+
+  // ----------------------------------------------------------
+  // SELECTIONS
+  // ----------------------------------------------------------
+
+  const selections =
+    Array.isArray(
+      submarket.selections
+    )
+      ? submarket.selections
+      : [];
+
+  result.selections =
+    selections.map(
+      (
+        selection: AnyObj
+      ) => {
+
+        const price =
+          finiteNumber(
+            selection?.price
+          );
+
+        const maxStake =
+          finiteNumber(
+            selection?.maxStake
+          );
+
+        const status =
+          String(
+            selection?.status ??
+            ""
+          )
+            .trim()
+            .toUpperCase();
+
+        const exactOutcome =
+          selection?.outcome ===
+          TARGET_OUTCOME;
+
+        const exactParams =
+          selection?.params ===
+          TARGET_PARAMS;
+
+        const exact =
+          exactOutcome &&
+          exactParams;
+
+        const enabledStatus =
+          !status ||
+          [
+            "SELECTION_ENABLED",
+            "OPEN",
+            "TRADING",
+            "ACTIVE",
+          ].includes(
+            status
+          );
+
+        return {
+
+          outcome:
+            selection?.outcome ??
+            null,
+
+          params:
+            selection?.params ??
+            null,
+
+          marketUrl:
+            selection?.marketUrl ??
+            null,
+
+          price,
+
+          raw_price:
+            selection?.price ??
+            null,
+
+          status:
+            selection?.status ??
+            null,
+
+          maxStake,
+
+          raw_maxStake:
+            selection?.maxStake ??
+            null,
+
+          side:
+            selection?.side ??
+            null,
+
+          exact_outcome:
+            exactOutcome,
+
+          exact_params:
+            exactParams,
+
+          exact_target:
+            exact,
+
+          enabled_status:
+            enabledStatus,
+
+          valid_price:
+            price !== null &&
+            price > 1,
+
+          valid_maxStake:
+            maxStake === null ||
+            maxStake > 0,
+
+          fully_usable:
+            exact &&
+            enabledStatus &&
+            price !== null &&
+            price > 1 &&
+            (
+              maxStake === null ||
+              maxStake > 0
+            ),
+
+        };
+
+      }
+    );
+
+
+  // ----------------------------------------------------------
+  // EXACT TARGET
+  // ----------------------------------------------------------
+
+  const exactSelection =
+    selections.find(
+      (
+        selection: AnyObj
+      ) =>
+        selection?.outcome ===
+          TARGET_OUTCOME &&
+        selection?.params ===
+          TARGET_PARAMS
+    );
+
+
+  if (
+    !exactSelection
+  ) {
+
+    result.reason =
+      "TARGET_SELECTION_NOT_PRESENT";
+
+    return result;
+  }
+
+  result.exact_target_found =
+    true;
+
+
+  const price =
+    finiteNumber(
+      exactSelection?.price
+    );
+
+  const maxStake =
+    finiteNumber(
+      exactSelection?.maxStake
+    );
+
+  const status =
+    String(
+      exactSelection?.status ??
+      ""
+    )
+      .trim()
+      .toUpperCase();
+
+
+  result.exact_target_price =
+    price;
+
+  result.exact_target_maxStake =
+    maxStake;
+
+  result.exact_target_status =
+    exactSelection?.status ??
+    null;
+
+
+  const enabledStatus =
+    !status ||
+    [
+      "SELECTION_ENABLED",
+      "OPEN",
+      "TRADING",
+      "ACTIVE",
+    ].includes(
+      status
+    );
+
+
+  const enabled =
+    enabledStatus &&
+    price !== null &&
+    price > 1 &&
+    (
+      maxStake === null ||
+      maxStake > 0
+    );
+
+
+  result.exact_target_enabled =
+    enabled;
+
+
+  if (
+    enabled
+  ) {
+
+    result.reason =
+      "TARGET_READY";
+
+  } else if (
+    !enabledStatus
+  ) {
+
+    result.reason =
+      `TARGET_STATUS_${status}`;
+
+  } else if (
+    price === null ||
+    price <= 1
+  ) {
+
+    result.reason =
+      "TARGET_BAD_PRICE";
+
+  } else if (
+    maxStake !== null &&
+    maxStake <= 0
+  ) {
+
+    result.reason =
+      "TARGET_MAXSTAKE_ZERO";
+
+  } else {
+
+    result.reason =
+      "TARGET_NOT_ACCEPTABLE";
+
+  }
+
+
+  return result;
+}
+
+
+// ============================================================
+// TARGET MARKET DIAGNOSTIC ENDPOINT
+// ============================================================
+
+async function diagnosticTargetMarket(
+  env: Env
+): Promise<Response> {
+
+  const started =
+    Date.now();
+
+  const path =
+    "/events?sport=soccer&live=true&players=false&limit=10000";
+
+  const result =
+    await cloudbetFetch(
+      env,
+      path
+    );
+
+  const data =
+    await parseJSON(
+      result.response
+    );
+
+  const events =
+    extractEvents(
+      data
+    );
+
+  const liveEvents =
+    events.filter(
+      isLiveEvent
+    );
+
+  const diagnostics =
+    liveEvents.map(
+      diagnoseTargetMarket
+    );
+
+
+  const marketPresent =
+    diagnostics.filter(
+      (
+        item
+      ) =>
+        item.market_exists
+    ).length;
+
+
+  const submarketPresent =
+    diagnostics.filter(
+      (
+        item
+      ) =>
+        item.submarket_exists
+    ).length;
+
+
+  const exactTargetPresent =
+    diagnostics.filter(
+      (
+        item
+      ) =>
+        item.exact_target_found
+    ).length;
+
+
+  const exactTargetEnabled =
+    diagnostics.filter(
+      (
+        item
+      ) =>
+        item.exact_target_enabled
+    ).length;
+
+
+  const targetReady =
+    diagnostics.filter(
+      (
+        item
+      ) =>
+        item.reason ===
+        "TARGET_READY"
+    ).length;
+
+
+  return json({
+
+    success:
+      true,
+
+    worker:
+      "cloudbet-live-soccer-detector",
+
+    version:
+      VERSION,
+
+    action:
+      "DIAGNOSTIC_TARGET_MARKET",
+
+    read_only:
+      true,
+
+    betting:
+      false,
+
+    request: {
+
+      path,
+
+      requests_made:
+        1,
+
+      elapsed_ms:
+        result.elapsedMs,
+
+      http_status:
+        result.response.status,
+
+    },
+
+    target: {
+
+      market:
+        TARGET_MARKET,
+
+      submarket:
+        TARGET_SUBMARKET,
+
+      outcome:
+        TARGET_OUTCOME,
+
+      params:
+        TARGET_PARAMS,
+
+    },
+
+    summary: {
+
+      events_received:
+        events.length,
+
+      live_events:
+        liveEvents.length,
+
+      market_present:
+        marketPresent,
+
+      submarket_present:
+        submarketPresent,
+
+      exact_target_present:
+        exactTargetPresent,
+
+      exact_target_enabled:
+        exactTargetEnabled,
+
+      target_ready:
+        targetReady,
+
+    },
+
+    events:
+      diagnostics,
+
+    performance: {
+
+      total_elapsed_ms:
+        Date.now() -
+        started,
+
+    },
+
+  });
+}
+
+
+// ============================================================
 // MAIN
 // ============================================================
 
@@ -2109,6 +2787,8 @@ export default {
           "/event?id=EVENT_ID",
 
           "/diagnostic-events-raw",
+
+          "/diagnostic-target-market",
 
           "/diagnostic-cloud0007",
 
@@ -2415,6 +3095,51 @@ export default {
 
           action:
             "DIAGNOSTIC_EVENTS_RAW",
+
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error),
+
+        }, 500);
+
+      }
+
+    }
+
+
+    // --------------------------------------------------------
+    // TARGET MARKET
+    // --------------------------------------------------------
+
+    if (
+      pathname ===
+      "/diagnostic-target-market"
+    ) {
+
+      try {
+
+        return await diagnosticTargetMarket(
+          env
+        );
+
+      } catch (
+        error
+      ) {
+
+        return json({
+
+          success:
+            false,
+
+          worker:
+            "cloudbet-live-soccer-detector",
+
+          version:
+            VERSION,
+
+          action:
+            "DIAGNOSTIC_TARGET_MARKET",
 
           error:
             error instanceof Error
