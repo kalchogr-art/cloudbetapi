@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET BET WORKER V6.0.3
+// CLOUDBET BET WORKER V6.0.4
 // DRY RUN · PERSISTENT ODDS RETRY
 // EXACT 1H TOTAL GOALS OVER 0.5
 //
@@ -29,7 +29,7 @@ type Obj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V6.0.3";
+const VERSION = "V6.0.4";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -3657,6 +3657,29 @@ async function archiveBet(
     signal?.execution_id ||
     crypto.randomUUID();
 
+  const signalMatchId =
+    String(
+      signal?.match_id ||
+      signal?.id ||
+      bet?.signal?.match_id ||
+      ""
+    ).trim();
+
+  if (!signalMatchId) {
+    return {
+      success: false,
+      error:
+        "ARCHIVE_MATCH_ID_MISSING"
+    };
+  }
+
+  const matchName =
+    signal?.match_name ||
+    signal?.match ||
+    bet?.signal?.match ||
+    displayMatch(signal) ||
+    "";
+
   const cloudbetId =
     bet?.cloudbet?.id ||
     bet?.cloudbet?.event_id ||
@@ -3665,7 +3688,8 @@ async function archiveBet(
     cloudbet?.event_id ||
     extractMatchId(
       cloudbet
-    );
+    ) ||
+    null;
 
   const home =
     bet?.cloudbet?.home ||
@@ -3679,10 +3703,57 @@ async function archiveBet(
     cloudbetAway(cloudbet) ||
     "";
 
-  const odds =
-    oddsResult?.odds ??
-    bet?.odds ??
+  const entryMinute =
+    Number(
+      signal?.entry_minute ??
+      signal?.minute ??
+      bet?.signal?.entry_minute ??
+      0
+    );
+
+  const hunterScore =
+    Number(
+      signal?.hunter_score ??
+      signal?.score ??
+      bet?.signal?.hunter_score ??
+      0
+    );
+
+  const matcherScoreValue =
+    Number(
+      matcher?.match_score ??
+      matcher?.score ??
+      matcher?.scoring?.total ??
+      matcher?.team_match_score ??
+      0
+    );
+
+  const matcherSource =
+    matcherMethod(
+      matcher
+    ) ||
+    matcher?.reason ||
+    matcher?.classification ||
     null;
+
+  const cloudbetVerified =
+    cloudbetId
+      ? 1
+      : 0;
+
+  const result =
+    oddsResult?.success &&
+    oddsResult?.odds != null
+      ? "TARGET_READY"
+      : "TARGET_NOT_READY";
+
+  const reason =
+    oddsResult?.success
+      ? `ODDS_${oddsResult.odds}`
+      : (
+          oddsResult?.error ||
+          null
+        );
 
   try {
     await env.DB
@@ -3690,36 +3761,42 @@ async function archiveBet(
         INSERT INTO bet_archive (
           execution_id,
           timestamp,
-          cloudbet_id,
+          match_id,
+          match_name,
           home,
           away,
-          odds,
-          stake_eur,
-          market,
-          selection,
-          payload_json
+          entry_minute,
+          hunter_score,
+          matcher_score,
+          matcher_source,
+          cloudbet_verified,
+          result,
+          reason,
+          cloudbet_match_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .bind(
         executionId,
         nowISO(),
-        cloudbetId ||
-          null,
+        signalMatchId,
+        matchName,
         home,
         away,
-        odds,
-        BET_STAKE_EUR,
-        BET_MARKET,
-        BET_SELECTION,
-        JSON.stringify({
-          bet,
-          signal,
-          matcher,
-          cloudbet,
-          odds:
-            oddsResult
-        })
+        Number.isFinite(entryMinute)
+          ? entryMinute
+          : null,
+        Number.isFinite(hunterScore)
+          ? hunterScore
+          : null,
+        Number.isFinite(matcherScoreValue)
+          ? matcherScoreValue
+          : null,
+        matcherSource,
+        cloudbetVerified,
+        result,
+        reason,
+        cloudbetId
       )
       .run();
 
@@ -3729,10 +3806,17 @@ async function archiveBet(
       execution_id:
         executionId,
 
-      cloudbet_id:
+      match_id:
+        signalMatchId,
+
+      cloudbet_match_id:
         cloudbetId,
 
-      odds
+      odds:
+        oddsResult?.odds ??
+        null,
+
+      result
     };
 
   } catch (error) {
