@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET BET WORKER V6.0.4
+// CLOUDBET BET WORKER V6.0.5
 // DRY RUN · PERSISTENT ODDS RETRY
 // EXACT 1H TOTAL GOALS OVER 0.5
 //
@@ -29,7 +29,7 @@ type Obj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V6.0.4";
+const VERSION = "V6.0.5";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -3775,6 +3775,22 @@ async function archiveBet(
           cloudbet_match_id
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+        ON CONFLICT(match_id)
+        DO UPDATE SET
+          execution_id = excluded.execution_id,
+          timestamp = excluded.timestamp,
+          match_name = excluded.match_name,
+          home = excluded.home,
+          away = excluded.away,
+          entry_minute = excluded.entry_minute,
+          hunter_score = excluded.hunter_score,
+          matcher_score = excluded.matcher_score,
+          matcher_source = excluded.matcher_source,
+          cloudbet_verified = excluded.cloudbet_verified,
+          result = excluded.result,
+          reason = excluded.reason,
+          cloudbet_match_id = excluded.cloudbet_match_id
       `)
       .bind(
         executionId,
