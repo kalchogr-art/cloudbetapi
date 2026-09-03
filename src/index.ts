@@ -1,6 +1,6 @@
 // ============================================================
 // CLOUDBET LIVE SOCCER DETECTOR
-// V5.7.9
+// V5.8.0
 //
 // FIX:
 // - Cloudbet /events returns:
@@ -32,7 +32,7 @@ const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
 const VERSION =
-  "V5.7.9";
+  "V5.8.0";
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
@@ -2944,6 +2944,298 @@ async function fetchTargetLine(
 }
 
 
+
+// ============================================================
+// TRADING / ACCOUNT ACCESS CHECK
+// V5.8.0
+//
+// READ ONLY
+// - NO BET PLACEMENT
+// - Checks authenticated Account API access
+// - Checks authenticated Trading API history access
+// ============================================================
+
+async function authenticatedCloudbetGet(
+  env: Env,
+  fullUrl: string
+): Promise<AnyObj> {
+
+  const started =
+    Date.now();
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      CLOUDBET_TIMEOUT_MS
+    );
+
+  try {
+
+    const response =
+      await fetch(
+        fullUrl,
+        {
+          method:
+            "GET",
+
+          headers: {
+            "accept":
+              "application/json",
+
+            "content-type":
+              "application/json",
+
+            "x-api-key":
+              env.CLOUDBET_API_KEY || ""
+          },
+
+          signal:
+            controller.signal
+        }
+      );
+
+    const raw =
+      await response.text();
+
+    let data:
+      any = null;
+
+    try {
+
+      data =
+        raw
+          ? JSON.parse(raw)
+          : null;
+
+    } catch {
+
+      data =
+        null;
+
+    }
+
+    return {
+      ok:
+        response.ok,
+
+      status:
+        response.status,
+
+      elapsed_ms:
+        Date.now() -
+        started,
+
+      content_type:
+        response.headers.get(
+          "content-type"
+        ),
+
+      data,
+
+      raw:
+        data === null
+          ? raw.slice(
+              0,
+              2000
+            )
+          : null
+    };
+
+  } catch (
+    error
+  ) {
+
+    return {
+      ok:
+        false,
+
+      status:
+        0,
+
+      elapsed_ms:
+        Date.now() -
+        started,
+
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error)
+    };
+
+  } finally {
+
+    clearTimeout(
+      timer
+    );
+
+  }
+
+}
+
+
+async function tradingAccessCheck(
+  env: Env
+): Promise<Response> {
+
+  const started =
+    Date.now();
+
+  const balanceUrl =
+    "https://sports-api.cloudbet.com/pub/v1/account/currencies/PLAY_EUR/balance";
+
+  const historyUrl =
+    "https://sports-api.cloudbet.com/pub/v4/bets/history?limit=1&offset=0";
+
+  const [
+    balance,
+    history
+  ] =
+    await Promise.all([
+      authenticatedCloudbetGet(
+        env,
+        balanceUrl
+      ),
+
+      authenticatedCloudbetGet(
+        env,
+        historyUrl
+      )
+    ]);
+
+  const balanceAuthenticated =
+    balance.status === 200;
+
+  const historyAuthenticated =
+    history.status === 200;
+
+  const access =
+    balanceAuthenticated &&
+    historyAuthenticated
+      ? "ACCOUNT_AND_TRADING_READ_ACCESS_OK"
+      : balanceAuthenticated
+      ? "ACCOUNT_ACCESS_OK_TRADING_HISTORY_FAILED"
+      : historyAuthenticated
+      ? "TRADING_HISTORY_OK_ACCOUNT_ACCESS_FAILED"
+      : "AUTHENTICATED_ACCESS_FAILED";
+
+  return json({
+
+    success:
+      balanceAuthenticated ||
+      historyAuthenticated,
+
+    worker:
+      "cloudbet-live-soccer-detector",
+
+    version:
+      VERSION,
+
+    action:
+      "TRADING_CHECK",
+
+    read_only:
+      true,
+
+    betting:
+      false,
+
+    api_key_present:
+      !!env.CLOUDBET_API_KEY,
+
+    access,
+
+    checks: {
+
+      account_balance: {
+
+        endpoint:
+          "/pub/v1/account/currencies/PLAY_EUR/balance",
+
+        ok:
+          balance.ok,
+
+        http_status:
+          balance.status,
+
+        elapsed_ms:
+          balance.elapsed_ms,
+
+        authenticated:
+          balanceAuthenticated,
+
+        // Keep the raw account response visible because it is useful
+        // for confirming that this API key belongs to the player account.
+        response:
+          balance.data ??
+          balance.raw ??
+          null,
+
+        error:
+          balance.error ??
+          null
+
+      },
+
+      trading_history: {
+
+        endpoint:
+          "/pub/v4/bets/history?limit=1&offset=0",
+
+        ok:
+          history.ok,
+
+        http_status:
+          history.status,
+
+        elapsed_ms:
+          history.elapsed_ms,
+
+        authenticated:
+          historyAuthenticated,
+
+        response:
+          history.data ??
+          history.raw ??
+          null,
+
+        error:
+          history.error ??
+          null
+
+      }
+
+    },
+
+    interpretation: {
+
+      both_200:
+        "The API key is accepted by both Account API and Trading API read endpoints.",
+
+      history_empty:
+        "An empty API bet history does not prove trading is disabled; Cloudbet API history can differ from website bet history.",
+
+      no_bet_placed:
+        true
+
+    },
+
+    performance: {
+
+      total_elapsed_ms:
+        Date.now() -
+        started
+
+    }
+
+  });
+
+}
+
+
 // ============================================================
 // MAIN
 // ============================================================
@@ -2994,6 +3286,8 @@ export default {
           "/event?id=EVENT_ID",
 
           "/line-test?id=EVENT_ID",
+
+          "/trading-check",
 
           "/diagnostic-events-raw",
 
@@ -3375,6 +3669,58 @@ export default {
                 ? error.message
                 : String(error)
 
+          },
+          500
+        );
+
+      }
+
+    }
+
+
+    // --------------------------------------------------------
+    // TRADING / ACCOUNT READ ACCESS CHECK
+    // --------------------------------------------------------
+
+    if (
+      pathname ===
+      "/trading-check"
+    ) {
+
+      try {
+
+        return await tradingAccessCheck(
+          env
+        );
+
+      } catch (
+        error
+      ) {
+
+        return json(
+          {
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "TRADING_CHECK",
+
+            read_only:
+              true,
+
+            betting:
+              false,
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(error)
           },
           500
         );
