@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET BET WORKER V6.0.1
+// CLOUDBET BET WORKER V6.0.2
 // DRY RUN · PERSISTENT ODDS RETRY
 // EXACT 1H TOTAL GOALS OVER 0.5
 //
@@ -29,7 +29,7 @@ type Obj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V6.0.1";
+const VERSION = "V6.0.2";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -966,6 +966,21 @@ async function fetchCloudbetEvent(
   ) {
     data =
       data.data;
+  }
+
+  // V6.0.2:
+  // cloudbet-live-soccer-detector V5.7.8 returns the full
+  // Cloudbet event inside the public wrapper field: event.
+  // Unwrap it so odds parsing receives the actual event.markets.
+  if (
+    data &&
+    typeof data === "object" &&
+    data.event &&
+    typeof data.event ===
+      "object"
+  ) {
+    data =
+      data.event;
   }
 
   return data || {};
