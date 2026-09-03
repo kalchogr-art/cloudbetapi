@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET BET WORKER V6.0.5
+// CLOUDBET BET WORKER V6.0.6
 // DRY RUN · PERSISTENT ODDS RETRY
 // EXACT 1H TOTAL GOALS OVER 0.5
 //
@@ -14,6 +14,14 @@
 // - Persistent retry preserved
 // - SAME EVENT / SAME MARKET / SAME LINE
 // - REAL BETTING DISABLED
+//
+// V6.0.6:
+// - Compares exact target from /event and detector /line-test
+// - Same Cloudbet event ID / same market / same line
+// - /line-test is used as a second fresh odds source
+// - If /line-test has a usable price it is preferred
+// - Full source comparison is exposed in odds_diagnostic
+// - DRY RUN remains enabled; no real bet placement
 // ============================================================
 
 interface Env {
@@ -29,7 +37,7 @@ type Obj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V6.0.5";
+const VERSION = "V6.0.6";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -984,6 +992,94 @@ async function fetchCloudbetEvent(
   }
 
   return data || {};
+}
+
+// ============================================================
+// CLOUDBET LINE TEST — V6.0.6
+// Detector endpoint: /line-test?id=EVENT_ID
+// READ ONLY
+// ============================================================
+
+async function fetchCloudbetLineTest(
+  env: Env,
+  eventId: string
+): Promise<any> {
+
+  if (!eventId) {
+    throw new ServiceRequestError(
+      "CLOUDBET_EVENT_ID_MISSING"
+    );
+  }
+
+  const path =
+    `/line-test?id=${encodeURIComponent(
+      eventId
+    )}`;
+
+  const result =
+    await fetchServiceJSON(
+      env.CLOUDBET,
+      path,
+      SERVICE_TIMEOUT_MS
+    );
+
+  if (!result.ok) {
+    return {
+      ok: false,
+      endpoint:
+        path,
+      status:
+        result.status,
+      latency_ms:
+        result.latency_ms,
+      data:
+        null,
+      error:
+        result.error ||
+        "CLOUDBET_LINE_TEST_FAILED",
+      raw:
+        result.data
+    };
+  }
+
+  const wrapper =
+    result.data || {};
+
+  const line =
+    wrapper?.line || {};
+
+  const selection =
+    line?.data ?? null;
+
+  return {
+    ok:
+      line?.success === true &&
+      !!selection,
+
+    endpoint:
+      path,
+
+    status:
+      line?.response?.status ??
+      result.status,
+
+    latency_ms:
+      line?.response?.elapsed_ms ??
+      result.latency_ms,
+
+    selection,
+
+    raw:
+      wrapper,
+
+    error:
+      line?.success === false
+        ? (
+            line?.error ||
+            "CLOUDBET_LINE_TEST_FAILED"
+          )
+        : null
+  };
 }
 
 // ============================================================
@@ -2636,6 +2732,7 @@ interface OddsResult {
   event_id: string | null;
   odds: number | null;
   event: Obj | null;
+  source?: string | null;
   diagnostic: Obj;
   error?: string;
 }
@@ -2663,6 +2760,7 @@ async function resolveOddsOnce(
       event_id: null,
       odds: null,
       event: null,
+      source: null,
       diagnostic: {
         error:
           "CLOUDBET_EVENT_ID_MISSING"
@@ -2673,44 +2771,307 @@ async function resolveOddsOnce(
   }
 
   try {
+
+    // V6.0.6:
+    // Ask BOTH sources for the SAME event at the same time:
+    //   1) /event?id=...
+    //   2) /line-test?id=...
+    //
+    // This lets us see whether the full event feed and the
+    // dedicated /lines lookup disagree.
+
+    const [
+      eventResult,
+      lineResult
+    ] =
+      await Promise.allSettled([
+        fetchCloudbetEvent(
+          env,
+          eventId
+        ),
+
+        fetchCloudbetLineTest(
+          env,
+          eventId
+        )
+      ]);
+
     const event =
-      await fetchCloudbetEvent(
-        env,
-        eventId
+      eventResult.status ===
+        "fulfilled"
+        ? eventResult.value
+        : null;
+
+    const eventError =
+      eventResult.status ===
+        "rejected"
+        ? (
+            eventResult.reason instanceof Error
+              ? eventResult.reason.message
+              : String(
+                  eventResult.reason
+                )
+          )
+        : null;
+
+    const eventDiagnostic =
+      event
+        ? buildOddsDiagnostic(
+            event
+          )
+        : {
+            error:
+              eventError ||
+              "EVENT_SOURCE_FAILED"
+          };
+
+    const eventTarget =
+      event
+        ? findTargetSelection(
+            event
+          )
+        : null;
+
+    const eventOdds =
+      eventTarget
+        ? extractPrice(
+            eventTarget
+          )
+        : null;
+
+    const line =
+      lineResult.status ===
+        "fulfilled"
+        ? lineResult.value
+        : {
+            ok: false,
+            selection: null,
+            error:
+              lineResult.reason instanceof Error
+                ? lineResult.reason.message
+                : String(
+                    lineResult.reason
+                  )
+          };
+
+    const lineSelection =
+      line?.selection ??
+      null;
+
+    const lineStatus =
+      String(
+        lineSelection?.status ??
+        ""
+      ).toUpperCase();
+
+    const linePrice =
+      extractPrice(
+        lineSelection
       );
 
-    const diagnostic =
-      buildOddsDiagnostic(
-        event
+    const lineMaxStakeRaw =
+      lineSelection?.maxStake ??
+      lineSelection?.max_stake ??
+      null;
+
+    const lineMaxStake =
+      lineMaxStakeRaw === null ||
+      lineMaxStakeRaw === undefined
+        ? null
+        : Number(
+            lineMaxStakeRaw
+          );
+
+    const lineEnabled =
+      !!lineSelection &&
+      selectionEnabled(
+        lineSelection
+      ) &&
+      linePrice !== null &&
+      (
+        lineMaxStake === null ||
+        (
+          Number.isFinite(
+            lineMaxStake
+          ) &&
+          lineMaxStake > 0
+        )
       );
 
-    const odds =
-      extractOdds(
-        event
+    const eventStatus =
+      String(
+        eventTarget?.status ??
+        ""
       );
 
+    const eventMaxStakeRaw =
+      eventTarget?.maxStake ??
+      eventTarget?.max_stake ??
+      null;
+
+    const eventMaxStake =
+      eventMaxStakeRaw === null ||
+      eventMaxStakeRaw === undefined
+        ? null
+        : Number(
+            eventMaxStakeRaw
+          );
+
+    const diagnostic = {
+      comparison_version:
+        "V6.0.6",
+
+      event_id:
+        eventId,
+
+      target: {
+        market:
+          TARGET_MARKET,
+
+        submarket:
+          TARGET_SUBMARKET,
+
+        outcome:
+          TARGET_OUTCOME,
+
+        params:
+          TARGET_PARAMS
+      },
+
+      event_source: {
+        ok:
+          !!event,
+
+        odds:
+          eventOdds,
+
+        status:
+          eventTarget?.status ??
+          null,
+
+        maxStake:
+          Number.isFinite(
+            eventMaxStake
+          )
+            ? eventMaxStake
+            : null,
+
+        target_found:
+          !!eventTarget,
+
+        diagnostic:
+          eventDiagnostic,
+
+        error:
+          eventError
+      },
+
+      line_source: {
+        ok:
+          line?.ok === true,
+
+        endpoint:
+          line?.endpoint ??
+          `/line-test?id=${eventId}`,
+
+        http_status:
+          line?.status ??
+          null,
+
+        latency_ms:
+          line?.latency_ms ??
+          null,
+
+        odds:
+          linePrice,
+
+        status:
+          lineSelection?.status ??
+          null,
+
+        maxStake:
+          Number.isFinite(
+            lineMaxStake
+          )
+            ? lineMaxStake
+            : null,
+
+        selection:
+          lineSelection,
+
+        enabled:
+          lineEnabled,
+
+        error:
+          line?.error ??
+          null
+      },
+
+      comparison: {
+        same_price:
+          eventOdds ===
+          linePrice,
+
+        same_status:
+          eventStatus ===
+          lineStatus,
+
+        event_price:
+          eventOdds,
+
+        line_price:
+          linePrice
+      }
+    };
+
+    // Prefer the dedicated /lines result when it is actually usable.
     if (
-      odds === null
+      lineEnabled &&
+      linePrice !== null
     ) {
       return {
-        success: false,
+        success: true,
         event_id:
           eventId,
-        odds: null,
-        event,
-        diagnostic,
-        error:
-          "TARGET_ODDS_NOT_AVAILABLE"
+        odds:
+          linePrice,
+        event:
+          event || cloudbet,
+        source:
+          "LINE_TEST",
+        diagnostic
+      };
+    }
+
+    // Fallback to the exact target read from /event.
+    if (
+      eventOdds !== null
+    ) {
+      return {
+        success: true,
+        event_id:
+          eventId,
+        odds:
+          eventOdds,
+        event:
+          event || cloudbet,
+        source:
+          "EVENT",
+        diagnostic
       };
     }
 
     return {
-      success: true,
+      success: false,
       event_id:
         eventId,
-      odds,
-      event,
-      diagnostic
+      odds: null,
+      event:
+        event || null,
+      source: null,
+      diagnostic,
+      error:
+        "TARGET_ODDS_NOT_AVAILABLE"
     };
 
   } catch (error) {
@@ -2732,6 +3093,7 @@ async function resolveOddsOnce(
         eventId,
       odds: null,
       event: null,
+      source: null,
       diagnostic,
       error:
         error instanceof Error
@@ -4433,6 +4795,13 @@ async function runWorker(
           odds:
             oddsResult.odds,
 
+          odds_source:
+            oddsResult.source ??
+            null,
+
+          odds_diagnostic:
+            oddsResult.diagnostic,
+
           target: {
             market:
               TARGET_MARKET,
@@ -4529,6 +4898,13 @@ async function runWorker(
         odds:
           oddsResult.odds,
 
+        odds_source:
+          oddsResult.source ??
+          null,
+
+        odds_diagnostic:
+          oddsResult.diagnostic,
+
         error:
           oddsResult.error,
 
@@ -4613,7 +4989,7 @@ async function runWorker(
         CLOUDBET_LIVE_PATH,
 
       odds_endpoint:
-        "/event?id=CLOUDBET_EVENT_ID",
+        "/event + /line-test?id=CLOUDBET_EVENT_ID",
 
       odds_event_retry:
         false,
@@ -4648,7 +5024,10 @@ async function runWorker(
         "CLOUDBET SERVICE BINDING /live",
 
       cloudbet_live_parser:
-        "CLOUDBET /live → events[]"
+        "CLOUDBET /live → events[]",
+
+      cloudbet_line_parser:
+        "CLOUDBET /line-test → POST /lines"
     },
 
     stats: {
@@ -4873,7 +5252,7 @@ async function runDiagnostic(
         CLOUDBET_LIVE_PATH,
 
       odds_endpoint:
-        "/event?id=CLOUDBET_EVENT_ID",
+        "/event + /line-test?id=CLOUDBET_EVENT_ID",
 
       tracker_endpoint:
         "/entries",
@@ -5180,7 +5559,7 @@ function healthResponse():
         "CLOUDBET /live → events[]",
 
       odds_endpoint:
-        "/event?id=CLOUDBET_EVENT_ID",
+        "/event + /line-test?id=CLOUDBET_EVENT_ID",
 
       persistent_retry:
         true,
