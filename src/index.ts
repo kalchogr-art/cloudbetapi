@@ -1,6 +1,6 @@
 // ============================================================
 // CLOUDBET LIVE SOCCER DETECTOR
-// V5.8.0
+// V5.8.1
 //
 // FIX:
 // - Cloudbet /events returns:
@@ -32,7 +32,7 @@ const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
 const VERSION =
-  "V5.8.0";
+  "V5.8.1";
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
@@ -3084,17 +3084,30 @@ async function tradingAccessCheck(
   const started =
     Date.now();
 
-  const balanceUrl =
-    "https://sports-api.cloudbet.com/pub/v1/account/currencies/PLAY_EUR/balance";
+  const currenciesUrl =
+    "https://sports-api.cloudbet.com/pub/v1/account/currencies";
 
-  const historyUrl =
+  const balanceUrl =
+    "https://sports-api.cloudbet.com/pub/v1/account/currencies/USDT/balance";
+
+  const historyV4Url =
     "https://sports-api.cloudbet.com/pub/v4/bets/history?limit=1&offset=0";
 
+  const historyV3Url =
+    "https://sports-api.cloudbet.com/pub/v3/bets/history?limit=1&offset=0";
+
   const [
+    currencies,
     balance,
-    history
+    historyV4,
+    historyV3
   ] =
     await Promise.all([
+      authenticatedCloudbetGet(
+        env,
+        currenciesUrl
+      ),
+
       authenticatedCloudbetGet(
         env,
         balanceUrl
@@ -3102,31 +3115,59 @@ async function tradingAccessCheck(
 
       authenticatedCloudbetGet(
         env,
-        historyUrl
+        historyV4Url
+      ),
+
+      authenticatedCloudbetGet(
+        env,
+        historyV3Url
       )
     ]);
+
+  const currenciesAuthenticated =
+    currencies.status === 200;
 
   const balanceAuthenticated =
     balance.status === 200;
 
-  const historyAuthenticated =
-    history.status === 200;
+  const historyV4Authenticated =
+    historyV4.status === 200;
+
+  const historyV3Authenticated =
+    historyV3.status === 200;
+
+  const tradingReadAuthenticated =
+    historyV4Authenticated ||
+    historyV3Authenticated;
 
   const access =
     balanceAuthenticated &&
-    historyAuthenticated
+    tradingReadAuthenticated
       ? "ACCOUNT_AND_TRADING_READ_ACCESS_OK"
       : balanceAuthenticated
       ? "ACCOUNT_ACCESS_OK_TRADING_HISTORY_FAILED"
-      : historyAuthenticated
+      : tradingReadAuthenticated
       ? "TRADING_HISTORY_OK_ACCOUNT_ACCESS_FAILED"
       : "AUTHENTICATED_ACCESS_FAILED";
+
+  const availableCurrencies =
+    Array.isArray(
+      currencies?.data?.currencies
+    )
+      ? currencies.data.currencies
+      : [];
+
+  const usdtListed =
+    availableCurrencies.includes(
+      "USDT"
+    );
 
   return json({
 
     success:
+      currenciesAuthenticated ||
       balanceAuthenticated ||
-      historyAuthenticated,
+      tradingReadAuthenticated,
 
     worker:
       "cloudbet-live-soccer-detector",
@@ -3146,14 +3187,50 @@ async function tradingAccessCheck(
     api_key_present:
       !!env.CLOUDBET_API_KEY,
 
+    configured_currency:
+      "USDT",
+
     access,
 
     checks: {
 
-      account_balance: {
+      account_currencies: {
 
         endpoint:
-          "/pub/v1/account/currencies/PLAY_EUR/balance",
+          "/pub/v1/account/currencies",
+
+        ok:
+          currencies.ok,
+
+        http_status:
+          currencies.status,
+
+        elapsed_ms:
+          currencies.elapsed_ms,
+
+        authenticated:
+          currenciesAuthenticated,
+
+        usdt_listed:
+          usdtListed,
+
+        currencies:
+          availableCurrencies,
+
+        response:
+          currencies.data ??
+          currencies.raw ??
+          null,
+
+        error:
+          currencies.error ??
+          null
+      },
+
+      account_balance_usdt: {
+
+        endpoint:
+          "/pub/v1/account/currencies/USDT/balance",
 
         ok:
           balance.ok,
@@ -3167,8 +3244,9 @@ async function tradingAccessCheck(
         authenticated:
           balanceAuthenticated,
 
-        // Keep the raw account response visible because it is useful
-        // for confirming that this API key belongs to the player account.
+        currency:
+          "USDT",
+
         response:
           balance.data ??
           balance.raw ??
@@ -3177,50 +3255,100 @@ async function tradingAccessCheck(
         error:
           balance.error ??
           null
-
       },
 
-      trading_history: {
+      trading_history_v4: {
 
         endpoint:
           "/pub/v4/bets/history?limit=1&offset=0",
 
         ok:
-          history.ok,
+          historyV4.ok,
 
         http_status:
-          history.status,
+          historyV4.status,
 
         elapsed_ms:
-          history.elapsed_ms,
+          historyV4.elapsed_ms,
 
         authenticated:
-          historyAuthenticated,
+          historyV4Authenticated,
 
         response:
-          history.data ??
-          history.raw ??
+          historyV4.data ??
+          historyV4.raw ??
           null,
 
         error:
-          history.error ??
+          historyV4.error ??
           null
+      },
 
+      trading_history_v3_legacy: {
+
+        endpoint:
+          "/pub/v3/bets/history?limit=1&offset=0",
+
+        ok:
+          historyV3.ok,
+
+        http_status:
+          historyV3.status,
+
+        elapsed_ms:
+          historyV3.elapsed_ms,
+
+        authenticated:
+          historyV3Authenticated,
+
+        response:
+          historyV3.data ??
+          historyV3.raw ??
+          null,
+
+        error:
+          historyV3.error ??
+          null
       }
 
     },
 
+    summary: {
+
+      account_api_authenticated:
+        currenciesAuthenticated ||
+        balanceAuthenticated,
+
+      usdt_available:
+        usdtListed ||
+        balanceAuthenticated,
+
+      usdt_balance_endpoint_ok:
+        balanceAuthenticated,
+
+      trading_v4_history_ok:
+        historyV4Authenticated,
+
+      trading_v3_history_ok:
+        historyV3Authenticated,
+
+      trading_read_access_ok:
+        tradingReadAuthenticated
+    },
+
     interpretation: {
 
-      both_200:
-        "The API key is accepted by both Account API and Trading API read endpoints.",
+      purpose:
+        "Confirm the API key against Account API and Trading API read endpoints using the real account currency USDT.",
 
-      history_empty:
-        "An empty API bet history does not prove trading is disabled; Cloudbet API history can differ from website bet history.",
+      v4:
+        "v4 is checked as the current Trading API history route.",
+
+      v3:
+        "v3 is checked only as a legacy compatibility diagnostic.",
 
       no_bet_placed:
         true
-
     },
 
     performance: {
@@ -3228,7 +3356,6 @@ async function tradingAccessCheck(
       total_elapsed_ms:
         Date.now() -
         started
-
     }
 
   });
