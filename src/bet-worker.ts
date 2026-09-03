@@ -1,24 +1,27 @@
+// ============================================================
 // CLOUDBET BET WORKER V5.9.0
 // DRY RUN · EXACT 1H TOTAL GOALS OVER 0.5
 //
 // FLOW:
-// TRACKER → MATCHER → CLOUDBET EVENT → EXACT TARGET → RETRY
+// TRACKER → MATCHER → CLOUDBET EVENT → EXACT TARGET
 //
-// V5.9.0:
+// V5.9.0 FIX:
 // - V5.8.9 behavior preserved
 // - /run service timeout protection
 // - TRACKER / MATCHER / CLOUDBET independently diagnosed
 // - Promise.allSettled() prevents one service from hanging /run
 // - NEW /diagnostic endpoint
 // - /diagnostic calls TRACKER → MATCHER → CLOUDBET sequentially
-// - /diagnostic measures each service independently
 // - exact elapsed_ms / HTTP status / response bytes
 // - EXACT target only
-// - SAME Cloudbet event retry
-// - 20 attempts
-// - 30 seconds between attempts
 // - /lines diagnostic
 // - Real betting disabled
+//
+// IMPORTANT V5.9.0 RUN FIX:
+// - /run uses SINGLE Cloudbet /event attempt
+// - /run DOES NOT wait 20 × 30 sec for odds
+// - processPending() keeps persistent retry:
+//   20 attempts / 30 sec between attempts
 // ============================================================
 
 interface Env {
@@ -892,8 +895,8 @@ function isHunterEntry(
   return (
     safe(
       signal?.type ??
-      signal?.signal_type ??
-      signal?.signalType
+        signal?.signal_type ??
+        signal?.signalType
     ).toUpperCase() ===
     ALLOWED_SIGNAL_TYPE
   );
@@ -904,9 +907,9 @@ function signalId(
 ): string {
   return safe(
     signal?.match_id ??
-    signal?.matchId ??
-    signal?.v27?.id ??
-    signal?.id
+      signal?.matchId ??
+      signal?.v27?.id ??
+      signal?.id
   );
 }
 
@@ -915,7 +918,7 @@ function signalHome(
 ): string {
   return safe(
     signal?.v27?.home ??
-    extractHome(signal)
+      extractHome(signal)
   );
 }
 
@@ -924,7 +927,7 @@ function signalAway(
 ): string {
   return safe(
     signal?.v27?.away ??
-    extractAway(signal)
+      extractAway(signal)
   );
 }
 
@@ -933,8 +936,8 @@ function signalMatch(
 ): string {
   return safe(
     signal?.match ??
-    signal?.name ??
-    signal?.v27?.match
+      signal?.name ??
+      signal?.v27?.match
   );
 }
 
@@ -961,11 +964,11 @@ function matcherScore(
   const n =
     Number(
       item?.scoring?.total ??
-      item?.scoring?.score ??
-      item?.matcher_score ??
-      item?.match_score ??
-      item?.score ??
-      0
+        item?.scoring?.score ??
+        item?.matcher_score ??
+        item?.match_score ??
+        item?.score ??
+        0
     );
 
   return Number.isFinite(n)
@@ -999,8 +1002,8 @@ function matcherClassification(
 ): string {
   return safe(
     item?.classification ??
-    item?.match_classification ??
-    item?.security?.classification
+      item?.match_classification ??
+      item?.security?.classification
   );
 }
 
@@ -1009,8 +1012,8 @@ function matcherMethod(
 ): string {
   return safe(
     item?.match_method ??
-    item?.method ??
-    item?.security?.match_method
+      item?.method ??
+      item?.security?.match_method
   );
 }
 
@@ -1442,9 +1445,7 @@ function validTarget(
     );
 
   if (
-    Number.isFinite(
-      maxStake
-    ) &&
+    Number.isFinite(maxStake) &&
     maxStake <= 0
   ) {
     return false;
@@ -1473,9 +1474,9 @@ function marketEntries(
         _market_key:
           safe(
             market?.market_key ??
-            market?.marketKey ??
-            market?.key ??
-            market?.market
+              market?.marketKey ??
+              market?.key ??
+              market?.market
           )
       });
     }
@@ -1503,9 +1504,9 @@ function marketEntries(
             safe(
               (value as Obj)
                 ?.market_key ??
-              (value as Obj)
-                ?.marketKey ??
-              key
+                (value as Obj)
+                  ?.marketKey ??
+                key
             )
         });
       }
@@ -1535,9 +1536,9 @@ function submarketEntries(
         _submarket_key:
           safe(
             sub?.submarket_key ??
-            sub?.submarketKey ??
-            sub?.key ??
-            sub?.market
+              sub?.submarketKey ??
+              sub?.key ??
+              sub?.market
           )
       });
     }
@@ -1565,9 +1566,9 @@ function submarketEntries(
             safe(
               (value as Obj)
                 ?.submarket_key ??
-              (value as Obj)
-                ?.submarketKey ??
-              key
+                (value as Obj)
+                  ?.submarketKey ??
+                key
             )
         });
       }
@@ -1931,6 +1932,12 @@ function buildOddsDiagnostic(
 }
 
 // ─── RETRY SAME EVENT ──────────────────────────────────────
+//
+// Used by PENDING CRON.
+// NOT used by /run.
+//
+// /run uses resolveOddsOnce() below.
+// ───────────────────────────────────────────────────────────
 
 async function resolveOddsWithRetry(
   env: Env,
@@ -1993,9 +2000,13 @@ async function resolveOddsWithRetry(
 
       attempts.push({
         attempt,
+
         event_id:
           eventId,
-        success: true,
+
+        success:
+          true,
+
         odds,
 
         reason:
@@ -2051,10 +2062,12 @@ async function resolveOddsWithRetry(
     } catch (error) {
       attempts.push({
         attempt,
+
         event_id:
           eventId,
 
-        success: false,
+        success:
+          false,
 
         odds: null,
 
@@ -2137,6 +2150,172 @@ async function resolveOddsWithRetry(
   };
 }
 
+// ─── SINGLE ODDS ATTEMPT ───────────────────────────────────
+//
+// V5.9.0 FIX.
+//
+// Used by /run so the HTTP request cannot be held for
+// approximately 9.5 minutes by the persistent retry.
+//
+// If the exact target is not available on this attempt,
+// /run returns immediately and savePending() stores it.
+//
+// Persistent retry remains in processPending().
+// ───────────────────────────────────────────────────────────
+
+async function resolveOddsOnce(
+  env: Env,
+  cloudbet: Obj
+): Promise<Obj> {
+  const eventId =
+    extractMatchId(
+      cloudbet
+    );
+
+  if (!eventId) {
+    return {
+      success: false,
+
+      source:
+        "CLOUDBET_EVENT_SINGLE_ATTEMPT",
+
+      event:
+        cloudbet,
+
+      odds: null,
+
+      attempts: 0,
+
+      error:
+        "CLOUDBET_EVENT_ID_MISSING",
+
+      attempts_detail: []
+    };
+  }
+
+  try {
+    const event =
+      await fetchCloudbetEvent(
+        env,
+        eventId
+      );
+
+    const diagnostic =
+      buildOddsDiagnostic(
+        event
+      );
+
+    const odds =
+      extractOdds(
+        event
+      );
+
+    return {
+      success:
+        odds !== null,
+
+      source:
+        "CLOUDBET_EVENT_SINGLE_ATTEMPT",
+
+      event,
+
+      odds,
+
+      attempts: 1,
+
+      error:
+        odds !== null
+          ? null
+          : diagnostic.reason,
+
+      retry: {
+        max_attempts: 1,
+        delay_ms: 0,
+        attempts_used: 1,
+        valid_on_attempt:
+          odds !== null
+            ? 1
+            : null
+      },
+
+      attempts_detail: [
+        {
+          attempt: 1,
+
+          event_id:
+            eventId,
+
+          success:
+            true,
+
+          odds,
+
+          reason:
+            diagnostic.reason,
+
+          target_selection_present:
+            diagnostic
+              .target_selection_present,
+
+          target_selection_valid:
+            diagnostic
+              .target_selection_valid
+        }
+      ],
+
+      diagnostic
+    };
+  } catch (error) {
+    return {
+      success: false,
+
+      source:
+        "CLOUDBET_EVENT_SINGLE_ATTEMPT",
+
+      event:
+        cloudbet,
+
+      odds: null,
+
+      attempts: 1,
+
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error),
+
+      retry: {
+        max_attempts: 1,
+        delay_ms: 0,
+        attempts_used: 1,
+        valid_on_attempt: null
+      },
+
+      attempts_detail: [
+        {
+          attempt: 1,
+
+          event_id:
+            eventId,
+
+          success:
+            false,
+
+          odds: null,
+
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error)
+        }
+      ],
+
+      diagnostic:
+        null
+    };
+  }
+}
+
 // ─── BET OBJECT ────────────────────────────────────────────
 
 function buildBet(
@@ -2172,8 +2351,8 @@ function buildBet(
     signal_type:
       safe(
         signal?.type ??
-        signal?.signal_type ??
-        signal?.signalType
+          signal?.signal_type ??
+          signal?.signalType
       ),
 
     signal_match_id:
@@ -2182,9 +2361,9 @@ function buildBet(
     hunter_score:
       Number(
         signal?.hunter_score ??
-        signal?.v27?.hunter_score ??
-        signal?.score ??
-        null
+          signal?.v27?.hunter_score ??
+          signal?.score ??
+          null
       ),
 
     match:
@@ -2194,9 +2373,9 @@ function buildBet(
     entry_minute:
       Number(
         signal?.minute ??
-        signal?.entry_minute ??
-        signal?.v27?.minute ??
-        null
+          signal?.entry_minute ??
+          signal?.v27?.minute ??
+          null
       ),
 
     v27: {
@@ -2321,7 +2500,7 @@ function buildCandidate(
   const odds =
     extractOdds(
       bet?.cloudbet ??
-      {}
+        {}
     );
 
   const complete =
@@ -2361,7 +2540,7 @@ function buildCandidate(
     cloudbet_id:
       extractMatchId(
         bet?.cloudbet ??
-        {}
+          {}
       ),
 
     market:
@@ -2423,10 +2602,10 @@ function archiveKey(
 
   return `teams:${normalizeTeam(
     bet?.v27?.home ??
-    bet?.cloudbet?.home
+      bet?.cloudbet?.home
   )}:${normalizeTeam(
     bet?.v27?.away ??
-    bet?.cloudbet?.away
+      bet?.cloudbet?.away
   )}`;
 }
 
@@ -2865,8 +3044,8 @@ function scorePair(
   const text =
     safe(
       m?.score ??
-      m?.result ??
-      m?.current_score
+        m?.result ??
+        m?.current_score
     );
 
   const match =
@@ -2917,10 +3096,10 @@ function isFirstHalf(
   const period =
     norm(
       m?.period ??
-      m?.match_period ??
-      m?.phase ??
-      m?.state ??
-      m?.status
+        m?.match_period ??
+        m?.phase ??
+        m?.state ??
+        m?.status
     );
 
   if (
@@ -2934,11 +3113,11 @@ function isFirstHalf(
   const minute =
     numberValue(
       m?.minute ??
-      m?.match_minute ??
-      m?.matchMinute ??
-      m?.clock?.minute ??
-      m?.time?.minute ??
-      m?.elapsed
+        m?.match_minute ??
+        m?.matchMinute ??
+        m?.clock?.minute ??
+        m?.time?.minute ??
+        m?.elapsed
     );
 
   return (
@@ -3128,7 +3307,7 @@ async function processPending(
       const missing =
         Number(
           row?.missing_count ??
-          0
+            0
         ) + 1;
 
       if (
@@ -3160,7 +3339,7 @@ async function processPending(
           id,
           Number(
             row?.retry_count ??
-            0
+              0
           ),
           missing
         );
@@ -3218,6 +3397,8 @@ async function processPending(
       continue;
     }
 
+    // IMPORTANT:
+    // Persistent retry is intentionally preserved here.
     const oddsResult =
       await resolveOddsWithRetry(
         env,
@@ -3233,7 +3414,7 @@ async function processPending(
         id,
         Number(
           row?.retry_count ??
-          0
+            0
         ) + 1,
         0
       );
@@ -3642,8 +3823,19 @@ async function runWorker(
       continue;
     }
 
+    // ========================================================
+    // V5.9.0 FIX:
+    //
+    // DO NOT use resolveOddsWithRetry() here.
+    //
+    // One /run request must not wait:
+    // 20 attempts × 30 seconds.
+    //
+    // One Cloudbet event request only.
+    // ========================================================
+
     const oddsResult =
-      await resolveOddsWithRetry(
+      await resolveOddsOnce(
         env,
         verification.cloudbet
       );
@@ -3783,16 +3975,25 @@ async function runWorker(
         "/event?id=CLOUDBET_EVENT_ID",
 
       odds_event_retry:
-        true,
+        false,
 
       odds_event_max_retries:
-        ODDS_EVENT_MAX_RETRIES,
+        1,
 
       odds_event_retry_delay_ms:
-        ODDS_EVENT_RETRY_DELAY_MS,
+        0,
 
       retry_same_event:
+        false,
+
+      persistent_pending_retry:
         true,
+
+      pending_retry_max_attempts:
+        ODDS_EVENT_MAX_RETRIES,
+
+      pending_retry_delay_ms:
+        ODDS_EVENT_RETRY_DELAY_MS,
 
       switch_event_on_retry:
         false,
@@ -3920,25 +4121,6 @@ async function runWorker(
 }
 
 // ─── /DIAGNOSTIC ───────────────────────────────────────────
-//
-// IMPORTANT:
-// This endpoint deliberately calls the services
-// SEQUENTIALLY.
-//
-// TRACKER → MATCHER → CLOUDBET
-//
-// Purpose:
-// determine exactly which service is slow/hanging.
-//
-// It does NOT:
-// - run matcher logic
-// - search Cloudbet events
-// - fetch odds
-// - perform odds retry
-// - access the betting pipeline
-//
-// It only measures service response performance.
-// ───────────────────────────────────────────────────────────
 
 async function diagnosticService(
   service: Fetcher,
@@ -4350,6 +4532,20 @@ function healthResponse(
         TARGET_PARAMS
     },
 
+    run_odds: {
+      mode:
+        "SINGLE_ATTEMPT",
+
+      max_attempts:
+        1,
+
+      delay_ms:
+        0,
+
+      persistent_pending_retry:
+        true
+    },
+
     retry: {
       max_attempts:
         ODDS_EVENT_MAX_RETRIES,
@@ -4506,7 +4702,7 @@ async function archiveResponse(
       total:
         Number(
           totalResult?.total ??
-          0
+            0
         ),
 
       returned:
