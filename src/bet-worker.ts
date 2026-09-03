@@ -1,30 +1,33 @@
 // ============================================================
-// CLOUDBET BET WORKER V5.9.4
+// CLOUDBET BET WORKER V5.9.5
 // DRY RUN · EXACT 1H TOTAL GOALS OVER 0.5
 //
 // FLOW:
-// TRACKER → MATCHER → DIRECT CLOUDBET FALLBACK → CLOUDBET EVENTS
-//       → EXACT TARGET → CLOUDBET EVENT
+// TRACKER → MATCHER → DIRECT CLOUDBET FALLBACK → CLOUDBET /live
+//       → EXACT TARGET → CLOUDBET /event?id=EVENT_ID
 //
-// V5.9.4:
-// - Cloudbet LIVE source uses:
-//     /events?sport=soccer&live=true&players=false&limit=10000
-// - Explicit support for:
-//     competitions[].events[]
-//     data.competitions[].events[]
-// - Cloudbet live feed diagnostics
-// - SAME event ID preserved for /event
-// - /run = ONE /event attempt
-// - Missing odds → PENDING_ODDS
-// - Pending retry = SAME event
-// - 20 attempts
-// - 30 sec between attempts
+// V5.9.5 FIX:
+// - CLOUDBET service binding uses /live
+// - NEVER call /events through CLOUDBET binding
+// - /live returns normalized events[]
+// - /event?id=EVENT_ID is used for exact odds
+// - SAME event ID preserved
 // - NO event switching
 // - NO market switching
 // - NO line switching
-// - Dynamic Hunter signal
-// - NO hard-coded match IDs
-// - NO hard-coded team names
+//
+// RETRY:
+// - /run performs ONE /event attempt
+// - Missing odds → PENDING_ODDS
+// - Pending retry uses SAME Cloudbet event ID
+// - Maximum 20 pending odds attempts
+// - 30 sec retry delay
+//
+// TARGET:
+// - Market: soccer.total_goals_period_first_half
+// - Submarket: period=1h
+// - Outcome: over
+// - Params: total=0.5
 //
 // REAL BETTING:
 // - DISABLED
@@ -40,7 +43,7 @@ interface Env {
 
 type Obj = Record<string, any>;
 
-const VERSION = "V5.9.4";
+const VERSION = "V5.9.5";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -65,9 +68,19 @@ const TARGET_PARAMS =
   "total=0.5";
 
 // ─── CLOUDBET LIVE SOURCE ─────────────────────────────────
+//
+// IMPORTANT V5.9.5:
+//
+// CLOUDBET is a Service Binding to the
+// cloudbet-live-soccer-detector.
+//
+// The detector exposes /live publicly.
+// The detector itself internally calls Cloudbet /events.
+//
+// Therefore bet-worker MUST NOT call /events here.
 
 const CLOUDBET_LIVE_PATH =
-  "/events?sport=soccer&live=true&players=false&limit=10000";
+  "/live";
 
 // ─── TIMEOUT / RETRY ───────────────────────────────────────
 
@@ -82,6 +95,7 @@ const MAX_MISSING_CHECKS = 3;
 
 const MATCHER_THRESHOLD = 0.20;
 const MIN_MATCHER_SCORE = 0.20;
+
 const TEAM_MATCH_MIN_SCORE = 0.70;
 const CHARACTER_SIMILARITY_MIN_SCORE = 0.70;
 const CONTAINMENT_MIN_SCORE = 0.75;
@@ -726,6 +740,7 @@ function twoSidedTeamScore(
 
 class ServiceRequestError
   extends Error {
+
   service: string;
   path: string;
   code: string;
@@ -760,12 +775,16 @@ class ServiceRequestError
     return {
       service:
         this.service,
+
       path:
         this.path,
+
       code:
         this.code,
+
       status:
         this.status,
+
       message:
         this.message
     };
@@ -781,6 +800,7 @@ async function fetchServiceJSON(
   timeoutMs =
     SERVICE_TIMEOUT_MS
 ): Promise<Obj> {
+
   const controller =
     new AbortController();
 
@@ -798,10 +818,12 @@ async function fetchServiceJSON(
           `https://service${path}`,
           {
             method: "GET",
+
             headers: {
               accept:
                 "application/json"
             },
+
             signal:
               controller.signal
           }
@@ -838,7 +860,9 @@ async function fetchServiceJSON(
         `Invalid JSON from ${serviceName} ${path}`
       );
     }
+
   } catch (error) {
+
     if (
       error instanceof
       ServiceRequestError
@@ -866,24 +890,30 @@ async function fetchServiceJSON(
         ? error.message
         : String(error)
     );
+
   } finally {
     clearTimeout(timer);
   }
 }
 
+// ─── CLOUDBET EVENT ────────────────────────────────────────
+//
+// IMPORTANT:
+// /event?id=EVENT_ID is exposed by the Cloudbet detector.
+// The event ID MUST come from the verified /live result.
+// No hard-coded ID is allowed.
+
 async function fetchCloudbetEvent(
   env: Env,
   eventId: string
 ): Promise<Obj> {
-  if (
-    !eventId ||
-    !/^\d+$/.test(eventId)
-  ) {
+
+  if (!eventId) {
     throw new ServiceRequestError(
       "CLOUDBET",
-      `/event?id=${eventId}`,
+      "/event?id=",
       "INVALID_CLOUDBET_EVENT_ID",
-      `INVALID_CLOUDBET_EVENT_ID:${eventId}`
+      "CLOUDBET_EVENT_ID_MISSING"
     );
   }
 
@@ -916,6 +946,7 @@ async function fetchCloudbetEvent(
 function extractSignals(
   data: Obj
 ): Obj[] {
+
   const source =
     data?.signals ??
     data?.entries ??
@@ -936,6 +967,7 @@ function extractSignals(
 function isHunterEntry(
   signal: Obj
 ): boolean {
+
   return (
     safe(
       signal?.type ??
@@ -949,6 +981,7 @@ function isHunterEntry(
 function signalId(
   signal: Obj
 ): string {
+
   return safe(
     signal?.match_id ??
       signal?.matchId ??
@@ -960,6 +993,7 @@ function signalId(
 function signalHome(
   signal: Obj
 ): string {
+
   return safe(
     signal?.v27?.home ??
       extractHome(signal)
@@ -969,6 +1003,7 @@ function signalHome(
 function signalAway(
   signal: Obj
 ): string {
+
   return safe(
     signal?.v27?.away ??
       extractAway(signal)
@@ -978,6 +1013,7 @@ function signalAway(
 function signalMatch(
   signal: Obj
 ): string {
+
   return safe(
     signal?.match ??
       signal?.name ??
@@ -990,6 +1026,7 @@ function signalMatch(
 function matcherMatches(
   data: Obj
 ): Obj[] {
+
   const source =
     data?.matches ??
     data?.results ??
@@ -1005,6 +1042,7 @@ function matcherMatches(
 function matcherScore(
   item: Obj
 ): number {
+
   const n =
     Number(
       item?.scoring?.total ??
@@ -1023,6 +1061,7 @@ function matcherScore(
 function matcherV27(
   item: Obj
 ): Obj {
+
   return (
     item?.v27 ??
     item?.source ??
@@ -1033,6 +1072,7 @@ function matcherV27(
 function matcherCloudbet(
   item: Obj
 ): Obj | null {
+
   return (
     item?.cloudbet ??
     item?.target ??
@@ -1044,6 +1084,7 @@ function matcherCloudbet(
 function matcherClassification(
   item: Obj
 ): string {
+
   return safe(
     item?.classification ??
       item?.match_classification ??
@@ -1054,6 +1095,7 @@ function matcherClassification(
 function matcherMethod(
   item: Obj
 ): string {
+
   return safe(
     item?.match_method ??
       item?.method ??
@@ -1065,6 +1107,7 @@ function validateMatcher(
   signal: Obj,
   item: Obj
 ): Obj {
+
   const v27 =
     matcherV27(item);
 
@@ -1143,17 +1186,25 @@ function validateMatcher(
 
   return {
     accepted: true,
-    source: "MATCHER",
+
+    source:
+      "MATCHER",
+
     classification:
       classification || null,
+
     method:
       matcherMethod(item) ||
       null,
+
     matcher_score:
       score,
+
     v27,
+
     cloudbet:
       matcherCloudbet(item),
+
     team_scores:
       teams
   };
@@ -1163,6 +1214,7 @@ function findBestMatcher(
   signal: Obj,
   data: Obj
 ): Obj {
+
   let best: Obj | null =
     null;
 
@@ -1173,6 +1225,7 @@ function findBestMatcher(
     const item of
     matcherMatches(data)
   ) {
+
     const result =
       validateMatcher(
         signal,
@@ -1180,15 +1233,19 @@ function findBestMatcher(
       );
 
     if (!result.accepted) {
+
       diagnostics.push({
         reason:
           result.reason,
+
         score:
           matcherScore(item),
+
         match:
           displayMatch(
             matcherV27(item)
           ),
+
         team_scores:
           result.team_scores ??
           null
@@ -1209,8 +1266,10 @@ function findBestMatcher(
   if (!best) {
     return {
       found: false,
+
       reason:
         "NO_ACCEPTABLE_MATCHER_OR_STRICT_CLOUDBET_MATCH",
+
       diagnostics
     };
   }
@@ -1220,628 +1279,735 @@ function findBestMatcher(
     ...best
   };
 }
+// ============================================================
+// V5.9.5 — PART 2/4
+// CLOUDBET /live PARSER
+// DIRECT FALLBACK
+// EXACT EVENT VERIFICATION
+// EXACT TARGET MARKET / ODDS EXTRACTION
+// ============================================================
 
-// ─── CLOUDBET LIVE ─────────────────────────────────────────
 
-function extractCloudbetEvents(
-  data: Obj
-): {
-  events: Obj[];
-  source: string;
-  competitions: number;
-  raw_events_array: number;
-  events_from_competitions: number;
-} {
-  const directSources: Array<{
-    value: any;
-    source: string;
-  }> = [
-    {
-      value:
-        data?.competitions,
-      source:
-        "competitions"
-    },
-    {
-      value:
-        data?.data?.competitions,
-      source:
-        "data.competitions"
-    }
-  ];
-
-  for (
-    const entry of
-    directSources
-  ) {
-    if (
-      Array.isArray(
-        entry.value
-      )
-    ) {
-      const competitions =
-        entry.value;
-
-      const events: Obj[] =
-        [];
-
-      for (
-        const competition of
-        competitions
-      ) {
-        if (
-          Array.isArray(
-            competition?.events
-          )
-        ) {
-          for (
-            const event of
-            competition.events
-          ) {
-            if (
-              event &&
-              typeof event ===
-                "object"
-            ) {
-              events.push(
-                event
-              );
-            }
-          }
-        }
-      }
-
-      return {
-        events,
-        source:
-          `${entry.source}[].events[]`,
-        competitions:
-          competitions.length,
-        raw_events_array: 0,
-        events_from_competitions:
-          events.length
-      };
-    }
-  }
-
-  const arraySources: Array<{
-    value: any;
-    source: string;
-  }> = [
-    {
-      value:
-        data?.events,
-      source:
-        "events"
-    },
-    {
-      value:
-        data?.data?.events,
-      source:
-        "data.events"
-    },
-    {
-      value:
-        data?.matches,
-      source:
-        "matches"
-    },
-    {
-      value:
-        data?.data?.matches,
-      source:
-        "data.matches"
-    },
-    {
-      value:
-        data?.live_matches,
-      source:
-        "live_matches"
-    },
-    {
-      value:
-        data?.data,
-      source:
-        "data"
-    }
-  ];
-
-  for (
-    const entry of
-    arraySources
-  ) {
-    if (
-      Array.isArray(
-        entry.value
-      )
-    ) {
-      return {
-        events:
-          entry.value.filter(
-            x =>
-              x &&
-              typeof x ===
-                "object"
-          ),
-        source:
-          entry.source,
-        competitions: 0,
-        raw_events_array:
-          entry.value.length,
-        events_from_competitions:
-          0
-      };
-    }
-  }
-
-  return {
-    events: [],
-    source:
-      "NONE",
-    competitions: 0,
-    raw_events_array: 0,
-    events_from_competitions: 0
-  };
-}
+// ─── CLOUDBET /LIVE PARSER ────────────────────────────────
+//
+// V5.9.5 IMPORTANT:
+//
+// env.CLOUDBET → cloudbet-live-soccer-detector
+//
+// Public binding endpoint:
+//     /live
+//
+// Detector internally calls:
+//     Cloudbet /events
+//
+// Detector /live returns normalized:
+//     {
+//       success: true,
+//       events: [...]
+//     }
+//
+// Therefore this worker consumes events[].
+// It MUST NOT expect competitions[].events[] as primary format.
+//
 
 function cloudbetMatches(
   data: Obj
 ): Obj[] {
-  return extractCloudbetEvents(
-    data
-  ).events;
+
+  if (!data) {
+    return [];
+  }
+
+  // PRIMARY V5.9.5 FORMAT
+  // cloudbet-live-soccer-detector /live
+  if (
+    Array.isArray(
+      data.events
+    )
+  ) {
+    return data.events.filter(
+      x =>
+        x &&
+        typeof x ===
+          "object"
+    );
+  }
+
+  // Compatibility:
+  // { data: { events: [] } }
+  if (
+    Array.isArray(
+      data?.data?.events
+    )
+  ) {
+    return data.data.events.filter(
+      x =>
+        x &&
+        typeof x ===
+          "object"
+    );
+  }
+
+  // Compatibility fallback only.
+  // This is NOT the expected binding format.
+  if (
+    Array.isArray(
+      data.competitions
+    )
+  ) {
+
+    const result: Obj[] =
+      [];
+
+    for (
+      const competition of
+      data.competitions
+    ) {
+
+      if (
+        Array.isArray(
+          competition?.events
+        )
+      ) {
+        result.push(
+          ...competition.events
+        );
+      }
+    }
+
+    return result;
+  }
+
+  // Compatibility fallback for
+  // { data: { competitions: [...] } }
+  if (
+    Array.isArray(
+      data?.data?.competitions
+    )
+  ) {
+
+    const result: Obj[] =
+      [];
+
+    for (
+      const competition of
+      data.data.competitions
+    ) {
+
+      if (
+        Array.isArray(
+          competition?.events
+        )
+      ) {
+        result.push(
+          ...competition.events
+        );
+      }
+    }
+
+    return result;
+  }
+
+  return [];
 }
 
-function cloudbetFeedDiagnostic(
-  data: Obj
-): Obj {
-  const extracted =
-    extractCloudbetEvents(
-      data
-    );
 
-  const live =
-    extracted.events.filter(
-      isCloudbetLive
-    );
-
-  const rawShape: Obj = {
-    top_level_type:
-      Array.isArray(data)
-        ? "array"
-        : typeof data,
-    top_level_keys:
-      data &&
-      typeof data === "object" &&
-      !Array.isArray(data)
-        ? Object.keys(data)
-        : [],
-    competitions:
-      extracted.competitions,
-    raw_events_array:
-      extracted.raw_events_array,
-    events_from_competitions:
-      extracted.events_from_competitions
-  };
-
-  return {
-    endpoint:
-      CLOUDBET_LIVE_PATH,
-
-    raw_shape:
-      rawShape,
-
-    extraction_source:
-      extracted.source,
-
-    events_received:
-      extracted.events.length,
-
-    events_recognized_live:
-      live.length,
-
-    events_not_recognized_live:
-      Math.max(
-        0,
-        extracted.events.length -
-          live.length
-      ),
-
-    live_events:
-      live.slice(0, 100).map(
-        event => ({
-          id:
-            extractMatchId(event),
-          match:
-            displayMatch(event),
-          status:
-            event?.status ??
-            null,
-          state:
-            event?.state ??
-            null,
-          live:
-            event?.live ??
-            null
-        })
-      )
-  };
-}
+// ─── CLOUDBET LIVE CHECK ──────────────────────────────────
 
 function isCloudbetLive(
-  m: Obj
+  event: Obj
 ): boolean {
+
   const status =
-    safe(m?.status)
-      .toUpperCase();
+    safe(
+      event?.status ??
+        event?.state ??
+        event?.event_status ??
+        event?.trading_status
+    ).toUpperCase();
 
-  const state =
-    safe(m?.state)
-      .toUpperCase();
+  if (
+    status === "TRADING_LIVE" ||
+    status === "LIVE"
+  ) {
+    return true;
+  }
 
-  return (
-    status ===
-      "TRADING_LIVE" ||
-    state ===
-      "LIVE" ||
-    m?.live === true
+  if (
+    status.includes("LIVE")
+  ) {
+    return true;
+  }
+
+  // Detector /live already filters live events.
+  // If it explicitly returns target_available
+  // or target information without a status,
+  // retain the event instead of discarding it.
+
+  if (
+    event?.target_available === true ||
+    event?.target_1h_over_05 === true
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+
+// ─── CLOUDBET EVENT ID ────────────────────────────────────
+
+function getCloudbetEventId(
+  event: Obj
+): string {
+
+  return safe(
+    event?.event_id ??
+      event?.eventId ??
+      event?.id ??
+      event?.cloudbet_id ??
+      event?.cloudbetId ??
+      event?.match_id
   );
 }
 
-function findCloudbet(
+
+// ─── CLOUDBET HOME / AWAY ─────────────────────────────────
+
+function cloudbetHome(
+  event: Obj
+): string {
+
+  return safe(
+    event?.home ??
+      event?.home_name ??
+      event?.homeTeam ??
+      event?.teams?.home?.name ??
+      event?.participants?.home?.name
+  );
+}
+
+function cloudbetAway(
+  event: Obj
+): string {
+
+  return safe(
+    event?.away ??
+      event?.away_name ??
+      event?.awayTeam ??
+      event?.teams?.away?.name ??
+      event?.participants?.away?.name
+  );
+}
+
+
+// ─── DIRECT CLOUDBET FALLBACK ──────────────────────────────
+//
+// If MATCHER does not provide an acceptable Cloudbet match,
+// search the current /live list directly.
+//
+// IMPORTANT:
+// The comparison is TWO-SIDED.
+// We never accept a match based only on one team.
+//
+
+function directCloudbetFallback(
   signal: Obj,
   liveMatches: Obj[]
 ): Obj {
-  const id =
-    signalId(signal);
 
-  if (id) {
-    const exact =
-      liveMatches.find(
-        m =>
-          extractMatchId(m) ===
-          id
-      );
+  const sh =
+    signalHome(signal);
 
-    if (exact) {
-      return {
-        found: true,
-        source:
-          "CLOUDBET_ID",
-        cloudbet:
-          exact,
-        team_scores:
-          twoSidedTeamScore(
-            signalHome(signal),
-            signalAway(signal),
-            extractHome(exact),
-            extractAway(exact)
-          )
-      };
-    }
+  const sa =
+    signalAway(signal);
+
+  if (
+    !teamsPresent(
+      sh,
+      sa
+    )
+  ) {
+    return {
+      found: false,
+
+      reason:
+        "SIGNAL_TEAMS_MISSING"
+    };
   }
 
-  let best: Obj | null =
-    null;
-
-  const diagnostics: Obj[] =
-    [];
+  let best:
+    Obj | null = null;
 
   for (
-    const match of
+    const event of
     liveMatches
   ) {
-    const home =
-      extractHome(match);
-
-    const away =
-      extractAway(match);
 
     if (
-      !teamsPresent(
-        signalHome(signal),
-        signalAway(signal)
-      ) ||
-      !teamsPresent(
-        home,
-        away
-      )
+      !isCloudbetLive(event)
     ) {
-      diagnostics.push({
-        match:
-          displayMatch(match),
-        reason:
-          "TEAMS_MISSING"
-      });
-
       continue;
     }
 
-    const score =
-      twoSidedTeamScore(
-        signalHome(signal),
-        signalAway(signal),
-        home,
-        away
-      );
+    const eh =
+      cloudbetHome(event);
 
-    diagnostics.push({
-      match:
-        displayMatch(match),
-      cloudbet_id:
-        extractMatchId(match),
-      matched:
-        score.matched,
-      combined_score:
-        score.combined_score,
-      home_score:
-        score.home_score,
-      away_score:
-        score.away_score,
-      direction:
-        score.direction,
-      home_method:
-        score.home_method ??
-        null,
-      away_method:
-        score.away_method ??
-        null
-    });
+    const ea =
+      cloudbetAway(event);
 
     if (
-      score.matched &&
-      (
-        !best ||
-        score.combined_score >
-          best.team_scores
-            .combined_score
+      !teamsPresent(
+        eh,
+        ea
       )
     ) {
-      best = {
-        cloudbet:
-          match,
-        team_scores:
-          score
-      };
+      continue;
+    }
+
+    const teams =
+      twoSidedTeamScore(
+        sh,
+        sa,
+        eh,
+        ea
+      );
+
+    if (
+      !teams.matched
+    ) {
+      continue;
+    }
+
+    const candidate = {
+      event,
+
+      cloudbet_id:
+        getCloudbetEventId(
+          event
+        ),
+
+      home:
+        eh,
+
+      away:
+        ea,
+
+      score:
+        teams.combined_score,
+
+      team_scores:
+        teams,
+
+      source:
+        "DIRECT_CLOUDBET_FALLBACK"
+    };
+
+    if (
+      !best ||
+      candidate.score >
+        best.score
+    ) {
+      best = candidate;
     }
   }
 
   if (!best) {
     return {
       found: false,
-      source:
-        "NOT_FOUND",
-      cloudbet: null,
-      team_scores: null,
-      diagnostics
+
+      reason:
+        "NO_DIRECT_CLOUDBET_MATCH"
     };
   }
 
-  return {
-    found: true,
-    source:
-      "STRICT_TWO_SIDED_TEAMS",
-    cloudbet:
-      best.cloudbet,
-    team_scores:
-      best.team_scores,
-    diagnostics
-  };
-}
-
-// ─── DIRECT CLOUDBET FALLBACK ──────────────────────────────
-
-function directCloudbetFallback(
-  signal: Obj,
-  liveMatches: Obj[]
-): Obj {
-  const result =
-    findCloudbet(
-      signal,
-      liveMatches
-    );
-
-  if (!result.found) {
+  if (
+    !best.cloudbet_id
+  ) {
     return {
       found: false,
-      source:
-        "CLOUDBET_DIRECT_FALLBACK",
-      fallback_used: true,
-      fallback_matched: false,
+
       reason:
-        "NO_STRICT_TWO_SIDED_CLOUDBET_MATCH",
-      cloudbet: null,
-      cloudbet_id: null,
-      team_scores:
-        result.team_scores ??
-        null,
-      diagnostics:
-        result.diagnostics ??
-        []
+        "CLOUDBET_EVENT_ID_MISSING"
     };
   }
 
   return {
     found: true,
+
     source:
-      "CLOUDBET_DIRECT_FALLBACK",
-    fallback_used: true,
-    fallback_matched: true,
-    fallback_source:
-      result.source,
-    cloudbet:
-      result.cloudbet,
+      "DIRECT_CLOUDBET_FALLBACK",
+
     cloudbet_id:
-      extractMatchId(
-        result.cloudbet
-      ),
+      best.cloudbet_id,
+
+    event:
+      best.event,
+
+    home:
+      best.home,
+
+    away:
+      best.away,
+
+    score:
+      best.score,
+
     team_scores:
-      result.team_scores ??
-      null,
-    diagnostics:
-      result.diagnostics ??
-      []
+      best.team_scores
   };
 }
 
-// ─── CLOUDBET VERIFICATION ────────────────────────────────
+
+// ─── FIND CLOUDBET EVENT ───────────────────────────────────
+
+function findCloudbetById(
+  liveMatches: Obj[],
+  eventId: string
+): Obj | null {
+
+  if (!eventId) {
+    return null;
+  }
+
+  for (
+    const event of
+    liveMatches
+  ) {
+
+    const id =
+      getCloudbetEventId(
+        event
+      );
+
+    if (
+      id === eventId
+    ) {
+      return event;
+    }
+  }
+
+  return null;
+}
+
+
+// ─── VERIFY CLOUDBET MATCH ────────────────────────────────
+//
+// This is intentionally strict.
+//
+// A matcher result alone is NOT enough.
+//
+// We verify the actual Cloudbet event against
+// the Hunter home + away teams.
+//
+// Event ID alone is never accepted as proof of teams.
+//
 
 function verifyCloudbet(
   signal: Obj,
   matcher: Obj,
   liveMatches: Obj[]
 ): Obj {
-  const matcherCloudbet =
-    matcher?.cloudbet;
 
-  const matcherId =
-    extractMatchId(
-      matcherCloudbet ?? {}
+  const sh =
+    signalHome(signal);
+
+  const sa =
+    signalAway(signal);
+
+  if (
+    !teamsPresent(
+      sh,
+      sa
+    )
+  ) {
+    return {
+      verified: false,
+
+      reason:
+        "SIGNAL_TEAMS_MISSING"
+    };
+  }
+
+  let matcherCloudbet =
+    matcher?.cloudbet ??
+    null;
+
+  let matcherEventId =
+    safe(
+      matcherCloudbet?.event_id ??
+        matcherCloudbet?.eventId ??
+        matcherCloudbet?.id ??
+        matcherCloudbet?.cloudbet_id
     );
 
-  if (matcherId) {
-    const exact =
-      liveMatches.find(
-        m =>
-          extractMatchId(m) ===
-          matcherId
+  let candidate:
+    Obj | null = null;
+
+  // ----------------------------------------------------------
+  // 1. Try matcher-provided Cloudbet event.
+  // ----------------------------------------------------------
+
+  if (
+    matcherCloudbet &&
+    typeof matcherCloudbet ===
+      "object"
+  ) {
+
+    const id =
+      getCloudbetEventId(
+        matcherCloudbet
       );
 
-    if (exact) {
-      const score =
-        twoSidedTeamScore(
-          signalHome(signal),
-          signalAway(signal),
-          extractHome(exact),
-          extractAway(exact)
+    if (id) {
+      const live =
+        findCloudbetById(
+          liveMatches,
+          id
         );
 
-      if (score.matched) {
-        return {
-          verified: true,
-          source:
-            "MATCHER_CLOUDBET_ID",
-          cloudbet:
-            exact,
-          cloudbet_id:
-            matcherId,
-          team_scores:
-            score
-        };
+      if (live) {
+        candidate =
+          live;
+
+        matcherEventId =
+          id;
       }
     }
   }
 
-  const direct =
-    findCloudbet(
-      signal,
-      liveMatches
+  // ----------------------------------------------------------
+  // 2. If matcher gave an ID but it is not currently
+  //    present in /live, DO NOT switch to another event
+  //    merely because the teams look similar.
+  //
+  //    This is important for pending/retry safety.
+  // ----------------------------------------------------------
+
+  if (
+    matcherEventId &&
+    !candidate
+  ) {
+    return {
+      verified: false,
+
+      reason:
+        "MATCHER_CLOUDBET_EVENT_NOT_IN_LIVE",
+
+      cloudbet_id:
+        matcherEventId
+    };
+  }
+
+  // ----------------------------------------------------------
+  // 3. If matcher did not provide an event,
+  //    perform strict direct fallback.
+  // ----------------------------------------------------------
+
+  if (!candidate) {
+
+    const fallback =
+      directCloudbetFallback(
+        signal,
+        liveMatches
+      );
+
+    if (
+      !fallback.found
+    ) {
+      return {
+        verified: false,
+
+        reason:
+          fallback.reason
+      };
+    }
+
+    candidate =
+      fallback.event;
+
+    matcherEventId =
+      fallback.cloudbet_id;
+  }
+
+  if (
+    !candidate
+  ) {
+    return {
+      verified: false,
+
+      reason:
+        "CLOUDBET_EVENT_NOT_FOUND"
+    };
+  }
+
+  const cloudHome =
+    cloudbetHome(candidate);
+
+  const cloudAway =
+    cloudbetAway(candidate);
+
+  if (
+    !teamsPresent(
+      cloudHome,
+      cloudAway
+    )
+  ) {
+    return {
+      verified: false,
+
+      reason:
+        "CLOUDBET_TEAMS_MISSING"
+    };
+  }
+
+  const teams =
+    twoSidedTeamScore(
+      sh,
+      sa,
+      cloudHome,
+      cloudAway
     );
 
-  if (direct.found) {
+  if (
+    !teams.matched
+  ) {
     return {
-      verified: true,
-      source:
-        direct.source,
-      cloudbet:
-        direct.cloudbet,
+      verified: false,
+
+      reason:
+        "STRICT_TWO_SIDED_CLOUDBET_VALIDATION_FAILED",
+
       cloudbet_id:
-        extractMatchId(
-          direct.cloudbet
-        ),
+        matcherEventId,
+
+      cloudbet_home:
+        cloudHome,
+
+      cloudbet_away:
+        cloudAway,
+
       team_scores:
-        direct.team_scores ??
-        null
+        teams
+    };
+  }
+
+  const eventId =
+    getCloudbetEventId(
+      candidate
+    ) ||
+    matcherEventId;
+
+  if (!eventId) {
+    return {
+      verified: false,
+
+      reason:
+        "CLOUDBET_EVENT_ID_MISSING"
     };
   }
 
   return {
-    verified: false,
+    verified: true,
+
     source:
-      "NOT_VERIFIED",
-    cloudbet: null,
-    cloudbet_id: null,
-    team_scores: null,
-    diagnostics:
-      direct.diagnostics ??
-      []
+      matcher?.source ??
+      "CLOUDBET",
+
+    cloudbet_id:
+      eventId,
+
+    event:
+      {
+        ...candidate,
+
+        id:
+          eventId,
+
+        event_id:
+          eventId
+      },
+
+    home:
+      cloudHome,
+
+    away:
+      cloudAway,
+
+    team_scores:
+      teams
   };
 }
 
-// ─── EXACT TARGET EXTRACTION ───────────────────────────────
 
-function enabled(
-  selection: Obj
+// ─── TARGET MARKET CHECK ──────────────────────────────────
+
+function isTargetMarket(
+  market: Obj
 ): boolean {
-  const status =
+
+  const marketName =
     safe(
-      selection?.status
-    ).toUpperCase();
+      market?.market ??
+        market?.market_name ??
+        market?.name ??
+        market?.key
+    );
 
   return (
-    !status ||
-    [
-      "SELECTION_ENABLED",
-      "ENABLED",
-      "TRADING",
-      "OPEN",
-      "ACTIVE"
-    ].includes(status)
+    marketName ===
+    TARGET_MARKET
   );
 }
 
-function targetSelection(
+function isTargetSubmarket(
+  submarket: Obj
+): boolean {
+
+  const value =
+    safe(
+      submarket?.submarket ??
+        submarket?.submarket_name ??
+        submarket?.name ??
+        submarket?.key ??
+        submarket?.params
+    );
+
+  return (
+    value ===
+    TARGET_SUBMARKET
+  );
+}
+
+function isTargetSelection(
   selection: Obj
 ): boolean {
-  return (
+
+  const outcome =
     safe(
-      selection?.outcome
-    ).toLowerCase() ===
-      TARGET_OUTCOME &&
+      selection?.outcome ??
+        selection?.selection ??
+        selection?.side
+    ).toLowerCase();
+
+  const params =
     safe(
-      selection?.params
-    ).toLowerCase() ===
+      selection?.params ??
+        selection?.line ??
+        selection?.selection_params
+    ).toLowerCase();
+
+  if (
+    outcome !==
+    TARGET_OUTCOME
+  ) {
+    return false;
+  }
+
+  if (
+    params &&
+    params !==
       TARGET_PARAMS
-  );
-}
-
-function validTarget(
-  selection: Obj
-): boolean {
-  if (
-    !targetSelection(
-      selection
-    )
-  ) {
-    return false;
-  }
-
-  if (
-    !enabled(selection)
-  ) {
-    return false;
-  }
-
-  const price =
-    Number(
-      selection?.price
-    );
-
-  if (
-    !Number.isFinite(price) ||
-    price <= 1
-  ) {
-    return false;
-  }
-
-  const maxStake =
-    Number(
-      selection?.maxStake
-    );
-
-  if (
-    Number.isFinite(maxStake) &&
-    maxStake <= 0
   ) {
     return false;
   }
@@ -1849,752 +2015,534 @@ function validTarget(
   return true;
 }
 
-function marketEntries(
-  event: Obj
-): Obj[] {
-  const result: Obj[] =
-    [];
 
-  if (
-    Array.isArray(
-      event?.markets
-    )
-  ) {
-    for (
-      const market of
-      event.markets
-    ) {
-      result.push({
-        ...market,
-        _market_key:
-          safe(
-            market?.market_key ??
-              market?.marketKey ??
-              market?.key ??
-              market?.market
-          )
-      });
-    }
-  } else if (
-    event?.markets &&
-    typeof event.markets ===
-      "object"
-  ) {
-    for (
-      const [
-        key,
-        value
-      ] of Object.entries(
-        event.markets
-      )
-    ) {
-      if (
-        value &&
-        typeof value ===
-          "object"
-      ) {
-        result.push({
-          ...(value as Obj),
-          _market_key:
-            safe(
-              (value as Obj)
-                ?.market_key ??
-                (value as Obj)
-                  ?.marketKey ??
-                key
-            )
-        });
-      }
-    }
-  }
+// ─── PRICE EXTRACTION ──────────────────────────────────────
 
-  return result;
-}
+function extractPrice(
+  selection: Obj
+): number | null {
 
-function submarketEntries(
-  market: Obj
-): Obj[] {
-  const result: Obj[] =
-    [];
+  const candidates = [
+    selection?.price,
+    selection?.odds,
+    selection?.decimal_odds,
+    selection?.raw_price
+  ];
 
-  if (
-    Array.isArray(
-      market?.submarkets
-    )
-  ) {
-    for (
-      const sub of
-      market.submarkets
-    ) {
-      result.push({
-        ...sub,
-        _submarket_key:
-          safe(
-            sub?.submarket_key ??
-              sub?.submarketKey ??
-              sub?.key ??
-              sub?.market
-          )
-      });
-    }
-  } else if (
-    market?.submarkets &&
-    typeof market.submarkets ===
-      "object"
-  ) {
-    for (
-      const [
-        key,
-        value
-      ] of Object.entries(
-        market.submarkets
-      )
-    ) {
-      if (
-        value &&
-        typeof value ===
-          "object"
-      ) {
-        result.push({
-          ...(value as Obj),
-          _submarket_key:
-            safe(
-              (value as Obj)
-                ?.submarket_key ??
-                (value as Obj)
-                  ?.submarketKey ??
-                key
-            )
-        });
-      }
-    }
-  }
-
-  return result;
-}
-
-function findExactSelection(
-  event: Obj
-): Obj | null {
   for (
-    const market of
-    marketEntries(event)
+    const value of
+    candidates
   ) {
+
+    const n =
+      Number(value);
+
     if (
-      safe(
-        market?._market_key
-      ).toLowerCase() !==
-      TARGET_MARKET
+      Number.isFinite(n) &&
+      n > 1
     ) {
-      continue;
-    }
-
-    for (
-      const sub of
-      submarketEntries(
-        market
-      )
-    ) {
-      if (
-        safe(
-          sub?._submarket_key
-        ).toLowerCase() !==
-        TARGET_SUBMARKET
-      ) {
-        continue;
-      }
-
-      const selections =
-        Array.isArray(
-          sub?.selections
-        )
-          ? sub.selections
-          : [];
-
-      for (
-        const selection of
-        selections
-      ) {
-        if (
-          validTarget(
-            selection
-          )
-        ) {
-          return selection;
-        }
-      }
+      return n;
     }
   }
 
   return null;
 }
 
+
+// ─── SELECTION STATUS ──────────────────────────────────────
+
+function selectionEnabled(
+  selection: Obj
+): boolean {
+
+  const status =
+    safe(
+      selection?.status ??
+        selection?.state ??
+        selection?.trading_status
+    ).toUpperCase();
+
+  if (!status) {
+    return true;
+  }
+
+  if (
+    status ===
+      "SELECTION_ENABLED" ||
+    status ===
+      "ENABLED" ||
+    status ===
+      "OPEN" ||
+    status ===
+      "TRADING"
+  ) {
+    return true;
+  }
+
+  if (
+    status.includes(
+      "DISABLED"
+    ) ||
+    status.includes(
+      "SUSPENDED"
+    ) ||
+    status.includes(
+      "CLOSED"
+    ) ||
+    status.includes(
+      "SETTLED"
+    )
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+
+// ─── TARGET SEARCH ─────────────────────────────────────────
+//
+// Supports the normalized event returned by detector /live
+// as well as the raw event returned by detector /event.
+//
+
+function findTargetSelection(
+  event: Obj
+): Obj | null {
+
+  // ----------------------------------------------------------
+  // CASE 1:
+  // normalized detector target fields
+  // ----------------------------------------------------------
+
+  if (
+    event?.target_1h_over_05 === true
+  ) {
+
+    const price =
+      Number(
+        event?.target_price
+      );
+
+    if (
+      Number.isFinite(price) &&
+      price > 1
+    ) {
+      return {
+        outcome:
+          TARGET_OUTCOME,
+
+        params:
+          TARGET_PARAMS,
+
+        price,
+
+        raw_price:
+          price,
+
+        status:
+          "SELECTION_ENABLED",
+
+        target:
+          true
+      };
+    }
+  }
+
+  // ----------------------------------------------------------
+  // CASE 2:
+  // normalized selection array
+  // ----------------------------------------------------------
+
+  const normalizedSelections =
+    event?.selections;
+
+  if (
+    Array.isArray(
+      normalizedSelections
+    )
+  ) {
+
+    for (
+      const selection of
+      normalizedSelections
+    ) {
+
+      if (
+        !isTargetSelection(
+          selection
+        )
+      ) {
+        continue;
+      }
+
+      if (
+        !selectionEnabled(
+          selection
+        )
+      ) {
+        continue;
+      }
+
+      const price =
+        extractPrice(
+          selection
+        );
+
+      if (
+        price === null
+      ) {
+        continue;
+      }
+
+      return {
+        ...selection,
+
+        price,
+
+        raw_price:
+          selection?.raw_price ??
+          price
+      };
+    }
+  }
+
+  // ----------------------------------------------------------
+  // CASE 3:
+  // raw Cloudbet markets
+  //
+  // Expected structure can be nested under:
+  //
+  // event.markets
+  // event.odds
+  // event.lines
+  // event.submarkets
+  //
+  // We inspect recursively but only accept the exact
+  // target market / submarket / selection.
+  // ----------------------------------------------------------
+
+  const roots = [
+    event?.markets,
+    event?.odds,
+    event?.lines,
+    event?.market
+  ];
+
+  for (
+    const root of
+    roots
+  ) {
+
+    const found =
+      searchTargetRecursive(
+        root,
+        false,
+        false
+      );
+
+    if (found) {
+      return found;
+    }
+  }
+
+  // Also inspect event itself.
+  const direct =
+    searchTargetRecursive(
+      event,
+      false,
+      false
+    );
+
+  if (direct) {
+    return direct;
+  }
+
+  return null;
+}
+
+
+// ─── RECURSIVE TARGET SEARCH ───────────────────────────────
+
+function searchTargetRecursive(
+  node: any,
+  insideTargetMarket: boolean,
+  insideTargetSubmarket: boolean
+): Obj | null {
+
+  if (!node) {
+    return null;
+  }
+
+  if (
+    Array.isArray(node)
+  ) {
+
+    for (
+      const item of node
+    ) {
+
+      const found =
+        searchTargetRecursive(
+          item,
+          insideTargetMarket,
+          insideTargetSubmarket
+        );
+
+      if (found) {
+        return found;
+      }
+    }
+
+    return null;
+  }
+
+  if (
+    typeof node !==
+    "object"
+  ) {
+    return null;
+  }
+
+  const marketHit =
+    insideTargetMarket ||
+    isTargetMarket(node);
+
+  const submarketHit =
+    insideTargetSubmarket ||
+    (
+      marketHit &&
+      isTargetSubmarket(
+        node
+      )
+    );
+
+  if (
+    marketHit &&
+    submarketHit &&
+    isTargetSelection(node)
+  ) {
+
+    if (
+      !selectionEnabled(node)
+    ) {
+      return null;
+    }
+
+    const price =
+      extractPrice(node);
+
+    if (
+      price === null
+    ) {
+      return null;
+    }
+
+    return {
+      ...node,
+
+      price,
+
+      raw_price:
+        node?.raw_price ??
+        price
+    };
+  }
+
+  for (
+    const value of
+    Object.values(node)
+  ) {
+
+    if (
+      !value ||
+      typeof value !==
+        "object"
+    ) {
+      continue;
+    }
+
+    const found =
+      searchTargetRecursive(
+        value,
+        marketHit,
+        submarketHit
+      );
+
+    if (found) {
+      return found;
+    }
+  }
+
+  return null;
+}
+
+
+// ─── ODDS EXTRACTION ──────────────────────────────────────
+
 function extractOdds(
   event: Obj
 ): number | null {
-  const selection =
-    findExactSelection(
+
+  const target =
+    findTargetSelection(
       event
     );
 
-  if (!selection) {
+  if (!target) {
     return null;
   }
 
   const price =
     Number(
-      selection.price
+      target.price
     );
 
-  return Number.isFinite(
-    price
-  )
-    ? price
-    : null;
+  if (
+    !Number.isFinite(price) ||
+    price <= 1
+  ) {
+    return null;
+  }
+
+  return price;
 }
 
-// ─── EXACT DIAGNOSTIC ──────────────────────────────────────
+
+// ─── ODDS DIAGNOSTIC ──────────────────────────────────────
 
 function buildOddsDiagnostic(
   event: Obj
 ): Obj {
-  let marketFound = false;
-  let submarketFound = false;
-  let selectionPresent = false;
-  let selectionValid = false;
 
-  const rows: Obj[] =
-    [];
-
-  for (
-    const market of
-    marketEntries(event)
-  ) {
-    const marketKey =
-      safe(
-        market?._market_key
-      ).toLowerCase();
-
-    if (
-      marketKey !==
-      TARGET_MARKET
-    ) {
-      continue;
-    }
-
-    marketFound = true;
-
-    for (
-      const sub of
-      submarketEntries(
-        market
-      )
-    ) {
-      const subKey =
-        safe(
-          sub?._submarket_key
-        ).toLowerCase();
-
-      if (
-        subKey !==
-        TARGET_SUBMARKET
-      ) {
-        continue;
-      }
-
-      submarketFound = true;
-
-      const selections =
-        Array.isArray(
-          sub?.selections
-        )
-          ? sub.selections
-          : [];
-
-      for (
-        const selection of
-        selections
-      ) {
-        const outcome =
-          safe(
-            selection?.outcome
-          ).toLowerCase();
-
-        const params =
-          safe(
-            selection?.params
-          ).toLowerCase();
-
-        const price =
-          Number(
-            selection?.price
-          );
-
-        const maxStake =
-          Number(
-            selection?.maxStake
-          );
-
-        const exact =
-          outcome ===
-            TARGET_OUTCOME &&
-          params ===
-            TARGET_PARAMS;
-
-        const valid =
-          exact &&
-          enabled(
-            selection
-          ) &&
-          Number.isFinite(
-            price
-          ) &&
-          price > 1 &&
-          (
-            !Number.isFinite(
-              maxStake
-            ) ||
-            maxStake > 0
-          );
-
-        if (exact) {
-          selectionPresent =
-            true;
-        }
-
-        if (valid) {
-          selectionValid =
-            true;
-        }
-
-        rows.push({
-          market_key:
-            marketKey,
-
-          submarket_key:
-            subKey,
-
-          outcome,
-
-          params,
-
-          price:
-            Number.isFinite(
-              price
-            )
-              ? price
-              : null,
-
-          raw_price:
-            selection?.price ??
-            null,
-
-          status:
-            selection?.status ??
-            null,
-
-          enabled:
-            selection?.enabled ??
-            null,
-
-          maxStake:
-            Number.isFinite(
-              maxStake
-            )
-              ? maxStake
-              : null,
-
-          exact_target:
-            exact,
-
-          target:
-            valid,
-
-          raw_selection:
-            selection
-        });
-      }
-    }
-  }
-
-  let reason =
-    "TARGET_MARKET_MISSING";
-
-  if (marketFound) {
-    reason =
-      "TARGET_SUBMARKET_MISSING";
-  }
-
-  if (submarketFound) {
-    reason =
-      selectionPresent
-        ? "TARGET_SELECTION_INVALID"
-        : "TARGET_SELECTION_MISSING";
-  }
-
-  if (selectionValid) {
-    reason =
-      "VALID";
-  } else if (
-    selectionPresent
-  ) {
-    const target =
-      rows.find(
-        x =>
-          x.exact_target
-      );
-
-    if (
-      target?.status &&
-      ![
-        "SELECTION_ENABLED",
-        "ENABLED",
-        "TRADING",
-        "OPEN",
-        "ACTIVE"
-      ].includes(
-        String(
-          target.status
-        ).toUpperCase()
-      )
-    ) {
-      reason =
-        "SELECTION_DISABLED";
-    } else if (
-      !Number.isFinite(
-        Number(
-          target?.price
-        )
-      ) ||
-      Number(
-        target?.price
-      ) <= 1
-    ) {
-      reason =
-        "INVALID_PRICE";
-    } else if (
-      Number.isFinite(
-        Number(
-          target?.maxStake
-        )
-      ) &&
-      Number(
-        target?.maxStake
-      ) <= 0
-    ) {
-      reason =
-        "MAX_STAKE_ZERO";
-    }
-  }
-
-  return {
-    target: {
-      market:
-        TARGET_MARKET,
-      submarket:
-        TARGET_SUBMARKET,
-      outcome:
-        TARGET_OUTCOME,
-      params:
-        TARGET_PARAMS
-    },
-
-    reason,
-
-    extractor_result:
-      extractOdds(event),
-
-    target_market_found:
-      marketFound,
-
-    target_submarket_found:
-      submarketFound,
-
-    target_selection_present:
-      selectionPresent,
-
-    target_selection_valid:
-      selectionValid,
-
-    selections:
-      rows,
-
-    event_id:
-      extractMatchId(event),
-
-    match:
-      displayMatch(event)
-  };
-}
-
-// ─── RETRY SAME EVENT ──────────────────────────────────────
-
-async function resolveOddsWithRetry(
-  env: Env,
-  cloudbet: Obj
-): Promise<Obj> {
   const eventId =
-    extractMatchId(
-      cloudbet
+    getCloudbetEventId(
+      event
     );
 
-  if (!eventId) {
-    return {
-      success: false,
-      event:
-        cloudbet,
-      odds: null,
-      attempts: 0,
-      error:
-        "CLOUDBET_EVENT_ID_MISSING",
-      attempts_detail: []
-    };
-  }
-
-  const attempts: Obj[] =
-    [];
-
-  let lastEvent:
-    Obj | null = null;
-
-  let lastDiagnostic:
-    Obj | null = null;
-
-  for (
-    let attempt = 1;
-    attempt <=
-      ODDS_EVENT_MAX_RETRIES;
-    attempt++
-  ) {
-    try {
-      const event =
-        await fetchCloudbetEvent(
-          env,
-          eventId
-        );
-
-      lastEvent =
-        event;
-
-      const diagnostic =
-        buildOddsDiagnostic(
-          event
-        );
-
-      lastDiagnostic =
-        diagnostic;
-
-      const odds =
-        extractOdds(
-          event
-        );
-
-      attempts.push({
-        attempt,
-
-        event_id:
-          eventId,
-
-        success:
-          true,
-
-        odds,
-
-        reason:
-          diagnostic.reason,
-
-        target_selection_present:
-          diagnostic
-            .target_selection_present,
-
-        target_selection_valid:
-          diagnostic
-            .target_selection_valid
-      });
-
-      if (
-        odds !== null
-      ) {
-        return {
-          success: true,
-
-          source:
-            "CLOUDBET_EVENT_SAME_EVENT_RETRY",
-
-          event,
-
-          odds,
-
-          attempts:
-            attempt,
-
-          error: null,
-
-          retry: {
-            max_attempts:
-              ODDS_EVENT_MAX_RETRIES,
-
-            delay_ms:
-              ODDS_EVENT_RETRY_DELAY_MS,
-
-            attempts_used:
-              attempt,
-
-            valid_on_attempt:
-              attempt,
-
-            event_id:
-              eventId,
-
-            same_event:
-              true,
-
-            switched_event:
-              false
-          },
-
-          attempts_detail:
-            attempts,
-
-          diagnostic
-        };
-      }
-    } catch (error) {
-      attempts.push({
-        attempt,
-
-        event_id:
-          eventId,
-
-        success:
-          false,
-
-        odds: null,
-
-        error:
-          error instanceof Error
-            ? error.message
-            : String(error),
-
-        service:
-          error instanceof
-          ServiceRequestError
-            ? error.service
-            : "CLOUDBET",
-
-        path:
-          error instanceof
-          ServiceRequestError
-            ? error.path
-            : null,
-
-        code:
-          error instanceof
-          ServiceRequestError
-            ? error.code
-            : null
-      });
-    }
-
-    if (
-      attempt <
-      ODDS_EVENT_MAX_RETRIES
-    ) {
-      await sleep(
-        ODDS_EVENT_RETRY_DELAY_MS
-      );
-    }
-  }
+  const target =
+    findTargetSelection(
+      event
+    );
 
   return {
-    success: false,
+    event_id:
+      eventId || null,
 
-    source:
-      "CLOUDBET_EVENT_RETRY_EXHAUSTED",
+    match:
+      displayMatch(event),
 
-    event:
-      lastEvent ??
-      cloudbet,
+    home:
+      cloudbetHome(event) ||
+      null,
 
-    odds: null,
+    away:
+      cloudbetAway(event) ||
+      null,
 
-    attempts:
-      attempts.length,
+    target_market:
+      TARGET_MARKET,
 
-    error:
-      "TARGET_1H_OVER_0_5_NOT_FOUND_AFTER_20_ATTEMPTS",
+    target_submarket:
+      TARGET_SUBMARKET,
 
-    retry: {
-      max_attempts:
-        ODDS_EVENT_MAX_RETRIES,
+    target_outcome:
+      TARGET_OUTCOME,
 
-      delay_ms:
-        ODDS_EVENT_RETRY_DELAY_MS,
+    target_params:
+      TARGET_PARAMS,
 
-      attempts_used:
-        attempts.length,
+    target_found:
+      !!target,
 
-      valid_on_attempt:
-        null,
+    target:
+      target
+        ? {
+            outcome:
+              target.outcome ??
+              TARGET_OUTCOME,
 
-      event_id:
-        eventId,
+            params:
+              target.params ??
+              TARGET_PARAMS,
 
-      same_event:
-        true,
+            price:
+              target.price ??
+              null,
 
-      switched_event:
-        false
-    },
+            raw_price:
+              target.raw_price ??
+              null,
 
-    attempts_detail:
-      attempts,
+            status:
+              target.status ??
+              null,
 
-    diagnostic:
-      lastDiagnostic ??
-      buildOddsDiagnostic(
-        lastEvent ??
-        cloudbet
-      )
+            target:
+              target.target ??
+              null
+          }
+        : null
   };
 }
 
-// ─── SINGLE ODDS ATTEMPT ───────────────────────────────────
+
+// ─── EXACT ODDS RESULT ────────────────────────────────────
+
+interface OddsResult {
+  success: boolean;
+  event_id: string | null;
+  odds: number | null;
+  event: Obj | null;
+  diagnostic: Obj;
+  error?: string;
+}
 
 async function resolveOddsOnce(
   env: Env,
   cloudbet: Obj
-): Promise<Obj> {
+): Promise<OddsResult> {
+
+  // ----------------------------------------------------------
+  // IMPORTANT V5.9.5:
+  //
+  // Preserve the exact verified Cloudbet event ID.
+  // ----------------------------------------------------------
+
   const eventId =
     extractMatchId(
+      cloudbet
+    ) ||
+    getCloudbetEventId(
       cloudbet
     );
 
   if (!eventId) {
+
     return {
       success: false,
-
-      source:
-        "CLOUDBET_EVENT_SINGLE_ATTEMPT",
-
-      event:
-        cloudbet,
 
       event_id:
         null,
 
-      odds: null,
+      odds:
+        null,
 
-      attempts: 0,
+      event:
+        null,
+
+      diagnostic: {
+        error:
+          "CLOUDBET_EVENT_ID_MISSING"
+      },
 
       error:
-        "CLOUDBET_EVENT_ID_MISSING",
-
-      attempts_detail: []
+        "CLOUDBET_EVENT_ID_MISSING"
     };
   }
 
   try {
+
     const event =
       await fetchCloudbetEvent(
         env,
@@ -2611,796 +2559,789 @@ async function resolveOddsOnce(
         event
       );
 
-    return {
-      success:
-        odds !== null,
+    if (
+      odds === null
+    ) {
 
-      source:
-        "CLOUDBET_EVENT_SINGLE_ATTEMPT",
+      return {
+        success: false,
+
+        event_id:
+          eventId,
+
+        odds:
+          null,
+
+        event,
+
+        diagnostic,
+
+        error:
+          "TARGET_ODDS_NOT_AVAILABLE"
+      };
+    }
+
+    return {
+      success: true,
+
+      event_id:
+        eventId,
+
+      odds,
 
       event,
 
-      event_id:
-        eventId,
-
-      odds,
-
-      attempts: 1,
-
-      error:
-        odds !== null
-          ? null
-          : diagnostic.reason,
-
-      retry: {
-        max_attempts: 1,
-        delay_ms: 0,
-        attempts_used: 1,
-
-        valid_on_attempt:
-          odds !== null
-            ? 1
-            : null,
-
-        event_id:
-          eventId,
-
-        same_event:
-          true,
-
-        switched_event:
-          false
-      },
-
-      attempts_detail: [
-        {
-          attempt: 1,
-
-          event_id:
-            eventId,
-
-          success:
-            true,
-
-          odds,
-
-          reason:
-            diagnostic.reason,
-
-          target_selection_present:
-            diagnostic
-              .target_selection_present,
-
-          target_selection_valid:
-            diagnostic
-              .target_selection_valid
-        }
-      ],
-
       diagnostic
     };
+
   } catch (error) {
+
+    const diagnostic =
+      error instanceof
+        ServiceRequestError
+        ? error.toJSON()
+        : {
+            error:
+              error instanceof
+              Error
+                ? error.message
+                : String(error)
+          };
+
     return {
       success: false,
-
-      source:
-        "CLOUDBET_EVENT_SINGLE_ATTEMPT",
-
-      event:
-        cloudbet,
 
       event_id:
         eventId,
 
-      odds: null,
+      odds:
+        null,
 
-      attempts: 1,
+      event:
+        null,
+
+      diagnostic,
 
       error:
-        error instanceof Error
-          ? error.message
-          : String(error),
-
-      retry: {
-        max_attempts: 1,
-        delay_ms: 0,
-        attempts_used: 1,
-        valid_on_attempt: null,
-
-        event_id:
-          eventId,
-
-        same_event:
-          true,
-
-        switched_event:
-          false
-      },
-
-      attempts_detail: [
-        {
-          attempt: 1,
-
-          event_id:
-            eventId,
-
-          success:
-            false,
-
-          odds: null,
-
-          error:
-            error instanceof Error
-              ? error.message
-              : String(error)
-        }
-      ],
-
-      diagnostic:
-        null
-    };
-  }
-}
-
-// ─── BET OBJECT ────────────────────────────────────────────
-
-function buildBet(
-  signal: Obj,
-  matcher: Obj,
-  verification: Obj,
-  oddsResult: Obj
-): Obj {
-  const verificationCloudbet =
-    verification?.cloudbet ??
-    {};
-
-  const event =
-    oddsResult.event ??
-    verificationCloudbet ??
-    {};
-
-  const verifiedCloudbetId =
-    safe(
-      verification?.cloudbet_id
-    ) ||
-    extractMatchId(
-      verificationCloudbet
-    ) ||
-    safe(
-      oddsResult?.event_id
-    ) ||
-    extractMatchId(event);
-
-  const odds =
-    oddsResult.odds ??
-    extractOdds(event);
-
-  return {
-    status:
-      odds !== null
-        ? "READY"
-        : "ODDS_UNAVAILABLE",
-
-    mode:
-      MODE,
-
-    betting_enabled:
-      BETTING_ENABLED,
-
-    dry_run:
-      DRY_RUN,
-
-    signal_type:
-      safe(
-        signal?.type ??
-          signal?.signal_type ??
-          signal?.signalType
-      ),
-
-    signal_match_id:
-      signalId(signal),
-
-    hunter_score:
-      Number(
-        signal?.hunter_score ??
-          signal?.v27?.hunter_score ??
-          signal?.score ??
-          null
-      ),
-
-    match:
-      signalMatch(signal) ||
-      `${signalHome(signal)} - ${signalAway(signal)}`,
-
-    entry_minute:
-      Number(
-        signal?.minute ??
-          signal?.entry_minute ??
-          signal?.v27?.minute ??
-          null
-      ),
-
-    v27: {
-      id:
-        signalId(signal),
-
-      home:
-        signalHome(signal),
-
-      away:
-        signalAway(signal)
-    },
-
-    matcher: {
-      classification:
-        matcher.classification ??
-        null,
-
-      method:
-        matcher.method ??
-        null,
-
-      matcher_score:
-        matcher.matcher_score ??
-        null,
-
-      team_scores:
-        matcher.team_scores ??
-        null,
-
-      source:
-        matcher.source ??
-        "MATCHER",
-
-      fallback_used:
-        matcher.fallback_used ??
-        false,
-
-      fallback_source:
-        matcher.fallback_source ??
-        null
-    },
-
-    cloudbet: {
-      id:
-        verifiedCloudbetId,
-
-      match:
-        displayMatch(event) !== "-"
-          ? displayMatch(event)
-          : displayMatch(
-              verificationCloudbet
-            ),
-
-      home:
-        extractHome(event) ||
-        extractHome(
-          verificationCloudbet
-        ),
-
-      away:
-        extractAway(event) ||
-        extractAway(
-          verificationCloudbet
-        ),
-
-      status:
-        event?.status ??
-        verificationCloudbet?.status ??
-        null,
-
-      state:
-        event?.state ??
-        verificationCloudbet?.state ??
-        null,
-
-      live:
-        isCloudbetLive(event) ||
-        isCloudbetLive(
-          verificationCloudbet
-        ),
-
-      market:
-        BET_MARKET,
-
-      selection:
-        BET_SELECTION,
-
-      odds,
-
-      odds_available:
-        odds !== null,
-
-      odds_source:
-        odds !== null
-          ? "CLOUDBET_EVENT"
-          : null
-    },
-
-    odds_diagnostic:
-      oddsResult.diagnostic ??
-      buildOddsDiagnostic(
-        event
-      ),
-
-    full_event_fetch: {
-      success:
-        oddsResult.success,
-
-      source:
-        oddsResult.source,
-
-      event_id:
-        verifiedCloudbetId,
-
-      attempts:
-        oddsResult.attempts,
-
-      retry:
-        oddsResult.retry ??
-        null,
-
-      error:
-        oddsResult.error ??
-        null,
-
-      attempts_detail:
-        oddsResult.attempts_detail ??
-        []
-    },
-
-    stake_eur:
-      BET_STAKE_EUR,
-
-    bet_placed:
-      false,
-
-    simulated:
-      true
-  };
-}
-
-function buildCandidate(
-  bet: Obj
-): Obj {
-  const odds =
-    Number(
-      bet?.cloudbet?.odds
-    );
-
-  const complete =
-    Number.isFinite(odds) &&
-    odds > 1;
-
-  return {
-    status:
-      "BET_CANDIDATE",
-
-    mode:
-      MODE,
-
-    betting_enabled:
-      false,
-
-    dry_run:
-      true,
-
-    bet_placed:
-      false,
-
-    bet_action:
-      "SIMULATED_ONLY",
-
-    match:
-      bet?.match ??
-      null,
-
-    signal_match_id:
-      bet?.signal_match_id ??
-      null,
-
-    hunter_score:
-      bet?.hunter_score ??
-      null,
-
-    cloudbet_id:
-      safe(
-        bet?.cloudbet?.id
-      ) ||
-      extractMatchId(
-        bet?.cloudbet ??
-          {}
-      ),
-
-    market:
-      BET_MARKET,
-
-    selection:
-      BET_SELECTION,
-
-    stake_eur:
-      BET_STAKE_EUR,
-
-    odds:
-      complete
-        ? odds
-        : null,
-
-    odds_available:
-      complete,
-
-    candidate_complete:
-      complete,
-
-    odds_source:
-      complete
-        ? "CLOUDBET_EVENT"
-        : null,
-
-    cloudbet:
-      bet?.cloudbet ??
-      null,
-
-    odds_diagnostic:
-      bet?.odds_diagnostic ??
-      null,
-
-    full_event_fetch:
-      bet?.full_event_fetch ??
-      null,
-
-    matcher:
-      bet?.matcher ??
-      null,
-
-    simulated:
-      true
-  };
-}
-
-// ─── D1 ARCHIVE ────────────────────────────────────────────
-
-function archiveKey(
-  bet: Obj
-): string {
-  const id =
-    safe(
-      bet?.signal_match_id
-    );
-
-  if (id) {
-    return `signal:${id}`;
-  }
-
-  return `teams:${normalizeTeam(
-    bet?.v27?.home ??
-      bet?.cloudbet?.home
-  )}:${normalizeTeam(
-    bet?.v27?.away ??
-      bet?.cloudbet?.away
-  )}`;
-}
-
-async function archiveBets(
-  env: Env,
-  bets: Obj[]
-): Promise<Obj> {
-  if (!env.DB) {
-    return {
-      success: false,
-      inserted: 0,
-      error:
-        "DB_BINDING_MISSING"
-    };
-  }
-
-  if (!bets.length) {
-    return {
-      success: true,
-      inserted: 0
-    };
-  }
-
-  const statements =
-    bets.map(bet => {
-      const matcherScore =
-        Number(
-          bet?.matcher
-            ?.matcher_score
-        );
-
-      const hunterScore =
-        Number(
-          bet?.hunter_score
-        );
-
-      const combined =
-        Number(
-          bet?.matcher
-            ?.team_scores
-            ?.combined_score
-        );
-
-      const minute =
-        Number(
-          bet?.entry_minute
-        );
-
-      return env.DB.prepare(`
-        INSERT OR IGNORE INTO hunter_bet_archive
-        (
-          archive_key,
-          match_id,
-          match,
-          home,
-          away,
-          entry_minute,
-          hunter_score,
-          cloudbet_id,
-          cloudbet_match,
-          matcher_source,
-          matcher_score,
-          cloudbet_combined_score,
-          direction,
-          created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-      `).bind(
-        archiveKey(bet),
-
-        safe(
-          bet?.signal_match_id
-        ) || null,
-
-        safe(
-          bet?.match
-        ) || null,
-
-        safe(
-          bet?.v27?.home
-        ) || null,
-
-        safe(
-          bet?.v27?.away
-        ) || null,
-
-        Number.isFinite(
-          minute
-        )
-          ? minute
-          : null,
-
-        Number.isFinite(
-          hunterScore
-        )
-          ? hunterScore
-          : null,
-
-        safe(
-          bet?.cloudbet?.id
-        ) || null,
-
-        safe(
-          bet?.cloudbet?.match
-        ) || null,
-
-        safe(
-          bet?.matcher?.source
-        ) || "MATCHER",
-
-        Number.isFinite(
-          matcherScore
-        )
-          ? matcherScore
-          : null,
-
-        Number.isFinite(
-          combined
-        )
-          ? combined
-          : null,
-
-        safe(
-          bet?.matcher
-            ?.team_scores
-            ?.direction
-        ) || null
-      );
-    });
-
-  try {
-    const result =
-      await env.DB.batch(
-        statements
-      );
-
-    return {
-      success: true,
-      inserted:
-        result.length,
-      attempted:
-        bets.length
-    };
-  } catch (error) {
-    return {
-      success: false,
-      inserted: 0,
-      attempted:
-        bets.length,
-      error:
-        error instanceof Error
+        error instanceof
+        Error
           ? error.message
           : String(error)
     };
   }
 }
 
-// ─── PENDING ODDS ──────────────────────────────────────────
+
+// ─── ODDS RETRY ────────────────────────────────────────────
+//
+// One attempt here.
+// Persistent retry is handled by pending_odds.
+//
+// This guarantees that /run does not sit waiting for
+// repeated Cloudbet /event requests.
+//
+
+async function resolveOddsWithRetry(
+  env: Env,
+  cloudbet: Obj
+): Promise<OddsResult> {
+
+  return resolveOddsOnce(
+    env,
+    cloudbet
+  );
+  }
+// ============================================================
+// D1 — PENDING ODDS
+// ============================================================
+
+interface PendingRow {
+  id?: number;
+  execution_id: string;
+  cloudbet_id: string;
+  payload_json: string;
+  created_at?: string;
+  updated_at?: string;
+  next_check_at?: string;
+  retry_count?: number;
+  missing_count?: number;
+  last_error?: string | null;
+}
+
+interface PendingPayload {
+  bet?: any;
+  signal?: any;
+  matcher?: any;
+  cloudbet?: any;
+  odds?: any;
+  diagnostic?: any;
+}
+
+function nowISO(): string {
+  return new Date().toISOString();
+}
+
+function addSecondsISO(seconds: number): string {
+  return new Date(Date.now() + seconds * 1000).toISOString();
+}
 
 async function savePending(
   env: Env,
-  bet: Obj
-): Promise<Obj> {
-  if (!env.DB) {
-    return {
-      success: false,
-      error:
-        "DB_BINDING_MISSING"
-    };
-  }
-
+  executionId: string,
+  bet: any,
+  signal: any,
+  matcher: any,
+  cloudbet: any,
+  oddsResult: OddsResult
+): Promise<any> {
   const cloudbetId =
-    safe(
-      bet?.cloudbet?.id
-    );
+    bet?.cloudbet?.id ||
+    cloudbet?.id ||
+    cloudbet?.event_id ||
+    extractMatchId(cloudbet);
 
   if (!cloudbetId) {
     return {
       success: false,
-      error:
-        "CLOUDBET_ID_MISSING",
-
-      diagnostic: {
-        signal_match_id:
-          bet?.signal_match_id ??
-          null,
-
-        match:
-          bet?.match ??
-          null,
-
-        verification_event_id:
-          bet?.full_event_fetch
-            ?.event_id ??
-          null,
-
-        cloudbet_object:
-          bet?.cloudbet ??
-          null
-      }
+      error: "CLOUDBET_EVENT_ID_MISSING_FOR_PENDING"
     };
   }
 
-  let payload = "{}";
+  const payload: PendingPayload = {
+    bet,
+    signal,
+    matcher,
+    cloudbet,
+    odds: oddsResult,
+    diagnostic: buildOddsDiagnostic(cloudbet)
+  };
 
-  try {
-    payload =
-      JSON.stringify(bet);
-  } catch {}
+  const payloadJson = JSON.stringify(payload);
 
-  try {
-    await env.DB.prepare(`
-      INSERT INTO pending_odds
-      (
-        archive_key,
-        signal_match_id,
-        cloudbet_id,
-        match,
-        home,
-        away,
-        entry_minute,
-        market,
-        selection,
-        stake_eur,
-        mode,
-        status,
-        retry_count,
-        missing_count,
-        last_checked_at,
-        next_check_at,
-        payload_json,
-        created_at,
-        updated_at
+  const existing = await env.DB
+    .prepare(`
+      SELECT *
+      FROM pending_odds
+      WHERE cloudbet_id = ?
+      LIMIT 1
+    `)
+    .bind(cloudbetId)
+    .first<PendingRow>();
+
+  const nextCheck = addSecondsISO(
+    ODDS_EVENT_RETRY_DELAY_MS / 1000
+  );
+
+  if (existing) {
+    await env.DB
+      .prepare(`
+        UPDATE pending_odds
+        SET
+          execution_id = ?,
+          payload_json = ?,
+          updated_at = ?,
+          next_check_at = ?,
+          last_error = ?
+        WHERE cloudbet_id = ?
+      `)
+      .bind(
+        executionId,
+        payloadJson,
+        nowISO(),
+        nextCheck,
+        oddsResult.error || null,
+        cloudbetId
       )
-      VALUES (
-        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-        'PENDING_ODDS',
-        0,
-        0,
-        NULL,
-        datetime('now', '+1 minute'),
-        ?,
-        datetime('now'),
-        datetime('now')
-      )
-      ON CONFLICT(archive_key)
-      DO UPDATE SET
-        cloudbet_id = excluded.cloudbet_id,
-        signal_match_id = excluded.signal_match_id,
-        match = excluded.match,
-        home = excluded.home,
-        away = excluded.away,
-        entry_minute = excluded.entry_minute,
-        market = excluded.market,
-        selection = excluded.selection,
-        stake_eur = excluded.stake_eur,
-        mode = excluded.mode,
-        payload_json = excluded.payload_json,
-        status = 'PENDING_ODDS',
-        missing_count = 0,
-        next_check_at =
-          datetime('now', '+1 minute'),
-        updated_at = datetime('now')
-    `).bind(
-      archiveKey(bet),
-
-      safe(
-        bet?.signal_match_id
-      ) || null,
-
-      cloudbetId,
-
-      safe(
-        bet?.match
-      ) || null,
-
-      safe(
-        bet?.v27?.home
-      ) || null,
-
-      safe(
-        bet?.v27?.away
-      ) || null,
-
-      Number.isFinite(
-        Number(
-          bet?.entry_minute
-        )
-      )
-        ? Number(
-            bet.entry_minute
-          )
-        : null,
-
-      BET_MARKET,
-      BET_SELECTION,
-      BET_STAKE_EUR,
-      MODE,
-      payload
-    ).run();
+      .run();
 
     return {
       success: true,
-      status:
-        "PENDING_ODDS",
-      archive_key:
-        archiveKey(bet),
-      cloudbet_id:
-        cloudbetId,
-      retry: {
-        max_attempts:
-          ODDS_EVENT_MAX_RETRIES,
-        delay_ms:
-          ODDS_EVENT_RETRY_DELAY_MS,
-        same_event:
-          true,
-        switch_event:
-          false,
-        switch_market:
-          false,
-        switch_line:
-          false
+      action: "UPDATED_PENDING",
+      cloudbet_id: cloudbetId,
+      retry_count: existing.retry_count || 0,
+      next_check_at: nextCheck
+    };
+  }
+
+  await env.DB
+    .prepare(`
+      INSERT INTO pending_odds (
+        execution_id,
+        cloudbet_id,
+        payload_json,
+        created_at,
+        updated_at,
+        next_check_at,
+        retry_count,
+        missing_count,
+        last_error
+      )
+      VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)
+    `)
+    .bind(
+      executionId,
+      cloudbetId,
+      payloadJson,
+      nowISO(),
+      nowISO(),
+      nextCheck,
+      oddsResult.error || null
+    )
+    .run();
+
+  return {
+    success: true,
+    action: "CREATED_PENDING",
+    cloudbet_id: cloudbetId,
+    retry_count: 0,
+    next_check_at: nextCheck
+  };
+}
+
+
+// ============================================================
+// PENDING RETRY HELPERS
+// ============================================================
+
+async function loadPending(env: Env): Promise<PendingRow[]> {
+  const result = await env.DB
+    .prepare(`
+      SELECT *
+      FROM pending_odds
+      WHERE
+        next_check_at IS NULL
+        OR next_check_at <= datetime('now')
+      ORDER BY id ASC
+      LIMIT 100
+    `)
+    .all<PendingRow>();
+
+  return result.results || [];
+}
+
+async function incrementPendingRetry(
+  env: Env,
+  row: PendingRow,
+  error: string
+): Promise<any> {
+  const currentRetry = Number(row.retry_count || 0);
+  const nextRetry = currentRetry + 1;
+
+  if (nextRetry >= ODDS_EVENT_MAX_RETRIES) {
+    await env.DB
+      .prepare(`
+        DELETE FROM pending_odds
+        WHERE id = ?
+      `)
+      .bind(row.id)
+      .run();
+
+    return {
+      action: "EXPIRED",
+      retry_count: nextRetry,
+      max_retries: ODDS_EVENT_MAX_RETRIES,
+      error
+    };
+  }
+
+  const nextCheck = addSecondsISO(
+    ODDS_EVENT_RETRY_DELAY_MS / 1000
+  );
+
+  await env.DB
+    .prepare(`
+      UPDATE pending_odds
+      SET
+        retry_count = ?,
+        updated_at = ?,
+        next_check_at = ?,
+        last_error = ?
+      WHERE id = ?
+    `)
+    .bind(
+      nextRetry,
+      nowISO(),
+      nextCheck,
+      error,
+      row.id
+    )
+    .run();
+
+  return {
+    action: "RESCHEDULED",
+    retry_count: nextRetry,
+    max_retries: ODDS_EVENT_MAX_RETRIES,
+    next_check_at: nextCheck,
+    error
+  };
+}
+
+async function incrementPendingMissing(
+  env: Env,
+  row: PendingRow,
+  error: string
+): Promise<any> {
+  const currentMissing = Number(row.missing_count || 0);
+  const nextMissing = currentMissing + 1;
+
+  if (nextMissing >= MAX_MISSING_CHECKS) {
+    await env.DB
+      .prepare(`
+        DELETE FROM pending_odds
+        WHERE id = ?
+      `)
+      .bind(row.id)
+      .run();
+
+    return {
+      action: "REMOVED_MISSING",
+      missing_count: nextMissing,
+      max_missing_checks: MAX_MISSING_CHECKS,
+      error
+    };
+  }
+
+  const nextCheck = addSecondsISO(
+    ODDS_EVENT_RETRY_DELAY_MS / 1000
+  );
+
+  await env.DB
+    .prepare(`
+      UPDATE pending_odds
+      SET
+        missing_count = ?,
+        updated_at = ?,
+        next_check_at = ?,
+        last_error = ?
+      WHERE id = ?
+    `)
+    .bind(
+      nextMissing,
+      nowISO(),
+      nextCheck,
+      error,
+      row.id
+    )
+    .run();
+
+  return {
+    action: "RESCHEDULED_MISSING",
+    missing_count: nextMissing,
+    max_missing_checks: MAX_MISSING_CHECKS,
+    next_check_at: nextCheck,
+    error
+  };
+}
+
+
+// ============================================================
+// PENDING VALIDATION
+// ============================================================
+
+function pendingValid(event: any): boolean {
+  if (!event) return false;
+
+  if (!isCloudbetLive(event)) {
+    return false;
+  }
+
+  const score = String(
+    event.score ??
+    event.result ??
+    event.match_score ??
+    ""
+  ).trim();
+
+  if (score === "0:0" || score === "0 - 0") {
+    // still valid
+  } else if (score) {
+    return false;
+  }
+
+  const period =
+    event.period ||
+    event.phase ||
+    event.period_type ||
+    "";
+
+  if (String(period).toLowerCase().includes("2h")) {
+    return false;
+  }
+
+  const minute = Number(
+    event.minute ??
+    event.clock ??
+    event.elapsed ??
+    event.match_minute ??
+    0
+  );
+
+  if (Number.isFinite(minute) && minute > 45) {
+    return false;
+  }
+
+  return true;
+}
+
+
+// ============================================================
+// PENDING RETRY
+//
+// CRITICAL RULE:
+// - SAME cloudbet event ID
+// - NO event switching
+// - NO market switching
+// - NO line switching
+// - EXACT 1H OVER 0.5
+// ============================================================
+
+async function processPending(env: Env): Promise<any> {
+  const rows = await loadPending(env);
+
+  if (!rows.length) {
+    return {
+      success: true,
+      pending_found: 0,
+      processed: 0,
+      completed: 0,
+      rescheduled: 0,
+      expired: 0,
+      missing: 0
+    };
+  }
+
+  let completed = 0;
+  let rescheduled = 0;
+  let expired = 0;
+  let missing = 0;
+  const results: any[] = [];
+
+  // One /live call for all pending records.
+  const liveResponse = await fetchServiceJSON(
+    env.CLOUDBET,
+    CLOUDBET_LIVE_PATH,
+    CLOUDBET_TIMEOUT_MS
+  );
+
+  if (!liveResponse.ok) {
+    return {
+      success: false,
+      pending_found: rows.length,
+      processed: 0,
+      completed: 0,
+      rescheduled: 0,
+      expired: 0,
+      missing: 0,
+      error: "CLOUDBET_LIVE_FAILED",
+      cloudbet: liveResponse
+    };
+  }
+
+  const liveMatches = cloudbetMatches(liveResponse.data)
+    .filter(isCloudbetLive);
+
+  const liveById = new Map<string, any>();
+
+  for (const event of liveMatches) {
+    const id =
+      extractMatchId(event) ||
+      getCloudbetEventId(event);
+
+    if (id) {
+      liveById.set(String(id), event);
+    }
+  }
+
+  for (const row of rows) {
+    const cloudbetId = String(row.cloudbet_id || "");
+
+    if (!cloudbetId) {
+      const r = await incrementPendingRetry(
+        env,
+        row,
+        "CLOUDBET_EVENT_ID_MISSING"
+      );
+
+      results.push({
+        pending_id: row.id,
+        ...r
+      });
+
+      if (r.action === "EXPIRED") expired++;
+      else rescheduled++;
+
+      continue;
+    }
+
+    // ========================================================
+    // SAME EVENT ID ONLY
+    // ========================================================
+
+    const liveEvent = liveById.get(cloudbetId);
+
+    if (!liveEvent) {
+      const r = await incrementPendingMissing(
+        env,
+        row,
+        "SAME_CLOUDBET_EVENT_NOT_IN_LIVE"
+      );
+
+      results.push({
+        pending_id: row.id,
+        cloudbet_id: cloudbetId,
+        ...r
+      });
+
+      missing++;
+
+      if (r.action === "REMOVED_MISSING") {
+        expired++;
+      } else {
+        rescheduled++;
       }
+
+      continue;
+    }
+
+    if (!pendingValid(liveEvent)) {
+      const r = await incrementPendingMissing(
+        env,
+        row,
+        "SAME_EVENT_NO_LONGER_VALID_FOR_TARGET"
+      );
+
+      results.push({
+        pending_id: row.id,
+        cloudbet_id: cloudbetId,
+        ...r
+      });
+
+      missing++;
+
+      if (r.action === "REMOVED_MISSING") {
+        expired++;
+      } else {
+        rescheduled++;
+      }
+
+      continue;
+    }
+
+    // Force the verified original event ID.
+    const retryEvent = {
+      ...liveEvent,
+      id: cloudbetId,
+      event_id: cloudbetId
+    };
+
+    // EXACT SAME EVENT.
+    // /event?id=<original cloudbet_id>
+    const oddsResult = await resolveOddsWithRetry(
+      env,
+      retryEvent
+    );
+
+    if (!oddsResult.ok) {
+      const r = await incrementPendingRetry(
+        env,
+        row,
+        oddsResult.error || "TARGET_ODDS_STILL_UNAVAILABLE"
+      );
+
+      results.push({
+        pending_id: row.id,
+        cloudbet_id: cloudbetId,
+        odds: oddsResult,
+        ...r
+      });
+
+      if (r.action === "EXPIRED") expired++;
+      else rescheduled++;
+
+      continue;
+    }
+
+    // ========================================================
+    // ODDS FOUND — COMPLETE ORIGINAL BET
+    // ========================================================
+
+    let storedPayload: PendingPayload = {};
+
+    try {
+      storedPayload = JSON.parse(
+        row.payload_json || "{}"
+      );
+    } catch {
+      storedPayload = {};
+    }
+
+    const originalBet = storedPayload.bet || {};
+
+    const completedBet = {
+      ...originalBet,
+
+      cloudbet: {
+        ...(originalBet.cloudbet || {}),
+        ...(liveEvent || {}),
+        id: cloudbetId,
+        event_id: cloudbetId
+      },
+
+      odds: {
+        ...(originalBet.odds || {}),
+        ...oddsResult
+      },
+
+      target: {
+        market: TARGET_MARKET,
+        selection: TARGET_SELECTION,
+        market_key: TARGET_MARKET_KEY,
+        submarket_key: TARGET_SUBMARKET_KEY,
+        outcome: TARGET_OUTCOME,
+        params: TARGET_PARAMS
+      }
+    };
+
+    const archiveResult = await archiveBet(
+      env,
+      completedBet,
+      storedPayload.signal || null,
+      storedPayload.matcher || null,
+      liveEvent,
+      oddsResult
+    );
+
+    if (!archiveResult.success) {
+      const r = await incrementPendingRetry(
+        env,
+        row,
+        archiveResult.error || "ARCHIVE_FAILED"
+      );
+
+      results.push({
+        pending_id: row.id,
+        cloudbet_id: cloudbetId,
+        archive: archiveResult,
+        ...r
+      });
+
+      if (r.action === "EXPIRED") expired++;
+      else rescheduled++;
+
+      continue;
+    }
+
+    await env.DB
+      .prepare(`
+        DELETE FROM pending_odds
+        WHERE id = ?
+      `)
+      .bind(row.id)
+      .run();
+
+    completed++;
+
+    results.push({
+      pending_id: row.id,
+      cloudbet_id: cloudbetId,
+      action: "COMPLETED",
+      odds: oddsResult,
+      archive: archiveResult
+    });
+  }
+
+  return {
+    success: true,
+    pending_found: rows.length,
+    processed: rows.length,
+    completed,
+    rescheduled,
+    expired,
+    missing,
+    results
+  };
+}
+
+
+// ============================================================
+// ARCHIVE
+// ============================================================
+
+async function archiveBet(
+  env: Env,
+  bet: any,
+  signal: any,
+  matcher: any,
+  cloudbet: any,
+  oddsResult: OddsResult
+): Promise<any> {
+  const executionId =
+    bet?.execution_id ||
+    signal?.execution_id ||
+    crypto.randomUUID();
+
+  const cloudbetId =
+    bet?.cloudbet?.id ||
+    cloudbet?.cloudbet?.id ||
+    extractMatchId(cloudbet);
+
+  const home =
+    bet?.cloudbet?.home ||
+    cloudbet?.home ||
+    "";
+
+  const away =
+    bet?.cloudbet?.away ||
+    cloudbet?.away ||
+    "";
+
+  const odds =
+    oddsResult?.odds ??
+    bet?.odds ??
+    null;
+
+  try {
+    await env.DB
+      .prepare(`
+        INSERT INTO bet_archive (
+          execution_id,
+          timestamp,
+          cloudbet_id,
+          home,
+          away,
+          odds,
+          stake_eur,
+          market,
+          selection,
+          payload_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .bind(
+        executionId,
+        nowISO(),
+        cloudbetId || null,
+        home,
+        away,
+        odds,
+        BET_STAKE_EUR,
+        TARGET_MARKET,
+        TARGET_SELECTION,
+        JSON.stringify({
+          bet,
+          signal,
+          matcher,
+          cloudbet,
+          odds: oddsResult
+        })
+      )
+      .run();
+
+    return {
+      success: true,
+      execution_id: executionId,
+      cloudbet_id: cloudbetId,
+      odds
     };
   } catch (error) {
     return {
@@ -3413,1309 +3354,703 @@ async function savePending(
   }
 }
 
-async function pendingRows(
-  env: Env
-): Promise<Obj[]> {
-  const result =
-    await env.DB.prepare(`
-      SELECT *
-      FROM pending_odds
-      WHERE
-        status = 'PENDING_ODDS'
-        AND (
-          next_check_at IS NULL
-          OR next_check_at <= datetime('now')
-        )
-      ORDER BY created_at ASC
-    `).all();
 
-  return (
-    result.results ??
-    []
-  ) as Obj[];
-}
+// ============================================================
+// BET BUILDER
+// ============================================================
 
-async function invalidate(
-  env: Env,
-  id: number
-): Promise<void> {
-  await env.DB.prepare(`
-    UPDATE pending_odds
-    SET
-      status = 'INVALIDATED',
-      updated_at = datetime('now'),
-      last_checked_at = datetime('now'),
-      next_check_at = NULL
-    WHERE id = ?
-  `).bind(id).run();
-}
+function buildBet(
+  signal: any,
+  matcher: any,
+  verificationCloudbet: any,
+  oddsResult: OddsResult
+): any {
+  const verifiedCloudbetId =
+    verificationCloudbet?.id ||
+    verificationCloudbet?.event_id ||
+    extractMatchId(verificationCloudbet) ||
+    oddsResult?.event_id ||
+    null;
 
-async function removePending(
-  env: Env,
-  id: number
-): Promise<void> {
-  await env.DB.prepare(
-    `DELETE FROM pending_odds WHERE id = ?`
-  ).bind(id).run();
-}
+  const cloudbetHome =
+    verificationCloudbet?.home ||
+    verificationCloudbet?.home_team ||
+    signal?.home ||
+    "";
 
-async function reschedule(
-  env: Env,
-  id: number,
-  retry: number,
-  missing: number
-): Promise<void> {
-  await env.DB.prepare(`
-    UPDATE pending_odds
-    SET
-      retry_count = ?,
-      missing_count = ?,
-      last_checked_at = datetime('now'),
-      next_check_at = datetime('now', '+1 minute'),
-      updated_at = datetime('now')
-    WHERE id = ?
-  `).bind(
-    retry,
-    missing,
-    id
-  ).run();
-}
+  const cloudbetAway =
+    verificationCloudbet?.away ||
+    verificationCloudbet?.away_team ||
+    signal?.away ||
+    "";
 
-// ─── PENDING VALIDATION ────────────────────────────────────
-
-function numberValue(
-  v: any
-): number | null {
-  const n = Number(v);
-
-  return Number.isFinite(n)
-    ? n
-    : null;
-}
-
-function scorePair(
-  m: Obj
-): {
-  home: number | null;
-  away: number | null;
-} {
-  const pairs = [
-    [
-      m?.home_score,
-      m?.away_score
-    ],
-    [
-      m?.homeScore,
-      m?.awayScore
-    ],
-    [
-      m?.score?.home,
-      m?.score?.away
-    ],
-    [
-      m?.scores?.home,
-      m?.scores?.away
-    ],
-    [
-      m?.result?.home,
-      m?.result?.away
-    ],
-    [
-      m?.home?.score,
-      m?.away?.score
-    ]
-  ];
-
-  for (
-    const [h, a] of pairs
-  ) {
-    const home =
-      numberValue(h);
-
-    const away =
-      numberValue(a);
-
-    if (
-      home !== null &&
-      away !== null
-    ) {
-      return {
-        home,
-        away
-      };
-    }
-  }
-
-  const text =
-    safe(
-      m?.score ??
-        m?.result ??
-        m?.current_score
-    );
-
-  const match =
-    text.match(
-      /(\d+)\s*[-:]\s*(\d+)/
-    );
-
-  if (match) {
-    return {
-      home:
-        Number(match[1]),
-      away:
-        Number(match[2])
-    };
-  }
+  const odds =
+    oddsResult?.odds ??
+    extractOdds(verificationCloudbet);
 
   return {
-    home: null,
-    away: null
+    execution_id: crypto.randomUUID(),
+    timestamp: nowISO(),
+
+    mode: MODE,
+    dry_run: DRY_RUN,
+    betting_enabled: BETTING_ENABLED,
+
+    stake_eur: BET_STAKE_EUR,
+
+    signal: {
+      match_id:
+        signal?.match_id ||
+        signal?.id ||
+        null,
+
+      home: signal?.home || "",
+      away: signal?.away || "",
+
+      entry_minute:
+        signal?.entry_minute ??
+        signal?.minute ??
+        null,
+
+      hunter_score:
+        signal?.hunter_score ??
+        signal?.score ??
+        null
+    },
+
+    matcher: {
+      matched: !!matcher,
+      match_score:
+        matcher?.match_score ??
+        matcher?.score ??
+        null,
+
+      confidence:
+        matcher?.confidence ??
+        null
+    },
+
+    cloudbet: {
+      id: verifiedCloudbetId,
+      event_id: verifiedCloudbetId,
+
+      home: cloudbetHome,
+      away: cloudbetAway,
+
+      status:
+        verificationCloudbet?.status ||
+        null,
+
+      competition:
+        verificationCloudbet?.competition ||
+        null
+    },
+
+    target: {
+      market: TARGET_MARKET,
+      selection: TARGET_SELECTION,
+
+      market_key: TARGET_MARKET_KEY,
+      submarket_key: TARGET_SUBMARKET_KEY,
+
+      outcome: TARGET_OUTCOME,
+      params: TARGET_PARAMS
+    },
+
+    odds: odds,
+
+    odds_diagnostic: oddsResult,
+
+    action: odds != null
+      ? "TARGET_READY"
+      : "PENDING_ODDS"
   };
 }
 
-function hasGoal(
-  m: Obj
-): boolean {
-  const score =
-    scorePair(m);
 
-  return (
-    score.home !== null &&
-    score.away !== null &&
-    (
-      score.home > 0 ||
-      score.away > 0
-    )
-  );
-}
+// ============================================================
+// HUNTER ENTRY DETECTION
+// ============================================================
 
-function isFirstHalf(
-  m: Obj
-): boolean {
+function isHunterEntry(signal: any): boolean {
+  if (!signal) return false;
+
+  const status = String(
+    signal.status ||
+    signal.state ||
+    ""
+  ).toUpperCase();
+
   if (
-    hasGoal(m)
+    status &&
+    ![
+      "ENTRY",
+      "SIGNAL",
+      "TRACKING",
+      "ACTIVE",
+      "HUNTER"
+    ].includes(status)
   ) {
     return false;
   }
 
-  const period =
-    norm(
-      m?.period ??
-        m?.match_period ??
-        m?.phase ??
-        m?.state ??
-        m?.status
-    );
+  const home =
+    signal.home ||
+    signal.home_team ||
+    signal.home_name;
 
-  if (
-    /\bfirst half\b|\b1st half\b|\b1h\b/.test(
-      period
-    )
-  ) {
-    return true;
+  const away =
+    signal.away ||
+    signal.away_team ||
+    signal.away_name;
+
+  if (!home || !away) {
+    return false;
   }
 
-  const minute =
-    numberValue(
-      m?.minute ??
-        m?.match_minute ??
-        m?.matchMinute ??
-        m?.clock?.minute ??
-        m?.time?.minute ??
-        m?.elapsed
-    );
-
-  return (
-    minute !== null &&
-    minute >= 0 &&
-    minute <= 45
+  const minute = Number(
+    signal.entry_minute ??
+    signal.minute ??
+    signal.elapsed ??
+    0
   );
+
+  if (
+    Number.isFinite(minute) &&
+    minute > 45
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
-function pendingValid(
-  cloudbet: Obj
-): Obj {
-  if (!cloudbet) {
-    return {
-      valid: false,
-      reason:
-        "CLOUDBET_EVENT_NOT_FOUND"
-    };
+
+// ============================================================
+// TRACKER RESPONSE NORMALIZATION
+// ============================================================
+
+function trackerEntries(data: any): any[] {
+  if (!data) return [];
+
+  if (Array.isArray(data.entries)) {
+    return data.entries;
   }
 
-  if (
-    !isCloudbetLive(
-      cloudbet
-    )
-  ) {
-    return {
-      valid: false,
-      reason:
-        "CLOUDBET_NO_LONGER_LIVE"
-    };
+  if (Array.isArray(data.results)) {
+    return data.results;
   }
 
-  if (
-    hasGoal(cloudbet)
-  ) {
-    return {
-      valid: false,
-      reason:
-        "GOAL_ALREADY_SCORED"
-    };
+  if (Array.isArray(data.signals)) {
+    return data.signals;
   }
 
-  if (
-    !isFirstHalf(
-      cloudbet
-    )
-  ) {
-    return {
-      valid: false,
-      reason:
-        "FIRST_HALF_ENDED"
-    };
+  if (Array.isArray(data.data?.entries)) {
+    return data.data.entries;
   }
 
-  return {
-    valid: true,
-    reason:
-      "BET_STILL_VALID"
-  };
+  if (Array.isArray(data.data?.signals)) {
+    return data.data.signals;
+  }
+
+  return [];
 }
 
-// ─── PENDING CRON ──────────────────────────────────────────
 
-async function processPending(
-  env: Env
-): Promise<Obj> {
-  const started =
-    Date.now();
+// ============================================================
+// MATCHER RESPONSE NORMALIZATION
+// ============================================================
 
-  const result: Obj = {
-    success: true,
-    version:
-      VERSION,
-    action:
-      "PENDING_ODDS_CRON",
-    pending_loaded: 0,
-    checked: 0,
-    odds_found: 0,
-    invalidated: 0,
-    still_pending: 0,
-    errors: 0,
-    details: []
-  };
+function matcherMatches(data: any): any[] {
+  if (!data) return [];
 
-  const rows =
-    await pendingRows(
-      env
+  if (Array.isArray(data.matches)) {
+    return data.matches;
+  }
+
+  if (Array.isArray(data.results)) {
+    return data.results;
+  }
+
+  if (Array.isArray(data.data?.matches)) {
+    return data.data.matches;
+  }
+
+  if (Array.isArray(data.data?.results)) {
+    return data.data.results;
+  }
+
+  return [];
+}
+
+
+// ============================================================
+// MATCHER LOOKUP
+// ============================================================
+
+function getMatcherForSignal(
+  signal: any,
+  matcherData: any
+): any | null {
+  const matches = matcherMatches(matcherData);
+
+  const signalId = String(
+    signal?.match_id ||
+    signal?.id ||
+    ""
+  );
+
+  const direct = matches.find((m: any) => {
+    const id = String(
+      m?.match_id ||
+      m?.source_match_id ||
+      m?.flashscore_id ||
+      ""
     );
 
-  result.pending_loaded =
-    rows.length;
+    return id && signalId && id === signalId;
+  });
 
-  if (!rows.length) {
-    result.elapsed_ms =
-      Date.now() -
-      started;
-
-    return result;
+  if (direct) {
+    return direct;
   }
 
-  let liveData: Obj;
+  const home = normalizeTeam(
+    signal?.home ||
+    signal?.home_team ||
+    ""
+  );
+
+  const away = normalizeTeam(
+    signal?.away ||
+    signal?.away_team ||
+    ""
+  );
+
+  let best: any = null;
+  let bestScore = 0;
+
+  for (const m of matches) {
+    const mh = normalizeTeam(
+      m?.home ||
+      m?.home_team ||
+      ""
+    );
+
+    const ma = normalizeTeam(
+      m?.away ||
+      m?.away_team ||
+      ""
+    );
+
+    const hs = teamSimilarity(home, mh);
+    const as = teamSimilarity(away, ma);
+
+    const score =
+      (hs + as) / 2;
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = m;
+    }
+  }
+
+  if (
+    best &&
+    bestScore >= MATCHER_THRESHOLD
+  ) {
+    return {
+      ...best,
+      fallback_score: bestScore
+    };
+  }
+
+  return null;
+                              }
+// ============================================================
+// MAIN WORKER
+// ============================================================
+
+async function runWorker(env: Env): Promise<any> {
+  const started = Date.now();
+
+  const executionId = crypto.randomUUID();
+
+  // ----------------------------------------------------------
+  // PERSISTENT PENDING RETRY
+  // ----------------------------------------------------------
+
+  let pendingResult: any = null;
 
   try {
-    liveData =
-      await fetchServiceJSON(
-        env.CLOUDBET,
-        CLOUDBET_LIVE_PATH,
-        "CLOUDBET",
-        SERVICE_TIMEOUT_MS
-      );
+    pendingResult = await processPending(env);
   } catch (error) {
-    return {
-      ...result,
+    pendingResult = {
       success: false,
-      errors:
-        rows.length,
       error:
         error instanceof Error
           ? error.message
-          : String(error),
-
-      service_error:
-        error instanceof
-        ServiceRequestError
-          ? error.toJSON()
-          : null
+          : String(error)
     };
   }
 
-  const feedDiagnostic =
-    cloudbetFeedDiagnostic(
-      liveData
-    );
-
-  const liveMatches =
-    cloudbetMatches(
-      liveData
-    ).filter(
-      isCloudbetLive
-    );
-
-  const byId =
-    new Map<
-      string,
-      Obj
-    >();
-
-  for (
-    const match of
-    liveMatches
-  ) {
-    const id =
-      extractMatchId(
-        match
-      );
-
-    if (id) {
-      byId.set(
-        id,
-        match
-      );
-    }
-  }
-
-  result.live_feed =
-    feedDiagnostic;
-
-  for (
-    const row of rows
-  ) {
-    result.checked++;
-
-    const id =
-      Number(
-        row?.id
-      );
-
-    const cloudbetId =
-      safe(
-        row?.cloudbet_id
-      );
-
-    if (
-      !Number.isInteger(id) ||
-      !cloudbetId
-    ) {
-      result.errors++;
-
-      result.details.push({
-        id:
-          row?.id ??
-          null,
-
-        cloudbet_id:
-          cloudbetId ||
-          null,
-
-        status:
-          "ERROR",
-
-        reason:
-          "INVALID_PENDING_ROW"
-      });
-
-      continue;
-    }
-
-    const live =
-      byId.get(
-        cloudbetId
-      );
-
-    if (!live) {
-      const missing =
-        Number(
-          row?.missing_count ??
-            0
-        ) + 1;
-
-      if (
-        missing >
-        MAX_MISSING_CHECKS
-      ) {
-        await invalidate(
-          env,
-          id
-        );
-
-        result.invalidated++;
-
-        result.details.push({
-          id,
-
-          cloudbet_id:
-            cloudbetId,
-
-          status:
-            "INVALIDATED",
-
-          reason:
-            "CLOUDBET_EVENT_NOT_FOUND",
-
-          live_feed_source:
-            feedDiagnostic
-              .extraction_source,
-
-          live_events_received:
-            feedDiagnostic
-              .events_received,
-
-          events_recognized_live:
-            feedDiagnostic
-              .events_recognized_live
-        });
-      } else {
-        await reschedule(
-          env,
-          id,
-          Number(
-            row?.retry_count ??
-              0
-          ),
-          missing
-        );
-
-        result.still_pending++;
-
-        result.details.push({
-          id,
-
-          cloudbet_id:
-            cloudbetId,
-
-          status:
-            "PENDING_ODDS",
-
-          reason:
-            "CLOUDBET_EVENT_TEMPORARILY_MISSING",
-
-          missing_count:
-            missing,
-
-          live_feed_source:
-            feedDiagnostic
-              .extraction_source,
-
-          live_events_received:
-            feedDiagnostic
-              .events_received,
-
-          events_recognized_live:
-            feedDiagnostic
-              .events_recognized_live
-        });
-      }
-
-      continue;
-    }
-
-    const validity =
-      pendingValid(
-        live
-      );
-
-    if (
-      !validity.valid
-    ) {
-      await invalidate(
-        env,
-        id
-      );
-
-      result.invalidated++;
-
-      result.details.push({
-        id,
-
-        cloudbet_id:
-          cloudbetId,
-
-        status:
-          "INVALIDATED",
-
-        reason:
-          validity.reason
-      });
-
-      continue;
-    }
-
-    const retryEvent: Obj = {
-      ...live,
-      id:
-        cloudbetId
-    };
-
-    const oddsResult =
-      await resolveOddsWithRetry(
-        env,
-        retryEvent
-      );
-
-    if (
-      !oddsResult.success ||
-      oddsResult.odds === null
-    ) {
-      await reschedule(
-        env,
-        id,
-        Number(
-          row?.retry_count ??
-            0
-        ) + 1,
-        0
-      );
-
-      result.still_pending++;
-
-      result.details.push({
-        id,
-
-        cloudbet_id:
-          cloudbetId,
-
-        status:
-          "PENDING_ODDS",
-
-        reason:
-          oddsResult.error,
-
-        attempts:
-          oddsResult.attempts,
-
-        retry:
-          oddsResult.retry,
-
-        attempts_detail:
-          oddsResult.attempts_detail,
-
-        diagnostic:
-          oddsResult.diagnostic
-      });
-
-      continue;
-    }
-
-    let bet: Obj = {};
-
-    try {
-      bet =
-        JSON.parse(
-          safe(
-            row?.payload_json
-          ) || "{}"
-        );
-    } catch {
-      bet = {};
-    }
-
-    bet.cloudbet = {
-      ...(bet.cloudbet ??
-        {}),
-
-      ...(oddsResult.event ??
-        {}),
-
-      id:
-        cloudbetId,
-
-      odds:
-        oddsResult.odds,
-
-      odds_available:
-        true,
-
-      odds_source:
-        "CLOUDBET_EVENT"
-    };
-
-    bet.odds =
-      oddsResult.odds;
-
-    bet.odds_available =
-      true;
-
-    bet.candidate_complete =
-      true;
-
-    bet.full_event_fetch = {
-      success:
-        oddsResult.success,
-
-      source:
-        oddsResult.source,
-
-      event_id:
-        cloudbetId,
-
-      attempts:
-        oddsResult.attempts,
-
-      retry:
-        oddsResult.retry,
-
-      error:
-        oddsResult.error
-    };
-
-    bet.odds_diagnostic =
-      oddsResult.diagnostic;
-
-    await archiveBets(
-      env,
-      [bet]
-    );
-
-    await removePending(
-      env,
-      id
-    );
-
-    result.odds_found++;
-
-    result.details.push({
-      id,
-
-      cloudbet_id:
-        cloudbetId,
-
-      status:
-        "READY",
-
-      odds:
-        oddsResult.odds,
-
-      attempts:
-        oddsResult.attempts,
-
-      retry:
-        oddsResult.retry
-    });
-  }
-
-  result.elapsed_ms =
-    Date.now() -
-    started;
-
-  return result;
-}
-
-// ─── MAIN RUN ──────────────────────────────────────────────
-
-async function runWorker(
-  env: Env
-): Promise<Obj> {
-  const started =
-    Date.now();
-
-  const results =
-    await Promise.allSettled([
+  // ----------------------------------------------------------
+  // TRACKER + MATCHER + CLOUDBET /live
+  // ----------------------------------------------------------
+
+  const [trackerResult, matcherResult, cloudbetResult] =
+    await Promise.all([
       fetchServiceJSON(
         env.TRACKER,
         "/entries",
-        "TRACKER",
-        SERVICE_TIMEOUT_MS
+        10000
       ),
 
       fetchServiceJSON(
         env.MATCHER,
         `/match?threshold=${MATCHER_THRESHOLD}`,
-        "MATCHER",
-        SERVICE_TIMEOUT_MS
+        10000
       ),
 
       fetchServiceJSON(
         env.CLOUDBET,
         CLOUDBET_LIVE_PATH,
-        "CLOUDBET",
-        SERVICE_TIMEOUT_MS
+        CLOUDBET_TIMEOUT_MS
       )
     ]);
 
-  const trackerResult =
-    results[0];
+  // ----------------------------------------------------------
+  // TRACKER
+  // ----------------------------------------------------------
 
-  const matcherResult =
-    results[1];
-
-  const cloudbetResult =
-    results[2];
-
-  const serviceDiagnostics: Obj[] =
-    [];
-
-  if (
-    trackerResult.status ===
-    "rejected"
-  ) {
-    serviceDiagnostics.push({
-      service:
-        "TRACKER",
-
-      ...(trackerResult.reason instanceof
-      ServiceRequestError
-        ? trackerResult.reason.toJSON()
-        : {
-            code:
-              "UNKNOWN_ERROR",
-
-            message:
-              trackerResult.reason instanceof
-              Error
-                ? trackerResult.reason.message
-                : String(
-                    trackerResult.reason
-                  )
-          })
-    });
-  }
-
-  if (
-    matcherResult.status ===
-    "rejected"
-  ) {
-    serviceDiagnostics.push({
-      service:
-        "MATCHER",
-
-      ...(matcherResult.reason instanceof
-      ServiceRequestError
-        ? matcherResult.reason.toJSON()
-        : {
-            code:
-              "UNKNOWN_ERROR",
-
-            message:
-              matcherResult.reason instanceof
-              Error
-                ? matcherResult.reason.message
-                : String(
-                    matcherResult.reason
-                  )
-          })
-    });
-  }
-
-  if (
-    cloudbetResult.status ===
-    "rejected"
-  ) {
-    serviceDiagnostics.push({
-      service:
-        "CLOUDBET",
-
-      ...(cloudbetResult.reason instanceof
-      ServiceRequestError
-        ? cloudbetResult.reason.toJSON()
-        : {
-            code:
-              "UNKNOWN_ERROR",
-
-            message:
-              cloudbetResult.reason instanceof
-              Error
-                ? cloudbetResult.reason.message
-                : String(
-                    cloudbetResult.reason
-                  )
-          })
-    });
-  }
-
-  if (
-    serviceDiagnostics.length
-  ) {
+  if (!trackerResult.ok) {
     return {
       success: false,
-
-      worker:
-        "cloudbet-bet-worker",
-
-      version:
-        VERSION,
-
-      mode:
-        MODE,
-
-      betting:
-        "DISABLED",
-
-      dry_run:
-        true,
-
-      action:
-        "RUN",
-
-      error:
-        "REQUIRED_SERVICE_FAILED",
-
-      timeout_ms:
-        SERVICE_TIMEOUT_MS,
-
-      failed_services:
-        serviceDiagnostics,
-
-      services: {
-        TRACKER:
-          trackerResult.status ===
-          "fulfilled"
-            ? "OK"
-            : "FAILED",
-
-        MATCHER:
-          matcherResult.status ===
-          "fulfilled"
-            ? "OK"
-            : "FAILED",
-
-        CLOUDBET:
-          cloudbetResult.status ===
-          "fulfilled"
-            ? "OK"
-            : "FAILED"
-      },
-
-      elapsed_ms:
-        Date.now() -
-        started
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      mode: MODE,
+      betting_enabled: BETTING_ENABLED,
+      action: "RUN",
+      execution_id: executionId,
+      error: "TRACKER_FAILED",
+      tracker: trackerResult,
+      pending: pendingResult,
+      processing_ms: Date.now() - started
     };
   }
 
-  const trackerData =
-    trackerResult.value as Obj;
+  // ----------------------------------------------------------
+  // MATCHER
+  // ----------------------------------------------------------
 
-  const matcherData =
-    matcherResult.value as Obj;
+  if (!matcherResult.ok) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      mode: MODE,
+      betting_enabled: BETTING_ENABLED,
+      action: "RUN",
+      execution_id: executionId,
+      error: "MATCHER_FAILED",
+      matcher: matcherResult,
+      pending: pendingResult,
+      processing_ms: Date.now() - started
+    };
+  }
 
-  const cloudbetData =
-    cloudbetResult.value as Obj;
+  // ----------------------------------------------------------
+  // CLOUDBET
+  // ----------------------------------------------------------
 
-  const allCloudbetEvents =
-    cloudbetMatches(
-      cloudbetData
-    );
+  if (!cloudbetResult.ok) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      mode: MODE,
+      betting_enabled: BETTING_ENABLED,
+      action: "RUN",
+      execution_id: executionId,
+      error: "CLOUDBET_LIVE_FAILED",
+      cloudbet: cloudbetResult,
+      pending: pendingResult,
+      processing_ms: Date.now() - started
+    };
+  }
 
-  const liveMatches =
-    allCloudbetEvents.filter(
-      isCloudbetLive
-    );
+  // ----------------------------------------------------------
+  // NORMALIZE
+  // ----------------------------------------------------------
 
-  const cloudbetFeed =
-    cloudbetFeedDiagnostic(
-      cloudbetData
-    );
+  const trackerSignals =
+    trackerEntries(trackerResult.data);
 
-  const signals =
-    extractSignals(
-      trackerData
-    ).filter(
-      isHunterEntry
-    );
+  const matcherList =
+    matcherMatches(matcherResult.data);
 
-  const prepared: Obj[] =
-    [];
+  const cloudbetAll =
+    cloudbetMatches(cloudbetResult.data);
 
-  const matcherFailures: Obj[] =
-    [];
+  const cloudbetLive =
+    cloudbetAll.filter(isCloudbetLive);
 
-  const matcherFallbacks: Obj[] =
-    [];
+  const hunterSignals =
+    trackerSignals.filter(isHunterEntry);
 
-  const verificationFailures: Obj[] =
-    [];
+  // ----------------------------------------------------------
+  // RESULTS
+  // ----------------------------------------------------------
 
-  const oddsFailures: Obj[] =
-    [];
+  const entries: any[] = [];
+  const pending: any[] = [];
+  const skipped: any[] = [];
+  const errors: any[] = [];
 
-  const signalCloudbetDiagnostics:
-    Obj[] = [];
+  let targetReady = 0;
+  let targetPending = 0;
+  let targetMissing = 0;
 
-  // ==========================================================
-  // PROCESS CURRENT HUNTER SIGNALS
-  // ==========================================================
+  // ----------------------------------------------------------
+  // PROCESS HUNTER SIGNALS
+  // ----------------------------------------------------------
 
-  for (
-    const signal of signals
-  ) {
-    let matcher =
-      findBestMatcher(
-        signal,
-        matcherData
-      );
+  for (const signal of hunterSignals) {
+    try {
+      // ======================================================
+      // STEP 1 — MATCHER
+      // ======================================================
 
-    if (!matcher.found) {
-      const fallback =
-        directCloudbetFallback(
+      let matcher =
+        getMatcherForSignal(
           signal,
-          liveMatches
+          matcherResult.data
         );
 
-      if (
-        fallback.found &&
-        fallback.cloudbet
-      ) {
-        matcherFallbacks.push({
-          match:
-            signalMatch(
-              signal
-            ),
+      // ======================================================
+      // STEP 2 — DIRECT CLOUDBET FALLBACK
+      //
+      // Only if matcher did not provide an acceptable match.
+      // ======================================================
 
-          signal_match_id:
-            signalId(
-              signal
-            ),
+      if (!matcher) {
+        matcher =
+          directCloudbetFallback(
+            signal,
+            cloudbetLive
+          );
+      }
 
-          fallback_used:
-            true,
-
-          fallback_matched:
-            true,
-
-          fallback_source:
-            fallback.source,
-
-          cloudbet_id:
-            fallback.cloudbet_id,
-
-          cloudbet_match:
-            displayMatch(
-              fallback.cloudbet
-            ),
-
-          team_scores:
-            fallback.team_scores ??
-            null
-        });
-
-        matcher = {
-          found: true,
-
-          source:
-            "CLOUDBET_DIRECT_FALLBACK",
-
-          classification:
-            "DIRECT_CLOUDBET_FALLBACK",
-
-          method:
-            fallback.fallback_source ??
-            "STRICT_TWO_SIDED_TEAMS",
-
-          matcher_score:
-            Number(
-              fallback
-                .team_scores
-                ?.combined_score ??
-                0
-            ),
-
-          v27:
-            fallback.cloudbet,
-
-          cloudbet:
-            fallback.cloudbet,
-
-          team_scores:
-            fallback.team_scores ??
-            null,
-
-          fallback_used:
-            true,
-
-          fallback_source:
-            fallback.source,
-
-          fallback_diagnostics:
-            fallback.diagnostics ??
-            []
-        };
-      } else {
-        matcherFailures.push({
-          match:
-            signalMatch(
-              signal
-            ),
-
-          signal_match_id:
-            signalId(
-              signal
-            ),
-
-          reason:
-            matcher.reason,
-
-          matcher_reason:
-            matcher.reason,
-
-          diagnostics:
-            matcher.diagnostics,
-
-          fallback_attempted:
-            true,
-
-          fallback_found:
-            false,
-
-          fallback_reason:
-            fallback.reason,
-
-          fallback_source:
-            fallback.source,
-
-          fallback_diagnostics:
-            fallback.diagnostics ??
-            [],
-
-          fallback_team_scores:
-            fallback.team_scores ??
-            null,
-
-          cloudbet_feed:
-            {
-              endpoint:
-                CLOUDBET_LIVE_PATH,
-
-              extraction_source:
-                cloudbetFeed
-                  .extraction_source,
-
-              events_received:
-                cloudbetFeed
-                  .events_received,
-
-              events_recognized_live:
-                cloudbetFeed
-                  .events_recognized_live
-            }
-        });
-
-        signalCloudbetDiagnostics.push({
-          signal_match:
-            signalMatch(signal),
-
-          signal_match_id:
-            signalId(signal),
-
-          found:
-            false,
-
-          reason:
-            "NOT_FOUND_IN_CLOUDBET_LIVE_FEED",
-
-          cloudbet_feed:
-            {
-              endpoint:
-                CLOUDBET_LIVE_PATH,
-
-              extraction_source:
-                cloudbetFeed
-                  .extraction_source,
-
-              events_received:
-                cloudbetFeed
-                  .events_received,
-
-              events_recognized_live:
-                cloudbetFeed
-                  .events_recognized_live
-            }
+      if (!matcher) {
+        skipped.push({
+          reason: "NO_MATCHER",
+          signal
         });
 
         continue;
       }
-    }
 
-    const verification =
-      verifyCloudbet(
-        signal,
-        matcher,
-        liveMatches
-      );
+      // ======================================================
+      // STEP 3 — STRICT CLOUDBET VERIFICATION
+      // ======================================================
 
-    if (
-      !verification.verified
-    ) {
-      verificationFailures.push({
-        match:
-          signalMatch(
-            signal
-          ),
+      const verification =
+        verifyCloudbet(
+          signal,
+          matcher,
+          cloudbetLive
+        );
 
-        signal_match_id:
-          signalId(
-            signal
-          ),
+      if (!verification.ok) {
+        skipped.push({
+          reason:
+            verification.error ||
+            "CLOUDBET_VERIFICATION_FAILED",
 
-        reason:
-          "CLOUDBET_NOT_VERIFIED",
+          signal,
+          matcher
+        });
 
-        matcher_source:
-          matcher.source ??
-          null,
+        continue;
+      }
 
-        fallback_used:
-          matcher.fallback_used ??
-          false,
+      const verifiedCloudbet =
+        verification.cloudbet;
 
-        diagnostics:
-          verification.diagnostics ??
-          [],
+      // ======================================================
+      // STEP 4 — EXACT TARGET ODDS
+      //
+      // /event?id=<VERIFIED EVENT ID>
+      //
+      // Only one attempt here.
+      // Persistent retry is handled by pending_odds.
+      // ======================================================
 
-        cloudbet_feed:
-          {
-            endpoint:
-              CLOUDBET_LIVE_PATH,
+      const oddsResult =
+        await resolveOddsOnce(
+          env,
+          verifiedCloudbet
+        );
 
-            extraction_source:
-              cloudbetFeed
-                .extraction_source,
+      // ======================================================
+      // STEP 5 — BUILD BET
+      // ======================================================
 
-            events_received:
-              cloudbetFeed
-                .events_received,
+      const bet =
+        buildBet(
+          signal,
+          matcher,
+          verifiedCloudbet,
+          oddsResult
+        );
 
-            events_recognized_live:
-              cloudbetFeed
-                .events_recognized_live
-          }
-      });
+      // ======================================================
+      // TARGET AVAILABLE
+      // ======================================================
 
-      continue;
-    }
+      if (
+        oddsResult.ok &&
+        oddsResult.odds != null
+      ) {
+        targetReady++;
 
-    signalCloudbetDiagnostics.push({
-      signal_match:
-        signalMatch(signal),
+        const archive =
+          await archiveBet(
+            env,
+            bet,
+            signal,
+            matcher,
+            verifiedCloudbet,
+            oddsResult
+          );
 
-      signal_match_id:
-        signalId(signal),
+        if (!archive.success) {
+          errors.push({
+            type: "ARCHIVE_FAILED",
+            signal,
+            error: archive.error
+          });
 
-      found:
-        true,
+          continue;
+        }
 
-      cloudbet_id:
-        verification.cloudbet_id,
+        entries.push({
+          execution_id:
+            bet.execution_id,
 
-      cloudbet_match:
-        displayMatch(
-          verification.cloudbet
-        ),
+          cloudbet_id:
+            bet.cloudbet?.id,
 
-      verification_source:
-        verification.source,
+          home:
+            bet.cloudbet?.home,
 
-      team_scores:
-        verification.team_scores ??
-        null
-    });
+          away:
+            bet.cloudbet?.away,
 
-    const oddsResult =
-      await resolveOddsOnce(
-        env,
-        verification.cloudbet
-      );
+          odds:
+            oddsResult.odds,
 
-    if (
-      !oddsResult.success
-    ) {
-      oddsFailures.push({
-        match:
-          signalMatch(
-            signal
-          ),
+          target:
+            {
+              market: TARGET_MARKET,
+              selection: TARGET_SELECTION,
+              market_key: TARGET_MARKET_KEY,
+              submarket_key:
+                TARGET_SUBMARKET_KEY,
+              outcome: TARGET_OUTCOME,
+              params: TARGET_PARAMS
+            },
 
-        signal_match_id:
-          signalId(
-            signal
-          ),
+          action: "TARGET_READY",
+          archive
+        });
+
+        continue;
+      }
+
+      // ======================================================
+      // TARGET ODDS MISSING
+      //
+      // SAVE SAME EVENT ID FOR PERSISTENT RETRY.
+      // ======================================================
+
+      targetMissing++;
+
+      const pendingResultForBet =
+        await savePending(
+          env,
+          bet.execution_id,
+          bet,
+          signal,
+          matcher,
+          verifiedCloudbet,
+          oddsResult
+        );
+
+      if (!pendingResultForBet.success) {
+        errors.push({
+          type: "PENDING_SAVE_FAILED",
+          signal,
+          error:
+            pendingResultForBet.error
+        });
+
+        continue;
+      }
+
+      targetPending++;
+
+      pending.push({
+        execution_id:
+          bet.execution_id,
 
         cloudbet_id:
-          verification.cloudbet_id ||
-          extractMatchId(
-            verification.cloudbet
-          ) ||
-          oddsResult.event_id ||
-          null,
+          bet.cloudbet?.id,
+
+        home:
+          bet.cloudbet?.home,
+
+        away:
+          bet.cloudbet?.away,
+
+        target:
+          {
+            market: TARGET_MARKET,
+            selection: TARGET_SELECTION,
+            market_key: TARGET_MARKET_KEY,
+            submarket_key:
+              TARGET_SUBMARKET_KEY,
+            outcome: TARGET_OUTCOME,
+            params: TARGET_PARAMS
+          },
+
+        odds:
+          oddsResult.odds,
 
         error:
           oddsResult.error,
 
-        attempts:
-          oddsResult.attempts,
+        pending:
+          pendingResultForBet
+      });
 
-        retry:
-          oddsResult.retry,
+    } catch (error) {
+      errors.push({
+        type: "SIGNAL_PROCESSING_ERROR",
 
-        attempts_detail:
-          oddsResult.attempts_detail,
+        signal,
 
-        diagnostic:
-          oddsResult.diagnostic
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error)
       });
     }
-
-    prepared.push(
-      buildBet(
-        signal,
-        matcher,
-        verification,
-        oddsResult
-      )
-    );
   }
 
-  const complete =
-    prepared.filter(
-      bet =>
-        bet?.cloudbet
-          ?.odds_available ===
-        true
-    );
-
-  const incomplete =
-    prepared.filter(
-      bet =>
-        bet?.cloudbet
-          ?.odds_available !==
-        true
-    );
-
-  const pendingResults: Obj[] =
-    [];
-
-  for (
-    const bet of incomplete
-  ) {
-    pendingResults.push(
-      await savePending(
-        env,
-        bet
-      )
-    );
-  }
-
-  const archive =
-    await archiveBets(
-      env,
-      complete
-    );
-
-  const candidates =
-    prepared.map(
-      buildCandidate
-    );
+  // ----------------------------------------------------------
+  // FINAL RESPONSE
+  // ----------------------------------------------------------
 
   return {
     success: true,
@@ -4729,14 +4064,17 @@ async function runWorker(
     mode:
       MODE,
 
-    betting:
-      "DISABLED",
-
     dry_run:
-      true,
+      DRY_RUN,
+
+    betting_enabled:
+      BETTING_ENABLED,
 
     action:
       "RUN",
+
+    execution_id:
+      executionId,
 
     config: {
       stake_eur:
@@ -4748,20 +4086,29 @@ async function runWorker(
       selection:
         BET_SELECTION,
 
-      exact_market:
-        TARGET_MARKET,
+      target_market:
+        TARGET_MARKET_KEY,
 
-      exact_submarket:
-        TARGET_SUBMARKET,
+      target_submarket:
+        TARGET_SUBMARKET_KEY,
 
-      exact_outcome:
+      target_outcome:
         TARGET_OUTCOME,
 
-      exact_params:
+      target_params:
         TARGET_PARAMS,
 
-      service_timeout_ms:
-        SERVICE_TIMEOUT_MS,
+      matcher_threshold:
+        MATCHER_THRESHOLD,
+
+      team_match_min_score:
+        TEAM_MATCH_MIN_SCORE,
+
+      character_similarity_min_score:
+        CHARACTER_SIMILARITY_MIN_SCORE,
+
+      containment_min_score:
+        CONTAINMENT_MIN_SCORE,
 
       live_endpoint:
         CLOUDBET_LIVE_PATH,
@@ -4773,361 +4120,192 @@ async function runWorker(
         false,
 
       odds_event_max_retries:
-        1,
+        ODDS_EVENT_MAX_RETRIES,
 
       odds_event_retry_delay_ms:
-        0,
+        ODDS_EVENT_RETRY_DELAY_MS,
 
       retry_same_event:
         true,
 
+      retry_same_market:
+        true,
+
+      retry_same_line:
+        true,
+
       persistent_pending_retry:
-        true,
-
-      pending_retry_max_attempts:
-        ODDS_EVENT_MAX_RETRIES,
-
-      pending_retry_delay_ms:
-        ODDS_EVENT_RETRY_DELAY_MS,
-
-      switch_event_on_retry:
-        false,
-
-      switch_market_on_retry:
-        false,
-
-      switch_line_on_retry:
-        false,
-
-      ui_odds_comparison:
-        false,
-
-      real_betting:
-        false,
-
-      direct_cloudbet_fallback:
-        true,
-
-      fallback_matching:
-        "STRICT_TWO_SIDED_HOME_AWAY"
+        true
     },
 
-    services: {
-      TRACKER:
-        "OK",
+    source: {
+      tracker:
+        "/entries",
 
-      MATCHER:
-        "OK",
+      matcher:
+        "/match",
 
-      CLOUDBET:
-        "OK"
+      cloudbet:
+        "CLOUDBET SERVICE BINDING /live",
+
+      cloudbet_live_parser:
+        "CLOUDBET /live → events[]"
     },
 
-    tracker: {
-      signals_received:
-        extractSignals(
-          trackerData
-        ).length,
+    stats: {
+      tracker_signals:
+        trackerSignals.length,
 
-      hunter_entries:
-        signals.length
+      hunter_signals:
+        hunterSignals.length,
+
+      matcher_matches:
+        matcherList.length,
+
+      cloudbet_events:
+        cloudbetAll.length,
+
+      cloudbet_live:
+        cloudbetLive.length,
+
+      target_ready:
+        targetReady,
+
+      target_pending:
+        targetPending,
+
+      target_missing:
+        targetMissing,
+
+      entries:
+        entries.length,
+
+      skipped:
+        skipped.length,
+
+      errors:
+        errors.length
     },
 
-    matcher: {
-      candidates:
-        signals.length,
+    pending_retry:
+      pendingResult,
 
-      matched:
-        prepared.length,
+    entries,
 
-      failures:
-        matcherFailures.length,
+    pending,
 
-      direct_cloudbet_fallback_attempted:
-        matcherFallbacks.length,
+    skipped,
 
-      direct_cloudbet_fallback_matched:
-        matcherFallbacks.filter(
-          x =>
-            x?.fallback_matched ===
-            true
-        ).length
-    },
+    errors,
 
-    cloudbet: {
-      endpoint:
-        CLOUDBET_LIVE_PATH,
-
-      feed:
-        cloudbetFeed,
-
-      raw_events:
-        allCloudbetEvents.length,
-
-      live_matches:
-        liveMatches.length,
-
-      verified:
-        prepared.length,
-
-      verification_failures:
-        verificationFailures.length,
-
-      odds_failures:
-        oddsFailures.length
-    },
-
-    odds: {
-      prepared:
-        prepared.length,
-
-      available:
-        complete.length,
-
-      unavailable:
-        incomplete.length,
-
-      pending_saved:
-        pendingResults.filter(
-          x =>
-            x?.success ===
-            true
-        ).length,
-
-      pending_failed:
-        pendingResults.filter(
-          x =>
-            x?.success !==
-            true
-        ).length,
-
-      pending:
-        pendingResults
-    },
-
-    candidates: {
-      total:
-        candidates.length,
-
-      complete:
-        candidates.filter(
-          x =>
-            x?.candidate_complete ===
-            true
-        ).length,
-
-      incomplete:
-        candidates.filter(
-          x =>
-            x?.candidate_complete !==
-            true
-        ).length
-    },
-
-    archive,
-
-    prepared_bets:
-      prepared,
-
-    bet_candidates:
-      candidates,
-
-    matcher_failures:
-      matcherFailures,
-
-    matcher_fallbacks:
-      matcherFallbacks,
-
-    verification_failures:
-      verificationFailures,
-
-    odds_fetch_failures:
-      oddsFailures,
-
-    cloudbet_signal_diagnostics:
-      signalCloudbetDiagnostics,
-
-    elapsed_ms:
-      Date.now() -
-      started
+    processing_ms:
+      Date.now() - started
   };
 }
 
-// ─── /DIAGNOSTIC ───────────────────────────────────────────
 
-async function diagnosticService(
-  service: Fetcher,
-  serviceName: string,
-  path: string
-): Promise<Obj> {
-  const started =
-    Date.now();
+// ============================================================
+// DIAGNOSTIC
+// ============================================================
 
-  const startedAt =
-    new Date().toISOString();
+async function runDiagnostic(env: Env): Promise<any> {
+  const started = Date.now();
 
-  try {
-    const data =
-      await fetchServiceJSON(
-        service,
-        path,
-        serviceName,
-        SERVICE_TIMEOUT_MS
-      );
+  const [tracker, matcher, cloudbet] =
+    await Promise.all([
+      fetchServiceJSON(
+        env.TRACKER,
+        "/entries",
+        10000
+      ),
 
-    const elapsed =
-      Date.now() -
-      started;
+      fetchServiceJSON(
+        env.MATCHER,
+        `/match?threshold=${MATCHER_THRESHOLD}`,
+        10000
+      ),
 
-    let serialized = "";
+      fetchServiceJSON(
+        env.CLOUDBET,
+        CLOUDBET_LIVE_PATH,
+        CLOUDBET_TIMEOUT_MS
+      )
+    ]);
 
-    try {
-      serialized =
-        JSON.stringify(data);
-    } catch {
-      serialized = "";
-    }
+  const cloudbetParsed =
+    cloudbet.ok
+      ? cloudbetMatches(cloudbet.data)
+      : [];
 
-    const result: Obj = {
-      service:
-        serviceName,
+  const cloudbetLive =
+    cloudbetParsed.filter(isCloudbetLive);
 
-      path,
+  const targetDiagnostics =
+    cloudbetLive.map((event: any) => {
+      const target =
+        findTargetSelection(event);
 
-      success:
-        true,
+      return {
+        id:
+          extractMatchId(event) ||
+          getCloudbetEventId(event),
 
-      elapsed_ms:
-        elapsed,
+        home:
+          event?.home ||
+          event?.home_team ||
+          null,
 
-      http_status:
-        200,
+        away:
+          event?.away ||
+          event?.away_team ||
+          null,
 
-      response_bytes:
-        new TextEncoder()
-          .encode(serialized)
-          .length,
+        status:
+          event?.status ||
+          null,
 
-      started_at:
-        startedAt
-    };
+        live:
+          isCloudbetLive(event),
 
-    if (
-      serviceName ===
-      "TRACKER"
-    ) {
-      result.signals =
-        extractSignals(
-          data
-        ).length;
-    }
+        target_found:
+          !!target,
 
-    if (
-      serviceName ===
-      "MATCHER"
-    ) {
-      result.matches =
-        matcherMatches(
-          data
-        ).length;
-    }
+        target:
+          target
+            ? {
+                outcome:
+                  target.outcome,
 
-    if (
-      serviceName ===
-      "CLOUDBET"
-    ) {
-      result.live_events =
-        cloudbetMatches(
-          data
-        ).length;
+                params:
+                  target.params,
 
-      result.cloudbet_feed =
-        cloudbetFeedDiagnostic(
-          data
-        );
-    }
+                price:
+                  target.price,
 
-    return result;
-  } catch (error) {
-    const elapsed =
-      Date.now() -
-      started;
+                status:
+                  target.status,
 
-    const serviceError =
-      error instanceof
-      ServiceRequestError
-        ? error.toJSON()
-        : null;
+                market:
+                  target.market
+              }
+            : null,
 
-    return {
-      service:
-        serviceName,
+        odds_diagnostic:
+          buildOddsDiagnostic(event)
+      };
+    });
 
-      path,
+  const hunterSignals =
+    tracker.ok
+      ? trackerEntries(tracker.data)
+          .filter(isHunterEntry)
+      : [];
 
-      success:
-        false,
-
-      elapsed_ms:
-        elapsed,
-
-      http_status:
-        serviceError?.status ??
-        null,
-
-      response_bytes:
-        null,
-
-      started_at:
-        startedAt,
-
-      error:
-        error instanceof Error
-          ? error.message
-          : String(error),
-
-      service_error:
-        serviceError
-    };
-  }
-}
-
-async function diagnosticResponse(
-  env: Env
-): Promise<Response> {
-  const started =
-    Date.now();
-
-  const tracker =
-    await diagnosticService(
-      env.TRACKER,
-      "TRACKER",
-      "/entries"
-    );
-
-  const matcher =
-    await diagnosticService(
-      env.MATCHER,
-      "MATCHER",
-      `/match?threshold=${MATCHER_THRESHOLD}`
-    );
-
-  const cloudbet =
-    await diagnosticService(
-      env.CLOUDBET,
-      "CLOUDBET",
-      CLOUDBET_LIVE_PATH
-    );
-
-  const total =
-    Date.now() -
-    started;
-
-  return json({
+  return {
     success:
-      tracker.success &&
-      matcher.success &&
-      cloudbet.success,
+      tracker.ok &&
+      matcher.ok &&
+      cloudbet.ok,
 
     worker:
       "cloudbet-bet-worker",
@@ -5138,204 +4316,143 @@ async function diagnosticResponse(
     mode:
       MODE,
 
-    betting:
-      "DISABLED",
-
-    dry_run:
-      true,
+    betting_enabled:
+      BETTING_ENABLED,
 
     action:
       "DIAGNOSTIC",
 
-    diagnostic_mode:
-      "SEQUENTIAL",
-
-    timeout_ms:
-      SERVICE_TIMEOUT_MS,
-
-    cloudbet_live_endpoint:
-      CLOUDBET_LIVE_PATH,
-
-    order: [
-      "TRACKER",
-      "MATCHER",
-      "CLOUDBET"
-    ],
-
-    services: {
-      TRACKER:
-        tracker.success
-          ? "OK"
-          : "FAILED",
-
-      MATCHER:
-        matcher.success
-          ? "OK"
-          : "FAILED",
-
-      CLOUDBET:
-        cloudbet.success
-          ? "OK"
-          : "FAILED"
-    },
-
-    tracker,
-
-    matcher,
-
-    cloudbet,
-
-    total_elapsed_ms:
-      total,
-
-    analysis: {
-      slowest_service:
-        [
-          tracker,
-          matcher,
-          cloudbet
-        ].reduce(
-          (
-            slowest,
-            current
-          ) =>
-            current.elapsed_ms >
-            slowest.elapsed_ms
-              ? current
-              : slowest
-        ).service,
-
-      slowest_elapsed_ms:
-        Math.max(
-          tracker.elapsed_ms,
-          matcher.elapsed_ms,
-          cloudbet.elapsed_ms
-        ),
-
-      expected_relationship:
-        "TOTAL ≈ TRACKER + MATCHER + CLOUDBET because diagnostic is sequential",
-
-      cloudbet_live_source:
+    config: {
+      live_endpoint:
         CLOUDBET_LIVE_PATH,
 
-      cloudbet_parser:
-        "competitions[].events[]",
+      odds_endpoint:
+        "/event?id=CLOUDBET_EVENT_ID",
 
-      direct_cloudbet_fallback:
-        "ENABLED_IN_RUN",
+      cloudbet_live_parser:
+        "CLOUDBET /live → events[]",
 
-      pending_retry:
-        "ENABLED"
-    }
-  });
-}
+      target_market:
+        TARGET_MARKET_KEY,
 
-// ─── /LINES ────────────────────────────────────────────────
+      target_submarket:
+        TARGET_SUBMARKET_KEY,
 
-async function linesResponse(
-  env: Env,
-  request: Request
-): Promise<Response> {
-  const id =
-    safe(
-      new URL(request.url)
-        .searchParams
-        .get("id")
-    );
+      target_outcome:
+        TARGET_OUTCOME,
 
-  if (!id) {
-    return json(
-      {
-        success: false,
-        error:
-          "CLOUDBET_EVENT_ID_MISSING"
-      },
-      400
-    );
-  }
+      target_params:
+        TARGET_PARAMS,
 
-  try {
-    const event =
-      await fetchCloudbetEvent(
-        env,
-        id
-      );
-
-    return json({
-      success: true,
-
-      worker:
-        "cloudbet-bet-worker",
-
-      version:
-        VERSION,
-
-      endpoint:
-        "/lines",
-
-      read_only:
+      persistent_retry:
         true,
 
-      event_id:
-        id,
+      max_retries:
+        ODDS_EVENT_MAX_RETRIES,
 
-      target: {
-        market:
-          TARGET_MARKET,
+      retry_delay_ms:
+        ODDS_EVENT_RETRY_DELAY_MS,
 
-        submarket:
-          TARGET_SUBMARKET,
+      retry_same_event:
+        true,
 
-        outcome:
-          TARGET_OUTCOME,
+      retry_same_market:
+        true,
 
-        params:
-          TARGET_PARAMS
-      },
+      retry_same_line:
+        true
+    },
 
-      diagnostic:
-        buildOddsDiagnostic(
-          event
-        ),
+    tracker: {
+      ok:
+        tracker.ok,
 
-      raw_event:
-        event
-    });
-  } catch (error) {
-    return json(
-      {
-        success: false,
+      status:
+        tracker.status,
 
-        worker:
-          "cloudbet-bet-worker",
+      latency_ms:
+        tracker.latency_ms,
 
-        version:
-          VERSION,
+      endpoint:
+        "/entries",
 
-        event_id:
-          id,
+      hunter_signals:
+        hunterSignals.length,
 
-        error:
-          error instanceof Error
-            ? error.message
-            : String(error),
+      error:
+        tracker.error ||
+        null
+    },
 
-        service_error:
-          error instanceof
-          ServiceRequestError
-            ? error.toJSON()
-            : null
-      },
-      500
-    );
-  }
+    matcher: {
+      ok:
+        matcher.ok,
+
+      status:
+        matcher.status,
+
+      latency_ms:
+        matcher.latency_ms,
+
+      endpoint:
+        `/match?threshold=${MATCHER_THRESHOLD}`,
+
+      matches:
+        matcher.ok
+          ? matcherMatches(matcher.data).length
+          : 0,
+
+      error:
+        matcher.error ||
+        null
+    },
+
+    cloudbet: {
+      ok:
+        cloudbet.ok,
+
+      status:
+        cloudbet.status,
+
+      latency_ms:
+        cloudbet.latency_ms,
+
+      endpoint:
+        CLOUDBET_LIVE_PATH,
+
+      parser:
+        "CLOUDBET /live → events[]",
+
+      events_received:
+        cloudbetParsed.length,
+
+      live_events:
+        cloudbetLive.length,
+
+      target_events:
+        targetDiagnostics.filter(
+          x => x.target_found
+        ).length,
+
+      error:
+        cloudbet.error ||
+        null
+    },
+
+    target_diagnostics:
+      targetDiagnostics,
+
+    processing_ms:
+      Date.now() - started
+  };
 }
 
-// ─── /HEALTH ───────────────────────────────────────────────
 
-function healthResponse(
-  env: Env
-): Response {
+// ============================================================
+// HEALTH
+// ============================================================
+
+function healthResponse(): Response {
   return json({
     success: true,
 
@@ -5348,41 +4465,24 @@ function healthResponse(
     mode:
       MODE,
 
-    betting:
-      "DISABLED",
-
     dry_run:
       DRY_RUN,
 
-    bindings: {
-      TRACKER:
-        !!env.TRACKER,
+    betting_enabled:
+      BETTING_ENABLED,
 
-      MATCHER:
-        !!env.MATCHER,
-
-      CLOUDBET:
-        !!env.CLOUDBET,
-
-      DB:
-        !!env.DB
-    },
-
-    service_timeout_ms:
-      SERVICE_TIMEOUT_MS,
-
-    cloudbet_live_endpoint:
-      CLOUDBET_LIVE_PATH,
-
-    cloudbet_live_parser:
-      "competitions[].events[]",
-
-    exact_target: {
+    target: {
       market:
         TARGET_MARKET,
 
-      submarket:
-        TARGET_SUBMARKET,
+      selection:
+        TARGET_SELECTION,
+
+      market_key:
+        TARGET_MARKET_KEY,
+
+      submarket_key:
+        TARGET_SUBMARKET_KEY,
 
       outcome:
         TARGET_OUTCOME,
@@ -5391,450 +4491,211 @@ function healthResponse(
         TARGET_PARAMS
     },
 
-    run_odds: {
-      mode:
-        "SINGLE_ATTEMPT_THEN_PENDING",
+    cloudbet: {
+      live_endpoint:
+        CLOUDBET_LIVE_PATH,
 
-      max_attempts:
-        1,
+      live_parser:
+        "CLOUDBET /live → events[]",
 
-      delay_ms:
-        0,
+      odds_endpoint:
+        "/event?id=CLOUDBET_EVENT_ID",
 
-      persistent_pending_retry:
-        true
-    },
-
-    direct_cloudbet_fallback: {
-      enabled:
+      persistent_retry:
         true,
 
-      mode:
-        "STRICT_TWO_SIDED_HOME_AWAY",
-
-      uses_existing_live_response:
-        true,
-
-      hard_coded_match:
-        false,
-
-      hard_coded_event:
-        false
-    },
-
-    retry: {
-      max_attempts:
+      max_retries:
         ODDS_EVENT_MAX_RETRIES,
 
-      delay_ms:
+      retry_delay_ms:
         ODDS_EVENT_RETRY_DELAY_MS,
-
-      delay_seconds:
-        ODDS_EVENT_RETRY_DELAY_MS /
-        1000,
 
       retry_same_event:
         true,
 
-      switch_event:
-        false,
+      retry_same_market:
+        true,
 
-      switch_market:
-        false,
-
-      switch_line:
-        false
+      retry_same_line:
+        true
     },
 
-    endpoints: [
-      "/health",
-      "/lines?id=EVENT_ID",
-      "/diagnostic",
-      "/run",
-      "/pending",
-      "/archive"
-    ]
+    status:
+      "OK"
   });
 }
 
-// ─── /PENDING ──────────────────────────────────────────────
 
-async function pendingResponse(
-  env: Env
-): Promise<Response> {
-  try {
-    const result =
-      await env.DB.prepare(`
-        SELECT
-          id,
-          archive_key,
-          signal_match_id,
-          cloudbet_id,
-          match,
-          home,
-          away,
-          entry_minute,
-          market,
-          selection,
-          stake_eur,
-          mode,
-          status,
-          retry_count,
-          missing_count,
-          last_checked_at,
-          next_check_at,
-          created_at,
-          updated_at
-        FROM pending_odds
-        WHERE status = 'PENDING_ODDS'
-        ORDER BY created_at ASC
-      `).all();
+// ============================================================
+// JSON RESPONSE
+// ============================================================
 
-    return json({
-      success: true,
+function json(
+  data: any,
+  status = 200
+): Response {
+  return new Response(
+    JSON.stringify(
+      data,
+      null,
+      2
+    ),
+    {
+      status,
 
-      worker:
-        "cloudbet-bet-worker",
+      headers: {
+        "content-type":
+          "application/json; charset=utf-8",
 
-      version:
-        VERSION,
-
-      status:
-        "PENDING_ODDS",
-
-      count:
-        result.results?.length ??
-        0,
-
-      pending:
-        result.results ??
-        []
-    });
-  } catch (error) {
-    return json(
-      {
-        success: false,
-
-        error:
-          error instanceof Error
-            ? error.message
-            : String(error)
-      },
-      500
-    );
-  }
+        "cache-control":
+          "no-store"
+      }
+    }
+  );
 }
 
-// ─── /ARCHIVE ──────────────────────────────────────────────
 
-async function archiveResponse(
-  env: Env
-): Promise<Response> {
-  try {
-    const totalResult =
-      await env.DB.prepare(`
-        SELECT COUNT(*) AS total
-        FROM hunter_bet_archive
-      `).first();
-
-    const result =
-      await env.DB.prepare(`
-        SELECT
-          id,
-          archive_key,
-          match_id,
-          match,
-          home,
-          away,
-          entry_minute,
-          hunter_score,
-          cloudbet_id,
-          cloudbet_match,
-          matcher_source,
-          matcher_score,
-          cloudbet_combined_score,
-          direction,
-          created_at
-        FROM hunter_bet_archive
-        ORDER BY id DESC
-        LIMIT 200
-      `).all();
-
-    return json({
-      success: true,
-
-      worker:
-        "cloudbet-bet-worker",
-
-      version:
-        VERSION,
-
-      status:
-        "ARCHIVE",
-
-      table:
-        "hunter_bet_archive",
-
-      total:
-        Number(
-          totalResult?.total ??
-            0
-        ),
-
-      returned:
-        result.results?.length ??
-        0,
-
-      archive:
-        result.results ??
-        []
-    });
-  } catch (error) {
-    return json(
-      {
-        success: false,
-
-        error:
-          error instanceof Error
-            ? error.message
-            : String(error)
-      },
-      500
-    );
-  }
-}
-
-// ─── WORKER ────────────────────────────────────────────────
+// ============================================================
+// FETCH ROUTER
+// ============================================================
 
 export default {
   async fetch(
     request: Request,
     env: Env
   ): Promise<Response> {
+
     const url =
       new URL(request.url);
 
-    if (
-      url.pathname === "/" ||
-      url.pathname === "/health"
-    ) {
-      return healthResponse(
-        env
+    const path =
+      url.pathname;
+
+    try {
+      // ------------------------------------------------------
+      // ROOT
+      // ------------------------------------------------------
+
+      if (
+        path === "/" ||
+        path === ""
+      ) {
+        return json({
+          success: true,
+
+          worker:
+            "cloudbet-bet-worker",
+
+          version:
+            VERSION,
+
+          mode:
+            MODE,
+
+          betting_enabled:
+            BETTING_ENABLED,
+
+          endpoints: [
+            "/",
+            "/health",
+            "/run",
+            "/diagnostic"
+          ],
+
+          target: {
+            market:
+              TARGET_MARKET,
+
+            selection:
+              TARGET_SELECTION,
+
+            exact:
+              `${TARGET_MARKET_KEY} / ${TARGET_SUBMARKET_KEY} / ${TARGET_OUTCOME} / ${TARGET_PARAMS}`
+          },
+
+          cloudbet_live:
+            CLOUDBET_LIVE_PATH
+        });
+      }
+
+      // ------------------------------------------------------
+      // HEALTH
+      // ------------------------------------------------------
+
+      if (
+        path === "/health"
+      ) {
+        return healthResponse();
+      }
+
+      // ------------------------------------------------------
+      // DIAGNOSTIC
+      // ------------------------------------------------------
+
+      if (
+        path === "/diagnostic"
+      ) {
+        const result =
+          await runDiagnostic(env);
+
+        return json(result);
+      }
+
+      // ------------------------------------------------------
+      // RUN
+      // ------------------------------------------------------
+
+      if (
+        path === "/run"
+      ) {
+        const result =
+          await runWorker(env);
+
+        return json(result);
+      }
+
+      // ------------------------------------------------------
+      // 404
+      // ------------------------------------------------------
+
+      return json(
+        {
+          success: false,
+
+          worker:
+            "cloudbet-bet-worker",
+
+          version:
+            VERSION,
+
+          error:
+            "Not found",
+
+          path
+        },
+        404
+      );
+
+    } catch (error) {
+      return json(
+        {
+          success: false,
+
+          worker:
+            "cloudbet-bet-worker",
+
+          version:
+            VERSION,
+
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error),
+
+          path
+        },
+        500
       );
     }
-
-    if (
-      url.pathname ===
-      "/diagnostic"
-    ) {
-      if (
-        request.method !==
-        "GET"
-      ) {
-        return json(
-          {
-            success: false,
-            error:
-              "METHOD_NOT_ALLOWED"
-          },
-          405
-        );
-      }
-
-      try {
-        return await diagnosticResponse(
-          env
-        );
-      } catch (error) {
-        return json(
-          {
-            success: false,
-
-            worker:
-              "cloudbet-bet-worker",
-
-            version:
-              VERSION,
-
-            action:
-              "DIAGNOSTIC",
-
-            error:
-              error instanceof Error
-                ? error.message
-                : String(error)
-          },
-          500
-        );
-      }
-    }
-
-    if (
-      url.pathname ===
-      "/lines"
-    ) {
-      if (
-        request.method !==
-        "GET"
-      ) {
-        return json(
-          {
-            success: false,
-            error:
-              "METHOD_NOT_ALLOWED"
-          },
-          405
-        );
-      }
-
-      return linesResponse(
-        env,
-        request
-      );
-    }
-
-    if (
-      url.pathname ===
-      "/run"
-    ) {
-      if (
-        request.method !==
-        "GET"
-      ) {
-        return json(
-          {
-            success: false,
-            error:
-              "METHOD_NOT_ALLOWED"
-          },
-          405
-        );
-      }
-
-      try {
-        return json(
-          await runWorker(
-            env
-          )
-        );
-      } catch (error) {
-        return json(
-          {
-            success: false,
-
-            worker:
-              "cloudbet-bet-worker",
-
-            version:
-              VERSION,
-
-            mode:
-              MODE,
-
-            betting:
-              "DISABLED",
-
-            error:
-              error instanceof Error
-                ? error.message
-                : String(error),
-
-            stack:
-              error instanceof Error
-                ? error.stack
-                : null
-          },
-          500
-        );
-      }
-    }
-
-    if (
-      url.pathname ===
-      "/pending"
-    ) {
-      return pendingResponse(
-        env
-      );
-    }
-
-    if (
-      url.pathname ===
-      "/archive"
-    ) {
-      if (
-        request.method !==
-        "GET"
-      ) {
-        return json(
-          {
-            success: false,
-            error:
-              "METHOD_NOT_ALLOWED"
-          },
-          405
-        );
-      }
-
-      return archiveResponse(
-        env
-      );
-    }
-
-    return json(
-      {
-        success: false,
-
-        error:
-          "NOT_FOUND",
-
-        path:
-          url.pathname,
-
-        available: [
-          "/health",
-          "/lines?id=EVENT_ID",
-          "/diagnostic",
-          "/run",
-          "/pending",
-          "/archive"
-        ]
-      },
-      404
-    );
-  },
-
-  async scheduled(
-    controller: ScheduledController,
-    env: Env,
-    ctx: ExecutionContext
-  ): Promise<void> {
-    ctx.waitUntil(
-      processPending(env)
-        .then(result => {
-          console.log(
-            JSON.stringify({
-              cron: true,
-              version:
-                VERSION,
-              ...result
-            })
-          );
-        })
-        .catch(error => {
-          console.error(
-            JSON.stringify({
-              cron: true,
-              version:
-                VERSION,
-              success: false,
-              error:
-                error instanceof Error
-                  ? error.message
-                  : String(error)
-            })
-          );
-        })
-    );
   }
 };
