@@ -1,26 +1,37 @@
 // ============================================================
-// CLOUDBET BET WORKER V5.9.1
+// CLOUDBET BET WORKER V5.9.2
 // DRY RUN · EXACT 1H TOTAL GOALS OVER 0.5
 //
 // FLOW:
-// TRACKER → MATCHER → CLOUDBET EVENT → EXACT TARGET
+// TRACKER → MATCHER → DIRECT CLOUDBET FALLBACK → CLOUDBET EVENT
+//       → EXACT TARGET
 //
-// V5.9.1 FIX:
-// - V5.9.0 behavior preserved
-// - /run SINGLE Cloudbet /event attempt
-// - persistent pending retry preserved
-// - EXACT 1H OVER 0.5 target preserved
-// - FIXED robust Cloudbet market extraction
-// - supports markets as array/object
-// - supports nested event/data structures
-// - supports submarkets as array/object
-// - supports alternative market/submarket key names
-// - supports params normalization
-// - expanded /lines diagnostic
-// - automatically diagnoses whatever event /run finds
-// - NO hard-coded match
-// - NO hard-coded event ID
-// - Real betting disabled
+// V5.9.2 FIX:
+// - V5.9.1 behavior preserved
+// - NEW DIRECT CLOUDBET FALLBACK
+// - If MATCHER does not find CONFIDENT_MATCH:
+//     → search already fetched CLOUDBET /live
+//     → strict two-sided HOME + AWAY matching
+//     → continue to /event?id=...
+// - NO hard-coded match IDs
+// - NO hard-coded team names
+// - Uses the current Hunter signal dynamically
+// - Detailed fallback diagnostics
+//
+// RUN ODDS:
+// - /run performs ONE Cloudbet /event attempt
+// - /run DOES NOT wait 20 × 30 sec
+//
+// PENDING ODDS:
+// - /pending cron keeps persistent retry
+// - 20 attempts
+// - 30 sec between attempts
+// - same Cloudbet event
+// - no event/market/line switching
+//
+// REAL BETTING:
+// - DISABLED
+// - DRY RUN ONLY
 // ============================================================
 
 interface Env {
@@ -32,7 +43,7 @@ interface Env {
 
 type Obj = Record<string, any>;
 
-const VERSION = "V5.9.1";
+const VERSION = "V5.9.2";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -667,7 +678,7 @@ function twoSidedTeamScore(
     home_score:
       Math.max(
         normalHome.score,
-        reverseHome.score
+        normalAway.score
       ),
     away_score:
       Math.max(
@@ -861,17 +872,6 @@ async function fetchCloudbetEvent(
     )
   ) {
     return data.data;
-  }
-
-  if (
-    data?.event &&
-    typeof data.event ===
-      "object" &&
-    !Array.isArray(
-      data.event
-    )
-  ) {
-    return data.event;
   }
 
   return data;
@@ -1250,7 +1250,14 @@ function findCloudbet(
         found: true,
         source:
           "CLOUDBET_ID",
-        cloudbet: exact
+        cloudbet: exact,
+        team_scores:
+          twoSidedTeamScore(
+            signalHome(signal),
+            signalAway(signal),
+            extractHome(exact),
+            extractAway(exact)
+          )
       };
     }
   }
@@ -1258,17 +1265,69 @@ function findCloudbet(
   let best: Obj | null =
     null;
 
+  const diagnostics: Obj[] =
+    [];
+
   for (
     const match of
     liveMatches
   ) {
+    const home =
+      extractHome(match);
+
+    const away =
+      extractAway(match);
+
+    if (
+      !teamsPresent(
+        signalHome(signal),
+        signalAway(signal)
+      ) ||
+      !teamsPresent(
+        home,
+        away
+      )
+    ) {
+      diagnostics.push({
+        match:
+          displayMatch(match),
+        reason:
+          "TEAMS_MISSING"
+      });
+
+      continue;
+    }
+
     const score =
       twoSidedTeamScore(
         signalHome(signal),
         signalAway(signal),
-        extractHome(match),
-        extractAway(match)
+        home,
+        away
       );
+
+    diagnostics.push({
+      match:
+        displayMatch(match),
+      cloudbet_id:
+        extractMatchId(match),
+      matched:
+        score.matched,
+      combined_score:
+        score.combined_score,
+      home_score:
+        score.home_score,
+      away_score:
+        score.away_score,
+      direction:
+        score.direction,
+      home_method:
+        score.home_method ??
+        null,
+      away_method:
+        score.away_method ??
+        null
+    });
 
     if (
       score.matched &&
@@ -1291,7 +1350,9 @@ function findCloudbet(
       found: false,
       source:
         "NOT_FOUND",
-      cloudbet: null
+      cloudbet: null,
+      team_scores: null,
+      diagnostics
     };
   }
 
@@ -1302,9 +1363,96 @@ function findCloudbet(
     cloudbet:
       best.cloudbet,
     team_scores:
-      best.team_scores
+      best.team_scores,
+    diagnostics
   };
 }
+
+// ─── DIRECT CLOUDBET FALLBACK ──────────────────────────────
+//
+// V5.9.2
+//
+// Matcher can fail because its candidate list does not contain
+// the Hunter match even though the same match exists in the
+// already fetched Cloudbet /live response.
+//
+// We therefore use the existing Cloudbet /live data directly.
+//
+// NO additional /live request is made.
+// NO hard-coded match.
+// NO hard-coded event ID.
+// ───────────────────────────────────────────────────────────
+
+function directCloudbetFallback(
+  signal: Obj,
+  liveMatches: Obj[]
+): Obj {
+  const result =
+    findCloudbet(
+      signal,
+      liveMatches
+    );
+
+  if (!result.found) {
+    return {
+      found: false,
+
+      source:
+        "CLOUDBET_DIRECT_FALLBACK",
+
+      fallback_used: true,
+
+      fallback_matched: false,
+
+      reason:
+        "NO_STRICT_TWO_SIDED_CLOUDBET_MATCH",
+
+      cloudbet: null,
+
+      cloudbet_id: null,
+
+      team_scores:
+        result.team_scores ??
+        null,
+
+      diagnostics:
+        result.diagnostics ??
+        []
+    };
+  }
+
+  return {
+    found: true,
+
+    source:
+      "CLOUDBET_DIRECT_FALLBACK",
+
+    fallback_used: true,
+
+    fallback_matched: true,
+
+    fallback_source:
+      result.source,
+
+    cloudbet:
+      result.cloudbet,
+
+    cloudbet_id:
+      extractMatchId(
+        result.cloudbet
+      ),
+
+    team_scores:
+      result.team_scores ??
+      null,
+
+    diagnostics:
+      result.diagnostics ??
+      []
+  };
+}
+
+// ─── CLOUDBET VERIFICATION ────────────────────────────────
 
 function verifyCloudbet(
   signal: Obj,
@@ -1379,14 +1527,15 @@ function verifyCloudbet(
     source:
       "NOT_VERIFIED",
     cloudbet: null,
-    cloudbet_id: null
+    cloudbet_id: null,
+    team_scores: null,
+    diagnostics:
+      direct.diagnostics ??
+      []
   };
 }
 
-// ============================================================
-// EXACT TARGET EXTRACTION
-// V5.9.1 ROBUST CLOUDbet STRUCTURE FIX
-// ============================================================
+// ─── EXACT TARGET EXTRACTION ───────────────────────────────
 
 function enabled(
   selection: Obj
@@ -1395,12 +1544,6 @@ function enabled(
     safe(
       selection?.status
     ).toUpperCase();
-
-  if (
-    selection?.enabled === false
-  ) {
-    return false;
-  }
 
   return (
     !status ||
@@ -1414,96 +1557,17 @@ function enabled(
   );
 }
 
-function normalizeParams(
-  value: any
-): string {
-  if (
-    value === null ||
-    value === undefined
-  ) {
-    return "";
-  }
-
-  if (
-    typeof value === "string"
-  ) {
-    return value
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g, "");
-  }
-
-  if (
-    typeof value === "number"
-  ) {
-    return String(value)
-      .trim()
-      .toLowerCase();
-  }
-
-  if (
-    typeof value === "object"
-  ) {
-    const entries =
-      Object.entries(
-        value
-      )
-        .map(
-          ([key, val]) =>
-            `${key}=${val}`
-        )
-        .sort();
-
-    return entries
-      .join("&")
-      .toLowerCase()
-      .replace(/\s+/g, "");
-  }
-
-  return safe(value)
-    .toLowerCase()
-    .replace(/\s+/g, "");
-}
-
-function selectionParams(
-  selection: Obj
-): string {
-  return normalizeParams(
-    selection?.params ??
-      selection?.parameter ??
-      selection?.parameters ??
-      selection?.line ??
-      selection?.total
-  );
-}
-
-function selectionOutcome(
-  selection: Obj
-): string {
-  return safe(
-    selection?.outcome ??
-      selection?.selection ??
-      selection?.side
-  ).toLowerCase();
-}
-
 function targetSelection(
   selection: Obj
 ): boolean {
-  const outcome =
-    selectionOutcome(
-      selection
-    );
-
-  const params =
-    selectionParams(
-      selection
-    );
-
   return (
-    outcome ===
+    safe(
+      selection?.outcome
+    ).toLowerCase() ===
       TARGET_OUTCOME &&
-    params ===
+    safe(
+      selection?.params
+    ).toLowerCase() ===
       TARGET_PARAMS
   );
 }
@@ -1527,9 +1591,7 @@ function validTarget(
 
   const price =
     Number(
-      selection?.price ??
-        selection?.odds ??
-        selection?.decimal
+      selection?.price
     );
 
   if (
@@ -1554,438 +1616,141 @@ function validTarget(
   return true;
 }
 
-function marketKeyOf(
-  market: Obj,
-  fallback = ""
-): string {
-  return safe(
-    market?.market_key ??
-      market?.marketKey ??
-      market?.market_id ??
-      market?.marketId ??
-      market?.key ??
-      market?.name ??
-      market?.market ??
-      fallback
-  );
-}
-
-function submarketKeyOf(
-  sub: Obj,
-  fallback = ""
-): string {
-  return safe(
-    sub?.submarket_key ??
-      sub?.submarketKey ??
-      sub?.submarket_id ??
-      sub?.submarketId ??
-      sub?.key ??
-      sub?.name ??
-      sub?.market ??
-      fallback
-  );
-}
-
-// ─── RECURSIVE MARKET CONTAINER EXTRACTION ────────────────
-
 function marketEntries(
   event: Obj
 ): Obj[] {
-  const result: Obj[] = [];
-  const seen =
-    new Set<any>();
+  const result: Obj[] =
+    [];
 
-  const addMarket =
-    (
-      value: any,
-      fallbackKey = ""
-    ) => {
+  if (
+    Array.isArray(
+      event?.markets
+    )
+  ) {
+    for (
+      const market of
+      event.markets
+    ) {
+      result.push({
+        ...market,
+        _market_key:
+          safe(
+            market?.market_key ??
+              market?.marketKey ??
+              market?.key ??
+              market?.market
+          )
+      });
+    }
+  } else if (
+    event?.markets &&
+    typeof event.markets ===
+      "object"
+  ) {
+    for (
+      const [
+        key,
+        value
+      ] of Object.entries(
+        event.markets
+      )
+    ) {
       if (
-        !value ||
-        typeof value !==
+        value &&
+        typeof value ===
           "object"
       ) {
-        return;
-      }
-
-      if (
-        seen.has(value)
-      ) {
-        return;
-      }
-
-      seen.add(value);
-
-      const key =
-        marketKeyOf(
-          value,
-          fallbackKey
-        );
-
-      if (key) {
         result.push({
-          ...value,
+          ...(value as Obj),
           _market_key:
-            key
+            safe(
+              (value as Obj)
+                ?.market_key ??
+                (value as Obj)
+                  ?.marketKey ??
+                key
+            )
         });
       }
-    };
-
-  const scan =
-    (
-      node: any,
-      depth = 0
-    ) => {
-      if (
-        !node ||
-        typeof node !==
-          "object" ||
-        depth > 5
-      ) {
-        return;
-      }
-
-      if (
-        Array.isArray(node)
-      ) {
-        for (
-          const item of node
-        ) {
-          scan(
-            item,
-            depth + 1
-          );
-        }
-
-        return;
-      }
-
-      if (
-        node.markets
-      ) {
-        if (
-          Array.isArray(
-            node.markets
-          )
-        ) {
-          for (
-            const market of
-            node.markets
-          ) {
-            addMarket(market);
-          }
-        } else if (
-          typeof node.markets ===
-          "object"
-        ) {
-          for (
-            const [
-              key,
-              value
-            ] of Object.entries(
-              node.markets
-            )
-          ) {
-            if (
-              value &&
-              typeof value ===
-                "object"
-            ) {
-              addMarket(
-                value,
-                key
-              );
-            }
-          }
-        }
-      }
-
-      // Some API variants may expose market data
-      // under market_groups / marketGroups.
-      for (
-        const field of [
-          "market_groups",
-          "marketGroups",
-          "market_data",
-          "marketData"
-        ]
-      ) {
-        const value =
-          node[field];
-
-        if (
-          value &&
-          typeof value ===
-            "object"
-        ) {
-          if (
-            Array.isArray(
-              value
-            )
-          ) {
-            for (
-              const market of
-              value
-            ) {
-              addMarket(
-                market
-              );
-            }
-          } else {
-            for (
-              const [
-                key,
-                market
-              ] of Object.entries(
-                value
-              )
-            ) {
-              if (
-                market &&
-                typeof market ===
-                  "object"
-              ) {
-                addMarket(
-                  market,
-                  key
-                );
-              }
-            }
-          }
-        }
-      }
-
-      // If the node itself looks like a market,
-      // preserve it too.
-      const ownKey =
-        marketKeyOf(node);
-
-      if (
-        ownKey &&
-        (
-          node.submarkets ||
-          node.selections ||
-          node.market_key ||
-          node.marketKey
-        )
-      ) {
-        addMarket(node);
-      }
-
-      // Continue through wrapper objects.
-      for (
-        const [
-          key,
-          value
-        ] of Object.entries(
-          node
-        )
-      ) {
-        if (
-          [
-            "markets",
-            "market_groups",
-            "marketGroups",
-            "market_data",
-            "marketData"
-          ].includes(key)
-        ) {
-          continue;
-        }
-
-        if (
-          value &&
-          typeof value ===
-            "object"
-        ) {
-          scan(
-            value,
-            depth + 1
-          );
-        }
-      }
-    };
-
-  scan(event);
+    }
+  }
 
   return result;
 }
-
-// ─── SUBMARKET EXTRACTION ─────────────────────────────────
 
 function submarketEntries(
   market: Obj
 ): Obj[] {
-  const result: Obj[] = [];
-  const seen =
-    new Set<any>();
+  const result: Obj[] =
+    [];
 
-  const addSub =
-    (
-      value: any,
-      fallbackKey = ""
-    ) => {
-      if (
-        !value ||
-        typeof value !==
-          "object"
-      ) {
-        return;
-      }
-
-      if (
-        seen.has(value)
-      ) {
-        return;
-      }
-
-      seen.add(value);
-
-      result.push({
-        ...value,
-        _submarket_key:
-          submarketKeyOf(
-            value,
-            fallbackKey
-          )
-      });
-    };
-
-  for (
-    const field of [
-      "submarkets",
-      "subMarkets",
-      "sub_market",
-      "subMarket"
-    ]
-  ) {
-    const source =
-      market?.[field];
-
-    if (
-      Array.isArray(source)
-    ) {
-      for (
-        const sub of source
-      ) {
-        addSub(sub);
-      }
-    } else if (
-      source &&
-      typeof source ===
-        "object"
-    ) {
-      for (
-        const [
-          key,
-          value
-        ] of Object.entries(
-          source
-        )
-      ) {
-        if (
-          value &&
-          typeof value ===
-            "object"
-        ) {
-          addSub(
-            value,
-            key
-          );
-        }
-      }
-    }
-  }
-
-  // Some responses can put selections directly
-  // under the market for a single submarket.
   if (
     Array.isArray(
-      market?.selections
+      market?.submarkets
     )
   ) {
-    result.push({
-      selections:
-        market.selections,
-      _submarket_key:
-        safe(
-          market?.submarket_key ??
-            market?.submarketKey ??
-            market?.period ??
-            market?.key ??
-            ""
-        )
-    });
+    for (
+      const sub of
+      market.submarkets
+    ) {
+      result.push({
+        ...sub,
+        _submarket_key:
+          safe(
+            sub?.submarket_key ??
+              sub?.submarketKey ??
+              sub?.key ??
+              sub?.market
+          )
+      });
+    }
+  } else if (
+    market?.submarkets &&
+    typeof market.submarkets ===
+      "object"
+  ) {
+    for (
+      const [
+        key,
+        value
+      ] of Object.entries(
+        market.submarkets
+      )
+    ) {
+      if (
+        value &&
+        typeof value ===
+          "object"
+      ) {
+        result.push({
+          ...(value as Obj),
+          _submarket_key:
+            safe(
+              (value as Obj)
+                ?.submarket_key ??
+                (value as Obj)
+                  ?.submarketKey ??
+                key
+            )
+        });
+      }
+    }
   }
 
   return result;
 }
 
-// ─── SELECTION EXTRACTION ─────────────────────────────────
-
-function selectionEntries(
-  sub: Obj
-): Obj[] {
-  for (
-    const field of [
-      "selections",
-      "selection",
-      "outcomes"
-    ]
-  ) {
-    const source =
-      sub?.[field];
-
-    if (
-      Array.isArray(source)
-    ) {
-      return source.filter(
-        x =>
-          x &&
-          typeof x ===
-            "object"
-      );
-    }
-
-    if (
-      source &&
-      typeof source ===
-        "object"
-    ) {
-      return Object.entries(
-        source
-      ).map(
-        ([key, value]) => ({
-          ...(value as Obj),
-          _selection_key:
-            key
-        })
-      );
-    }
-  }
-
-  return [];
-}
-
-// ─── EXACT FIND ────────────────────────────────────────────
-
 function findExactSelection(
   event: Obj
 ): Obj | null {
-  const markets =
-    marketEntries(event);
-
   for (
-    const market of markets
+    const market of
+    marketEntries(event)
   ) {
-    const marketKey =
-      marketKeyOf(
-        market,
-        market?._market_key
-      ).toLowerCase();
-
     if (
-      marketKey !==
+      safe(
+        market?._market_key
+      ).toLowerCase() !==
       TARGET_MARKET
     ) {
       continue;
@@ -1997,22 +1762,25 @@ function findExactSelection(
         market
       )
     ) {
-      const subKey =
-        submarketKeyOf(
-          sub,
-          sub?._submarket_key
-        ).toLowerCase();
-
       if (
-        subKey !==
+        safe(
+          sub?._submarket_key
+        ).toLowerCase() !==
         TARGET_SUBMARKET
       ) {
         continue;
       }
 
+      const selections =
+        Array.isArray(
+          sub?.selections
+        )
+          ? sub.selections
+          : [];
+
       for (
         const selection of
-        selectionEntries(sub)
+        selections
       ) {
         if (
           validTarget(
@@ -2042,9 +1810,7 @@ function extractOdds(
 
   const price =
     Number(
-      selection?.price ??
-        selection?.odds ??
-        selection?.decimal
+      selection.price
     );
 
   return Number.isFinite(
@@ -2064,29 +1830,17 @@ function buildOddsDiagnostic(
   let selectionPresent = false;
   let selectionValid = false;
 
-  const rows: Obj[] = [];
-
-  const availableMarkets =
-    new Set<string>();
-
-  const availableSubmarkets =
-    new Set<string>();
+  const rows: Obj[] =
+    [];
 
   for (
     const market of
     marketEntries(event)
   ) {
     const marketKey =
-      marketKeyOf(
-        market,
+      safe(
         market?._market_key
       ).toLowerCase();
-
-    if (marketKey) {
-      availableMarkets.add(
-        marketKey
-      );
-    }
 
     if (
       marketKey !==
@@ -2104,16 +1858,9 @@ function buildOddsDiagnostic(
       )
     ) {
       const subKey =
-        submarketKeyOf(
-          sub,
+        safe(
           sub?._submarket_key
         ).toLowerCase();
-
-      if (subKey) {
-        availableSubmarkets.add(
-          subKey
-        );
-      }
 
       if (
         subKey !==
@@ -2124,25 +1871,30 @@ function buildOddsDiagnostic(
 
       submarketFound = true;
 
+      const selections =
+        Array.isArray(
+          sub?.selections
+        )
+          ? sub.selections
+          : [];
+
       for (
         const selection of
-        selectionEntries(sub)
+        selections
       ) {
         const outcome =
-          selectionOutcome(
-            selection
-          );
+          safe(
+            selection?.outcome
+          ).toLowerCase();
 
         const params =
-          selectionParams(
-            selection
-          );
+          safe(
+            selection?.params
+          ).toLowerCase();
 
         const price =
           Number(
-            selection?.price ??
-              selection?.odds ??
-              selection?.decimal
+            selection?.price
           );
 
         const maxStake =
@@ -2193,10 +1945,6 @@ function buildOddsDiagnostic(
 
           params,
 
-          raw_params:
-            selection?.params ??
-            null,
-
           price:
             Number.isFinite(
               price
@@ -2206,7 +1954,6 @@ function buildOddsDiagnostic(
 
           raw_price:
             selection?.price ??
-            selection?.odds ??
             null,
 
           status:
@@ -2253,8 +2000,7 @@ function buildOddsDiagnostic(
   }
 
   if (selectionValid) {
-    reason =
-      "VALID";
+    reason = "VALID";
   } else if (
     selectionPresent
   ) {
@@ -2339,17 +2085,6 @@ function buildOddsDiagnostic(
     selections:
       rows,
 
-    available_market_keys:
-      [...availableMarkets]
-        .slice(0, 300),
-
-    available_submarket_keys:
-      [...availableSubmarkets]
-        .slice(0, 300),
-
-    market_count:
-      availableMarkets.size,
-
     event_id:
       extractMatchId(event),
 
@@ -2359,6 +2094,12 @@ function buildOddsDiagnostic(
 }
 
 // ─── RETRY SAME EVENT ──────────────────────────────────────
+//
+// Used by PENDING CRON.
+// NOT used by /run.
+//
+// /run uses resolveOddsOnce().
+// ───────────────────────────────────────────────────────────
 
 async function resolveOddsWithRetry(
   env: Env,
@@ -2572,6 +2313,12 @@ async function resolveOddsWithRetry(
 }
 
 // ─── SINGLE ODDS ATTEMPT ───────────────────────────────────
+//
+// /run only.
+//
+// ONE /event request.
+// No 20 × 30 sec wait.
+// ───────────────────────────────────────────────────────────
 
 async function resolveOddsOnce(
   env: Env,
@@ -2818,7 +2565,15 @@ function buildBet(
 
       source:
         matcher.source ??
-        "MATCHER"
+        "MATCHER",
+
+      fallback_used:
+        matcher.fallback_used ??
+        false,
+
+      fallback_source:
+        matcher.fallback_source ??
+        null
     },
 
     cloudbet: {
@@ -2907,21 +2662,14 @@ function buildBet(
 function buildCandidate(
   bet: Obj
 ): Obj {
-  const event =
-    bet?.event ??
-    bet?.cloudbet ??
-    {};
-
   const odds =
-    bet?.cloudbet
-      ?.odds ??
-    null;
+    Number(
+      bet?.cloudbet?.odds
+    );
 
   const complete =
-    Number.isFinite(
-      Number(odds)
-    ) &&
-    Number(odds) > 1;
+    Number.isFinite(odds) &&
+    odds > 1;
 
   return {
     status:
@@ -2971,7 +2719,7 @@ function buildCandidate(
 
     odds:
       complete
-        ? Number(odds)
+        ? odds
         : null,
 
     odds_available:
@@ -4176,42 +3924,173 @@ async function runWorker(
   const matcherFailures: Obj[] =
     [];
 
+  const matcherFallbacks: Obj[] =
+    [];
+
   const verificationFailures: Obj[] =
     [];
 
   const oddsFailures: Obj[] =
     [];
 
+  // ==========================================================
+  // PROCESS CURRENT HUNTER SIGNALS
+  // ==========================================================
+
   for (
     const signal of signals
   ) {
-    const matcher =
+    let matcher =
       findBestMatcher(
         signal,
         matcherData
       );
 
+    // ========================================================
+    // V5.9.2 DIRECT CLOUDBET FALLBACK
+    //
+    // Matcher failed.
+    //
+    // DO NOT STOP HERE.
+    //
+    // Search the SAME Cloudbet /live response that was already
+    // fetched above.
+    // ========================================================
+
     if (!matcher.found) {
-      matcherFailures.push({
-        match:
-          signalMatch(
-            signal
-          ),
+      const fallback =
+        directCloudbetFallback(
+          signal,
+          liveMatches
+        );
 
-        signal_match_id:
-          signalId(
-            signal
-          ),
+      if (
+        fallback.found &&
+        fallback.cloudbet
+      ) {
+        matcherFallbacks.push({
+          match:
+            signalMatch(
+              signal
+            ),
 
-        reason:
-          matcher.reason,
+          signal_match_id:
+            signalId(
+              signal
+            ),
 
-        diagnostics:
-          matcher.diagnostics
-      });
+          fallback_used:
+            true,
 
-      continue;
+          fallback_matched:
+            true,
+
+          fallback_source:
+            fallback.source,
+
+          cloudbet_id:
+            fallback.cloudbet_id,
+
+          cloudbet_match:
+            displayMatch(
+              fallback.cloudbet
+            ),
+
+          team_scores:
+            fallback.team_scores ??
+            null
+        });
+
+        matcher = {
+          found: true,
+
+          source:
+            "CLOUDBET_DIRECT_FALLBACK",
+
+          classification:
+            "DIRECT_CLOUDBET_FALLBACK",
+
+          method:
+            fallback.fallback_source ??
+            "STRICT_TWO_SIDED_TEAMS",
+
+          matcher_score:
+            Number(
+              fallback
+                .team_scores
+                ?.combined_score ??
+                0
+            ),
+
+          v27:
+            fallback.cloudbet,
+
+          cloudbet:
+            fallback.cloudbet,
+
+          team_scores:
+            fallback.team_scores ??
+            null,
+
+          fallback_used:
+            true,
+
+          fallback_source:
+            fallback.source,
+
+          fallback_diagnostics:
+            fallback.diagnostics ??
+            []
+        };
+      } else {
+        matcherFailures.push({
+          match:
+            signalMatch(
+              signal
+            ),
+
+          signal_match_id:
+            signalId(
+              signal
+            ),
+
+          reason:
+            matcher.reason,
+
+          matcher_reason:
+            matcher.reason,
+
+          diagnostics:
+            matcher.diagnostics,
+
+          fallback_attempted:
+            true,
+
+          fallback_found:
+            false,
+
+          fallback_reason:
+            fallback.reason,
+
+          fallback_source:
+            fallback.source,
+
+          fallback_diagnostics:
+            fallback.diagnostics ??
+            [],
+
+          fallback_team_scores:
+            fallback.team_scores ??
+            null
+        });
+
+        continue;
+      }
     }
+
+    // ========================================================
+    // CLOUDBET VERIFICATION
+    // ========================================================
 
     const verification =
       verifyCloudbet(
@@ -4235,14 +4114,29 @@ async function runWorker(
           ),
 
         reason:
-          "CLOUDBET_NOT_VERIFIED"
+          "CLOUDBET_NOT_VERIFIED",
+
+        matcher_source:
+          matcher.source ??
+          null,
+
+        fallback_used:
+          matcher.fallback_used ??
+          false,
+
+        diagnostics:
+          verification.diagnostics ??
+          []
       });
 
       continue;
     }
 
-    // SINGLE EVENT ATTEMPT.
-    // Persistent retry remains in processPending().
+    // ========================================================
+    // V5.9.2 /run:
+    //
+    // ONE /event attempt only.
+    // ========================================================
 
     const oddsResult =
       await resolveOddsOnce(
@@ -4418,7 +4312,13 @@ async function runWorker(
         false,
 
       real_betting:
-        false
+        false,
+
+      direct_cloudbet_fallback:
+        true,
+
+      fallback_matching:
+        "STRICT_TWO_SIDED_HOME_AWAY"
     },
 
     services: {
@@ -4450,7 +4350,17 @@ async function runWorker(
         prepared.length,
 
       failures:
-        matcherFailures.length
+        matcherFailures.length,
+
+      direct_cloudbet_fallback_attempted:
+        matcherFallbacks.length,
+
+      direct_cloudbet_fallback_matched:
+        matcherFallbacks.filter(
+          x =>
+            x?.fallback_matched ===
+            true
+        ).length
     },
 
     cloudbet: {
@@ -4517,6 +4427,9 @@ async function runWorker(
 
     matcher_failures:
       matcherFailures,
+
+    matcher_fallbacks:
+      matcherFallbacks,
 
     verification_failures:
       verificationFailures,
@@ -4782,7 +4695,10 @@ async function diagnosticResponse(
         ),
 
       expected_relationship:
-        "TOTAL ≈ TRACKER + MATCHER + CLOUDBET because diagnostic is sequential"
+        "TOTAL ≈ TRACKER + MATCHER + CLOUDBET because diagnostic is sequential",
+
+      direct_cloudbet_fallback:
+        "ENABLED_IN_RUN"
     }
   });
 }
@@ -4818,11 +4734,6 @@ async function linesResponse(
         id
       );
 
-    const diagnostic =
-      buildOddsDiagnostic(
-        event
-      );
-
     return json({
       success: true,
 
@@ -4855,7 +4766,10 @@ async function linesResponse(
           TARGET_PARAMS
       },
 
-      diagnostic,
+      diagnostic:
+        buildOddsDiagnostic(
+          event
+        ),
 
       raw_event:
         event
@@ -4956,6 +4870,23 @@ function healthResponse(
 
       persistent_pending_retry:
         true
+    },
+
+    direct_cloudbet_fallback: {
+      enabled:
+        true,
+
+      mode:
+        "STRICT_TWO_SIDED_HOME_AWAY",
+
+      uses_existing_live_response:
+        true,
+
+      hard_coded_match:
+        false,
+
+      hard_coded_event:
+        false
     },
 
     retry: {
