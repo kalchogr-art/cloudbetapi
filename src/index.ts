@@ -1,6 +1,6 @@
 // ============================================================
 // CLOUDBET LIVE SOCCER DETECTOR
-// V5.8.2
+// V5.8.3
 //
 // FIX:
 // - Cloudbet /events returns:
@@ -32,7 +32,7 @@ const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
 const VERSION =
-  "V5.8.2";
+  "V5.8.3";
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
@@ -3366,7 +3366,7 @@ async function tradingAccessCheck(
 
 // ============================================================
 // GRAPHQL ACCESS CHECK
-// V5.8.2
+// V5.8.3
 //
 // READ ONLY
 // Official Cloudbet GraphQL endpoint
@@ -3675,6 +3675,105 @@ async function graphqlCheck(
 }
 
 
+
+
+async function graphqlSingleCheck(
+  env: Env,
+  kind: "account" | "bets"
+): Promise<Response> {
+  const started = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CLOUDBET_TIMEOUT_MS);
+
+  const query = kind === "account"
+    ? `query AccountBalances { accountBalances { currency amount } }`
+    : `query Bets($limit: Int) { bets(limit: $limit) { referenceId categoryKey sportsKey eventId eventName marketUrl currency price stake side returnAmount betStatus betErrorCode } }`;
+
+  try {
+    const response = await fetch(CLOUDBET_GRAPHQL_URL, {
+      method: "POST",
+      headers: {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "x-api-key": env.CLOUDBET_API_KEY || ""
+      },
+      body: JSON.stringify({
+        query,
+        variables: kind === "bets" ? { limit: 1 } : undefined
+      }),
+      signal: controller.signal
+    });
+
+    const raw = await response.text();
+    let data: any = null;
+    try { data = raw ? JSON.parse(raw) : null; } catch { data = null; }
+
+    const errors = Array.isArray(data?.errors) ? data.errors : [];
+    const balances = Array.isArray(data?.data?.accountBalances) ? data.data.accountBalances : [];
+    const bets = Array.isArray(data?.data?.bets) ? data.data.bets : [];
+    const graphqlOk = response.ok && !!data && errors.length === 0;
+
+    return json({
+      success: graphqlOk,
+      worker: "cloudbet-live-soccer-detector",
+      version: VERSION,
+      action: kind === "account" ? "GRAPHQL_ACCOUNT_CHECK" : "GRAPHQL_BETS_CHECK",
+      read_only: true,
+      betting: false,
+      api_key_present: !!env.CLOUDBET_API_KEY,
+      endpoint: CLOUDBET_GRAPHQL_URL,
+      request: {
+        method: "POST",
+        operation: kind === "account" ? "accountBalances only" : "bets(limit:1) only"
+      },
+      response: {
+        http_status: response.status,
+        ok: response.ok,
+        elapsed_ms: Date.now() - started,
+        content_type: response.headers.get("content-type")
+      },
+      authentication: {
+        accepted: graphqlOk,
+        graphql_errors: errors
+      },
+      account: kind === "account" ? {
+        balances,
+        balances_count: balances.length,
+        usdt: balances.find((x: AnyObj) => String(x?.currency ?? "").toUpperCase() === "USDT") ?? null
+      } : null,
+      trading: kind === "bets" ? {
+        bets,
+        bets_count: bets.length
+      } : null,
+      raw: data === null ? raw.slice(0, 3000) : data,
+      interpretation: {
+        isolated_query: true,
+        purpose: kind === "account"
+          ? "Tests accountBalances without invoking the bets resolver."
+          : "Tests bets(limit:1) without invoking the accountBalances resolver.",
+        no_bet_placed: true
+      },
+      performance: { total_elapsed_ms: Date.now() - started }
+    });
+  } catch (error) {
+    return json({
+      success: false,
+      worker: "cloudbet-live-soccer-detector",
+      version: VERSION,
+      action: kind === "account" ? "GRAPHQL_ACCOUNT_CHECK" : "GRAPHQL_BETS_CHECK",
+      read_only: true,
+      betting: false,
+      api_key_present: !!env.CLOUDBET_API_KEY,
+      endpoint: CLOUDBET_GRAPHQL_URL,
+      error: error instanceof Error ? error.message : String(error),
+      performance: { total_elapsed_ms: Date.now() - started }
+    }, 500);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+
 // ============================================================
 // MAIN
 // ============================================================
@@ -3729,6 +3828,10 @@ export default {
           "/trading-check",
 
           "/graphql-check",
+
+          "/graphql-account-check",
+
+          "/graphql-bets-check",
 
           "/diagnostic-events-raw",
 
@@ -4184,6 +4287,21 @@ export default {
         env
       );
 
+    }
+
+
+    if (
+      pathname ===
+      "/graphql-account-check"
+    ) {
+      return await graphqlSingleCheck(env, "account");
+    }
+
+    if (
+      pathname ===
+      "/graphql-bets-check"
+    ) {
+      return await graphqlSingleCheck(env, "bets");
     }
 
 
