@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET BET WORKER V6.0.2
+// CLOUDBET BET WORKER V6.0.3
 // DRY RUN · PERSISTENT ODDS RETRY
 // EXACT 1H TOTAL GOALS OVER 0.5
 //
@@ -29,7 +29,7 @@ type Obj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V6.0.2";
+const VERSION = "V6.0.3";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -2136,6 +2136,80 @@ function findTargetSelection(
 
   if (!event) {
     return null;
+  }
+
+  // V6.0.3:
+  // DIRECT EXACT CLOUDBET STRUCTURE
+  //
+  // event.markets[TARGET_MARKET]
+  //   .submarkets[TARGET_SUBMARKET]
+  //   .selections[]
+  //
+  // The previous recursive fallback entered event.markets but did not
+  // iterate arbitrary market-key properties, so the exact target could
+  // exist with a valid price and still be missed.
+  const directMarket =
+    event?.markets?.[
+      TARGET_MARKET_KEY
+    ];
+
+  const directSubmarket =
+    directMarket?.submarkets?.[
+      TARGET_SUBMARKET_KEY
+    ];
+
+  const directSelections =
+    Array.isArray(
+      directSubmarket?.selections
+    )
+      ? directSubmarket.selections
+      : [];
+
+  for (
+    const selection
+    of directSelections
+  ) {
+    if (
+      !isTargetSelection(
+        selection
+      )
+    ) {
+      continue;
+    }
+
+    if (
+      !selectionEnabled(
+        selection
+      )
+    ) {
+      continue;
+    }
+
+    const price =
+      extractPrice(
+        selection
+      );
+
+    if (
+      price === null
+    ) {
+      continue;
+    }
+
+    return {
+      ...selection,
+
+      price,
+
+      market:
+        TARGET_MARKET_KEY,
+
+      submarket:
+        TARGET_SUBMARKET_KEY,
+
+      target:
+        true
+    };
   }
 
   if (
