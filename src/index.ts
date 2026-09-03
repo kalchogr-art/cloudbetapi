@@ -1,6 +1,6 @@
 // ============================================================
 // CLOUDBET LIVE SOCCER DETECTOR
-// V5.7.8
+// V5.7.9
 //
 // FIX:
 // - Cloudbet /events returns:
@@ -9,7 +9,7 @@
 //     competitions[].events[]
 // - TRADING_LIVE is recognized as live
 //
-// NEW V5.7.8:
+// NEW V5.7.9:
 // - /diagnostic-target-market
 // - Inspects every live event
 // - Checks exact target market/submarket/selection
@@ -32,7 +32,7 @@ const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
 const VERSION =
-  "V5.7.8";
+  "V5.7.9";
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
@@ -381,6 +381,9 @@ const TARGET_OUTCOME =
 
 const TARGET_PARAMS =
   "total=0.5";
+
+const TARGET_MARKET_URL =
+  "soccer.total_goals_period_first_half/over?total=0.5";
 
 
 // ============================================================
@@ -2746,6 +2749,201 @@ async function diagnosticTargetMarket(
 }
 
 
+
+// ============================================================
+// LINE FETCH
+// V5.7.9
+// READ ONLY — DOES NOT PLACE A BET
+// ============================================================
+
+async function fetchTargetLine(
+  env: Env,
+  eventId: string
+): Promise<AnyObj> {
+
+  const started =
+    Date.now();
+
+  const url =
+    `${API_BASE}/lines`;
+
+  const body = {
+
+    eventId:
+      String(eventId),
+
+    marketUrl:
+      TARGET_MARKET_URL
+
+  };
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      CLOUDBET_TIMEOUT_MS
+    );
+
+  try {
+
+    const response =
+      await fetch(
+        url,
+        {
+          method:
+            "POST",
+
+          headers: {
+            "accept":
+              "application/json",
+
+            "content-type":
+              "application/json",
+
+            "x-api-key":
+              env.CLOUDBET_API_KEY || ""
+          },
+
+          body:
+            JSON.stringify(body),
+
+          signal:
+            controller.signal
+        }
+      );
+
+    const text =
+      await response.text();
+
+    let data:
+      any = null;
+
+    try {
+
+      data =
+        text
+          ? JSON.parse(text)
+          : null;
+
+    } catch {
+
+      data =
+        null;
+
+    }
+
+    return {
+
+      success:
+        response.ok,
+
+      request: {
+
+        method:
+          "POST",
+
+        endpoint:
+          "/lines",
+
+        eventId:
+          String(eventId),
+
+        marketUrl:
+          TARGET_MARKET_URL
+
+      },
+
+      response: {
+
+        status:
+          response.status,
+
+        ok:
+          response.ok,
+
+        elapsed_ms:
+          Date.now() -
+          started,
+
+        content_type:
+          response.headers.get(
+            "content-type"
+          )
+
+      },
+
+      data,
+
+      raw:
+        data === null
+          ? text.slice(
+              0,
+              3000
+            )
+          : null
+
+    };
+
+  } catch (
+    error
+  ) {
+
+    return {
+
+      success:
+        false,
+
+      request: {
+
+        method:
+          "POST",
+
+        endpoint:
+          "/lines",
+
+        eventId:
+          String(eventId),
+
+        marketUrl:
+          TARGET_MARKET_URL
+
+      },
+
+      response: {
+
+        status:
+          0,
+
+        ok:
+          false,
+
+        elapsed_ms:
+          Date.now() -
+          started
+
+      },
+
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error)
+
+    };
+
+  } finally {
+
+    clearTimeout(
+      timer
+    );
+
+  }
+
+}
+
+
 // ============================================================
 // MAIN
 // ============================================================
@@ -2794,6 +2992,8 @@ export default {
           "/search?q=HOME%20AWAY",
 
           "/event?id=EVENT_ID",
+
+          "/line-test?id=EVENT_ID",
 
           "/diagnostic-events-raw",
 
@@ -3055,6 +3255,134 @@ export default {
       }
 
     }
+
+    // --------------------------------------------------------
+    // LINE TEST
+    // --------------------------------------------------------
+
+    if (
+      pathname ===
+      "/line-test"
+    ) {
+
+      const id =
+        url.searchParams.get(
+          "id"
+        );
+
+      if (!id) {
+
+        return json(
+          {
+
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "LINE_TEST",
+
+            error:
+              "Missing id"
+
+          },
+          400
+        );
+
+      }
+
+      try {
+
+        const result =
+          await fetchTargetLine(
+            env,
+            id
+          );
+
+        return json({
+
+          success:
+            true,
+
+          worker:
+            "cloudbet-live-soccer-detector",
+
+          version:
+            VERSION,
+
+          action:
+            "LINE_TEST",
+
+          read_only:
+            true,
+
+          betting:
+            false,
+
+          target: {
+
+            event_id:
+              id,
+
+            market:
+              TARGET_MARKET,
+
+            submarket:
+              TARGET_SUBMARKET,
+
+            outcome:
+              TARGET_OUTCOME,
+
+            params:
+              TARGET_PARAMS,
+
+            marketUrl:
+              TARGET_MARKET_URL
+
+          },
+
+          line:
+            result
+
+        });
+
+      } catch (
+        error
+      ) {
+
+        return json(
+          {
+
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "LINE_TEST",
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(error)
+
+          },
+          500
+        );
+
+      }
+
+    }
+
 
     if (
       pathname ===
