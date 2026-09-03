@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET BET WORKER V6.0
+// CLOUDBET BET WORKER V6.0.1
 // DRY RUN · PERSISTENT ODDS RETRY
 // EXACT 1H TOTAL GOALS OVER 0.5
 //
@@ -8,6 +8,7 @@
 // - MATCHER V7.1 compatibility: reads v27.id, v27.home/away and scoring.total
 // - Cloudbet ID remains read from matcher.cloudbet.id/event_id
 // - D1 pending_odds compatibility fixed for the existing production schema
+// - Weak matcher fallback removed; insecure candidates now fall through to direct Cloudbet matching
 // - archive_key / market / selection / stake_eur / mode are now written on INSERT
 // - Existing public diagnostic proxies preserved
 // - Persistent retry preserved
@@ -28,7 +29,7 @@ type Obj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V6.0";
+const VERSION = "V6.0.1";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -3931,81 +3932,11 @@ function getMatcherForSignal(
     return best;
   }
 
-  const home =
-    normalizeTeam(
-      signalHome(signal)
-    );
-
-  const away =
-    normalizeTeam(
-      signalAway(signal)
-    );
-
-  let bestFallback:
-    any | null = null;
-
-  let bestScore = 0;
-
-  for (
-    const m
-    of matches
-  ) {
-    const mh =
-      normalizeTeam(
-        matcherHome(m)
-      );
-
-    const ma =
-      normalizeTeam(
-        matcherAway(m)
-      );
-
-    const hs =
-      teamSimilarity(
-        home,
-        mh
-      );
-
-    const as =
-      teamSimilarity(
-        away,
-        ma
-      );
-
-    const score =
-      (hs + as) / 2;
-
-    if (
-      score >
-      bestScore
-    ) {
-      bestScore =
-        score;
-
-      bestFallback = {
-        ...m,
-
-        fallback_score:
-          score,
-
-        match_score:
-          matcherScore(m) ||
-          score
-      };
-    }
-  }
-
-  if (
-    bestFallback &&
-    bestScore >=
-      MATCHER_THRESHOLD &&
-    validateMatcher(
-      bestFallback
-    )
-  ) {
-    return bestFallback;
-  }
-
+  // V6.0.1:
+  // Do NOT accept weak matcher candidates by average fallback similarity.
+  // If there is no exact V27-id match and no secure two-sided matcher result,
+  // return null so runWorker() falls through to directCloudbetFallback(),
+  // which requires TEAM_MATCH_MIN_SCORE on BOTH HOME and AWAY.
   return null;
 }
 
