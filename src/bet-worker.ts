@@ -1,33 +1,36 @@
 // ============================================================
-// CLOUDBET BET WORKER V5.9.2
+// CLOUDBET BET WORKER V5.9.3
 // DRY RUN · EXACT 1H TOTAL GOALS OVER 0.5
 //
 // FLOW:
 // TRACKER → MATCHER → DIRECT CLOUDBET FALLBACK → CLOUDBET EVENT
 //       → EXACT TARGET
 //
-// V5.9.2 FIX:
-// - V5.9.1 behavior preserved
-// - NEW DIRECT CLOUDBET FALLBACK
-// - If MATCHER does not find CONFIDENT_MATCH:
-//     → search already fetched CLOUDBET /live
-//     → strict two-sided HOME + AWAY matching
-//     → continue to /event?id=...
+// V5.9.3 FIX:
+// - V5.9.2 behavior preserved
+// - FIXED PENDING ODDS SAVE:
+//     Cloudbet event ID is preserved from verification
+//     even when /event response itself has no id field
+// - If /run finds the event but target odds are temporarily
+//   missing, the SAME Cloudbet event ID is saved to pending
+// - Pending retry uses SAME EVENT
+// - 20 attempts
+// - 30 sec between attempts
+// - NO event switching
+// - NO market switching
+// - NO line switching
+// - Dynamic Hunter signal
 // - NO hard-coded match IDs
 // - NO hard-coded team names
-// - Uses the current Hunter signal dynamically
-// - Detailed fallback diagnostics
 //
 // RUN ODDS:
 // - /run performs ONE Cloudbet /event attempt
-// - /run DOES NOT wait 20 × 30 sec
+// - If odds are missing → save PENDING_ODDS
 //
 // PENDING ODDS:
-// - /pending cron keeps persistent retry
+// - scheduled process retries SAME Cloudbet event
 // - 20 attempts
 // - 30 sec between attempts
-// - same Cloudbet event
-// - no event/market/line switching
 //
 // REAL BETTING:
 // - DISABLED
@@ -43,7 +46,7 @@ interface Env {
 
 type Obj = Record<string, any>;
 
-const VERSION = "V5.9.2";
+const VERSION = "V5.9.3";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -678,13 +681,35 @@ function twoSidedTeamScore(
     home_score:
       Math.max(
         normalHome.score,
-        normalAway.score
+        reverseHome.score
       ),
     away_score:
       Math.max(
         normalAway.score,
         reverseAway.score
-      )
+      ),
+    normal: {
+      combined_score: normal,
+      home_score:
+        normalHome.score,
+      away_score:
+        normalAway.score,
+      home_method:
+        normalHome.method,
+      away_method:
+        normalAway.method
+    },
+    reverse: {
+      combined_score: reverse,
+      home_score:
+        reverseHome.score,
+      away_score:
+        reverseAway.score,
+      home_method:
+        reverseHome.method,
+      away_method:
+        reverseAway.method
+    }
   };
 }
 
@@ -1369,19 +1394,6 @@ function findCloudbet(
 }
 
 // ─── DIRECT CLOUDBET FALLBACK ──────────────────────────────
-//
-// V5.9.2
-//
-// Matcher can fail because its candidate list does not contain
-// the Hunter match even though the same match exists in the
-// already fetched Cloudbet /live response.
-//
-// We therefore use the existing Cloudbet /live data directly.
-//
-// NO additional /live request is made.
-// NO hard-coded match.
-// NO hard-coded event ID.
-// ───────────────────────────────────────────────────────────
 
 function directCloudbetFallback(
   signal: Obj,
@@ -1396,25 +1408,17 @@ function directCloudbetFallback(
   if (!result.found) {
     return {
       found: false,
-
       source:
         "CLOUDBET_DIRECT_FALLBACK",
-
       fallback_used: true,
-
       fallback_matched: false,
-
       reason:
         "NO_STRICT_TWO_SIDED_CLOUDBET_MATCH",
-
       cloudbet: null,
-
       cloudbet_id: null,
-
       team_scores:
         result.team_scores ??
         null,
-
       diagnostics:
         result.diagnostics ??
         []
@@ -1423,29 +1427,21 @@ function directCloudbetFallback(
 
   return {
     found: true,
-
     source:
       "CLOUDBET_DIRECT_FALLBACK",
-
     fallback_used: true,
-
     fallback_matched: true,
-
     fallback_source:
       result.source,
-
     cloudbet:
       result.cloudbet,
-
     cloudbet_id:
       extractMatchId(
         result.cloudbet
       ),
-
     team_scores:
       result.team_scores ??
       null,
-
     diagnostics:
       result.diagnostics ??
       []
@@ -1715,8 +1711,7 @@ function submarketEntries(
         value
       ] of Object.entries(
         market.submarkets
-      )
-    ) {
+      ) {
       if (
         value &&
         typeof value ===
@@ -2096,9 +2091,11 @@ function buildOddsDiagnostic(
 // ─── RETRY SAME EVENT ──────────────────────────────────────
 //
 // Used by PENDING CRON.
-// NOT used by /run.
 //
-// /run uses resolveOddsOnce().
+// IMPORTANT:
+// The event ID is captured before every request and NEVER
+// changed during retry.
+//
 // ───────────────────────────────────────────────────────────
 
 async function resolveOddsWithRetry(
@@ -2212,7 +2209,16 @@ async function resolveOddsWithRetry(
               attempt,
 
             valid_on_attempt:
-              attempt
+              attempt,
+
+            event_id:
+              eventId,
+
+            same_event:
+              true,
+
+            switched_event:
+              false
           },
 
           attempts_detail:
@@ -2297,7 +2303,16 @@ async function resolveOddsWithRetry(
         attempts.length,
 
       valid_on_attempt:
-        null
+        null,
+
+      event_id:
+        eventId,
+
+      same_event:
+        true,
+
+      switched_event:
+        false
     },
 
     attempts_detail:
@@ -2317,7 +2332,9 @@ async function resolveOddsWithRetry(
 // /run only.
 //
 // ONE /event request.
-// No 20 × 30 sec wait.
+// If odds are unavailable, /run saves the SAME event to
+// pending_odds for persistent retry.
+//
 // ───────────────────────────────────────────────────────────
 
 async function resolveOddsOnce(
@@ -2338,6 +2355,9 @@ async function resolveOddsOnce(
 
       event:
         cloudbet,
+
+      event_id:
+        null,
 
       odds: null,
 
@@ -2376,6 +2396,12 @@ async function resolveOddsOnce(
 
       event,
 
+      // IMPORTANT:
+      // Preserve the verified event ID even if the
+      // /event response does not contain its own id field.
+      event_id:
+        eventId,
+
       odds,
 
       attempts: 1,
@@ -2392,7 +2418,16 @@ async function resolveOddsOnce(
         valid_on_attempt:
           odds !== null
             ? 1
-            : null
+            : null,
+
+        event_id:
+          eventId,
+
+        same_event:
+          true,
+
+        switched_event:
+          false
       },
 
       attempts_detail: [
@@ -2432,6 +2467,9 @@ async function resolveOddsOnce(
       event:
         cloudbet,
 
+      event_id:
+        eventId,
+
       odds: null,
 
       attempts: 1,
@@ -2445,7 +2483,16 @@ async function resolveOddsOnce(
         max_attempts: 1,
         delay_ms: 0,
         attempts_used: 1,
-        valid_on_attempt: null
+        valid_on_attempt: null,
+
+        event_id:
+          eventId,
+
+        same_event:
+          true,
+
+        switched_event:
+          false
       },
 
       attempts_detail: [
@@ -2481,10 +2528,29 @@ function buildBet(
   verification: Obj,
   oddsResult: Obj
 ): Obj {
+  const verificationCloudbet =
+    verification?.cloudbet ??
+    {};
+
   const event =
     oddsResult.event ??
-    verification.cloudbet ??
+    verificationCloudbet ??
     {};
+
+  // IMPORTANT V5.9.3:
+  // Prefer the verified Cloudbet ID.
+  // The /event response may not contain an id.
+  const verifiedCloudbetId =
+    safe(
+      verification?.cloudbet_id
+    ) ||
+    extractMatchId(
+      verificationCloudbet
+    ) ||
+    safe(
+      oddsResult?.event_id
+    ) ||
+    extractMatchId(event);
 
   const odds =
     oddsResult.odds ??
@@ -2578,28 +2644,43 @@ function buildBet(
 
     cloudbet: {
       id:
-        extractMatchId(event),
+        verifiedCloudbetId,
 
       match:
-        displayMatch(event),
+        displayMatch(event) !== "-"
+          ? displayMatch(event)
+          : displayMatch(
+              verificationCloudbet
+            ),
 
       home:
-        extractHome(event),
+        extractHome(event) ||
+        extractHome(
+          verificationCloudbet
+        ),
 
       away:
-        extractAway(event),
+        extractAway(event) ||
+        extractAway(
+          verificationCloudbet
+        ),
 
       status:
         event?.status ??
+        verificationCloudbet?.status ??
         null,
 
       state:
         event?.state ??
+        verificationCloudbet?.state ??
         null,
 
       live:
         isCloudbetLive(
           event
+        ) ||
+        isCloudbetLive(
+          verificationCloudbet
         ),
 
       market:
@@ -2631,6 +2712,9 @@ function buildBet(
 
       source:
         oddsResult.source,
+
+      event_id:
+        verifiedCloudbetId,
 
       attempts:
         oddsResult.attempts,
@@ -2703,6 +2787,9 @@ function buildCandidate(
       null,
 
     cloudbet_id:
+      safe(
+        bet?.cloudbet?.id
+      ) ||
       extractMatchId(
         bet?.cloudbet ??
           {}
@@ -2954,7 +3041,26 @@ async function savePending(
     return {
       success: false,
       error:
-        "CLOUDBET_ID_MISSING"
+        "CLOUDBET_ID_MISSING",
+
+      diagnostic: {
+        signal_match_id:
+          bet?.signal_match_id ??
+          null,
+
+        match:
+          bet?.match ??
+          null,
+
+        verification_event_id:
+          bet?.full_event_fetch
+            ?.event_id ??
+          null,
+
+        cloudbet_object:
+          bet?.cloudbet ??
+          null
+      }
     };
   }
 
@@ -3063,7 +3169,22 @@ async function savePending(
       archive_key:
         archiveKey(bet),
       cloudbet_id:
-        cloudbetId
+        cloudbetId,
+      retry:
+        {
+          max_attempts:
+            ODDS_EVENT_MAX_RETRIES,
+          delay_ms:
+            ODDS_EVENT_RETRY_DELAY_MS,
+          same_event:
+            true,
+          switch_event:
+            false,
+          switch_market:
+            false,
+          switch_line:
+            false
+        }
     };
   } catch (error) {
     return {
@@ -3463,8 +3584,31 @@ async function processPending(
       !cloudbetId
     ) {
       result.errors++;
+
+      result.details.push({
+        id:
+          row?.id ??
+          null,
+
+        cloudbet_id:
+          cloudbetId ||
+          null,
+
+        status:
+          "ERROR",
+
+        reason:
+          "INVALID_PENDING_ROW"
+      });
+
       continue;
     }
+
+    // ========================================================
+    // IMPORTANT:
+    // The pending row stores the SAME Cloudbet event ID.
+    // We do not search for another event here.
+    // ========================================================
 
     const live =
       byId.get(
@@ -3565,10 +3709,29 @@ async function processPending(
       continue;
     }
 
+    // ========================================================
+    // SAME EVENT RETRY
+    //
+    // resolveOddsWithRetry() receives the Cloudbet live object
+    // containing the ORIGINAL pending event ID.
+    //
+    // It will call:
+    //
+    // /event?id=<SAME_ID>
+    //
+    // up to 20 times with 30 sec delay.
+    // ========================================================
+
+    const retryEvent: Obj = {
+      ...live,
+      id:
+        cloudbetId
+    };
+
     const oddsResult =
       await resolveOddsWithRetry(
         env,
-        live
+        retryEvent
       );
 
     if (
@@ -3628,6 +3791,8 @@ async function processPending(
       bet = {};
     }
 
+    // IMPORTANT:
+    // Never replace the original Cloudbet ID.
     bet.cloudbet = {
       ...(bet.cloudbet ??
         {}),
@@ -3663,6 +3828,9 @@ async function processPending(
 
       source:
         oddsResult.source,
+
+      event_id:
+        cloudbetId,
 
       attempts:
         oddsResult.attempts,
@@ -3947,14 +4115,7 @@ async function runWorker(
       );
 
     // ========================================================
-    // V5.9.2 DIRECT CLOUDBET FALLBACK
-    //
-    // Matcher failed.
-    //
-    // DO NOT STOP HERE.
-    //
-    // Search the SAME Cloudbet /live response that was already
-    // fetched above.
+    // DIRECT CLOUDBET FALLBACK
     // ========================================================
 
     if (!matcher.found) {
@@ -4133,9 +4294,11 @@ async function runWorker(
     }
 
     // ========================================================
-    // V5.9.2 /run:
+    // V5.9.3:
+    // ONE /event attempt in /run.
     //
-    // ONE /event attempt only.
+    // If unavailable, the VERIFIED Cloudbet ID is preserved
+    // inside buildBet() and then saved to pending_odds.
     // ========================================================
 
     const oddsResult =
@@ -4159,7 +4322,12 @@ async function runWorker(
           ),
 
         cloudbet_id:
-          verification.cloudbet_id,
+          verification.cloudbet_id ||
+          extractMatchId(
+            verification.cloudbet
+          ) ||
+          oddsResult.event_id ||
+          null,
 
         error:
           oddsResult.error,
@@ -4203,6 +4371,13 @@ async function runWorker(
           ?.odds_available !==
         true
     );
+
+  // ==========================================================
+  // SAVE ALL INCOMPLETE BETS TO PENDING
+  //
+  // V5.9.3:
+  // buildBet() now preserves verification.cloudbet_id.
+  // ==========================================================
 
   const pendingResults: Obj[] =
     [];
@@ -4288,7 +4463,7 @@ async function runWorker(
         0,
 
       retry_same_event:
-        false,
+        true,
 
       persistent_pending_retry:
         true,
@@ -4391,6 +4566,13 @@ async function runWorker(
         pendingResults.filter(
           x =>
             x?.success ===
+            true
+        ).length,
+
+      pending_failed:
+        pendingResults.filter(
+          x =>
+            x?.success !==
             true
         ).length,
 
@@ -4698,7 +4880,10 @@ async function diagnosticResponse(
         "TOTAL ≈ TRACKER + MATCHER + CLOUDBET because diagnostic is sequential",
 
       direct_cloudbet_fallback:
-        "ENABLED_IN_RUN"
+        "ENABLED_IN_RUN",
+
+      pending_retry:
+        "ENABLED"
     }
   });
 }
@@ -4860,7 +5045,7 @@ function healthResponse(
 
     run_odds: {
       mode:
-        "SINGLE_ATTEMPT",
+        "SINGLE_ATTEMPT_THEN_PENDING",
 
       max_attempts:
         1,
