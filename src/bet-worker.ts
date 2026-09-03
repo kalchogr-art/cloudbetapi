@@ -1,15 +1,16 @@
 // ============================================================
-// CLOUDBET BET WORKER V5.9.6
+// CLOUDBET BET WORKER V5.9.7
 // DRY RUN · PERSISTENT ODDS RETRY
 // EXACT 1H TOTAL GOALS OVER 0.5
 //
-// V5.9.6 FIXES:
+// V5.9.7 FIXES:
 // - CLOUDBET binding uses /live
 // - /events remains internal to Cloudbet detector
 // - Exact verified Cloudbet event ID is preserved
 // - Alphanumeric Cloudbet event IDs are supported
 // - /event?id=<EXACT_EVENT_ID> used for odds
 // - Persistent retry: SAME EVENT / SAME MARKET / SAME LINE
+// - Removed last_error dependency from pending_odds D1 SQL
 // - OddsResult uses success consistently
 // - All target constants explicitly defined
 // - No event switching during retry
@@ -31,7 +32,7 @@ type Obj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V5.9.6";
+const VERSION = "V5.9.7";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -118,14 +119,12 @@ const ALLOWED_SIGNAL_TYPE =
 // ============================================================
 
 const TEAM_ALIASES: Record<string, string> = {
-  // Kazakhstan
   "akademia ontustyk":
     "akademiya ontustyk",
 
   "akademiya ontustyk":
     "akademiya ontustyk",
 
-  // Common abbreviations
   "fc":
     "",
 
@@ -153,14 +152,12 @@ const TEAM_ALIASES: Record<string, string> = {
   "fc ":
     "",
 
-  // English
   "united":
     "utd",
 
   "utd":
     "utd",
 
-  // Common transliteration variants
   "shanghai shenhua":
     "shanghai shenhua",
 
@@ -196,7 +193,10 @@ const GENERIC_WORDS = new Set([
 // ============================================================
 
 function safe(value: any): string {
-  if (value === null || value === undefined) {
+  if (
+    value === null ||
+    value === undefined
+  ) {
     return "";
   }
 
@@ -241,7 +241,11 @@ function sleep(
   ms: number
 ): Promise<void> {
   return new Promise(
-    resolve => setTimeout(resolve, ms)
+    resolve =>
+      setTimeout(
+        resolve,
+        ms
+      )
   );
 }
 
@@ -322,7 +326,10 @@ function splitMatch(
     " : "
   ];
 
-  for (const separator of separators) {
+  for (
+    const separator
+    of separators
+  ) {
     const index =
       text
         .toLowerCase()
@@ -333,16 +340,20 @@ function splitMatch(
     if (index >= 0) {
       return {
         home:
-          text.slice(
-            0,
-            index
-          ).trim(),
+          text
+            .slice(
+              0,
+              index
+            )
+            .trim(),
 
         away:
-          text.slice(
-            index +
-            separator.length
-          ).trim()
+          text
+            .slice(
+              index +
+                separator.length
+            )
+            .trim()
       };
     }
   }
@@ -369,7 +380,8 @@ function extractHome(
 
   if (direct) {
     if (
-      typeof direct === "object"
+      typeof direct ===
+      "object"
     ) {
       return safe(
         direct.name ||
@@ -411,7 +423,8 @@ function extractAway(
 
   if (direct) {
     if (
-      typeof direct === "object"
+      typeof direct ===
+      "object"
     ) {
       return safe(
         direct.name ||
@@ -505,8 +518,11 @@ function levenshtein(
   a: string,
   b: string
 ): number {
-  const aa = a || "";
-  const bb = b || "";
+  const aa =
+    a || "";
+
+  const bb =
+    b || "";
 
   if (aa === bb) {
     return 0;
@@ -573,7 +589,9 @@ function levenshtein(
     ];
   }
 
-  return previous[bb.length];
+  return previous[
+    bb.length
+  ];
 }
 
 function characterSimilarity(
@@ -641,8 +659,10 @@ function teamScore(
   const bTokens =
     teamTokens(b);
 
-  if (!aTokens.length ||
-      !bTokens.length) {
+  if (
+    !aTokens.length ||
+    !bTokens.length
+  ) {
     return 0;
   }
 
@@ -654,8 +674,13 @@ function teamScore(
 
   let common = 0;
 
-  for (const token of aSet) {
-    if (bSet.has(token)) {
+  for (
+    const token
+    of aSet
+  ) {
+    if (
+      bSet.has(token)
+    ) {
       common++;
     }
   }
@@ -720,8 +745,10 @@ function twoSidedTeamScore(
     average:
       (home + away) / 2,
     valid:
-      home >= TEAM_MATCH_MIN_SCORE &&
-      away >= TEAM_MATCH_MIN_SCORE
+      home >=
+        TEAM_MATCH_MIN_SCORE &&
+      away >=
+        TEAM_MATCH_MIN_SCORE
   };
 }
 
@@ -823,7 +850,8 @@ async function fetchServiceJSON(
       );
 
     const latency =
-      Date.now() - started;
+      Date.now() -
+      started;
 
     const text =
       await response.text();
@@ -873,9 +901,9 @@ async function fetchServiceJSON(
     };
 
   } catch (error) {
-
     const latency =
-      Date.now() - started;
+      Date.now() -
+      started;
 
     return {
       ok: false,
@@ -909,12 +937,6 @@ async function fetchCloudbetEvent(
     );
   }
 
-  // IMPORTANT:
-  // Cloudbet event IDs may be alphanumeric,
-  // e.g. 18dwh5.
-  //
-  // Do NOT require numeric IDs.
-
   const path =
     `/event?id=${encodeURIComponent(
       eventId
@@ -944,7 +966,8 @@ async function fetchCloudbetEvent(
     data &&
     typeof data === "object" &&
     data.data &&
-    typeof data.data === "object"
+    typeof data.data ===
+      "object"
   ) {
     data =
       data.data;
@@ -1240,7 +1263,9 @@ function validateMatcher(
   }
 
   const score =
-    matcherScore(matcher);
+    matcherScore(
+      matcher
+    );
 
   const classification =
     matcherClassification(
@@ -1256,7 +1281,8 @@ function validateMatcher(
   }
 
   if (
-    score < MIN_MATCHER_SCORE
+    score <
+    MIN_MATCHER_SCORE
   ) {
     return false;
   }
@@ -1290,13 +1316,18 @@ function findBestMatcher(
   let bestScore = 0;
 
   for (
-    const matcher of matches
+    const matcher
+    of matches
   ) {
     const mh =
-      extractHome(matcher);
+      extractHome(
+        matcher
+      );
 
     const ma =
-      extractAway(matcher);
+      extractAway(
+        matcher
+      );
 
     const score =
       twoSidedTeamScore(
@@ -1352,7 +1383,7 @@ function teamSimilarity(
 }
 
 // ============================================================
-// CLOUDbet NORMALIZATION
+// CLOUDBET NORMALIZATION
 // ============================================================
 
 function cloudbetMatches(
@@ -1383,7 +1414,8 @@ function cloudbetMatches(
       data.competitions
     )
   ) {
-    const events: any[] = [];
+    const events: any[] =
+      [];
 
     for (
       const competition
@@ -1410,7 +1442,8 @@ function cloudbetMatches(
       data.data?.competitions
     )
   ) {
-    const events: any[] = [];
+    const events: any[] =
+      [];
 
     for (
       const competition
@@ -1637,8 +1670,7 @@ function findCloudbetById(
             target
         );
       }
-    ) ||
-    null
+    ) || null
   );
 }
 
@@ -1685,7 +1717,6 @@ function verifyCloudbet(
     );
 
   if (matcherEventId) {
-
     const exact =
       findCloudbetById(
         cloudbetLive,
@@ -1959,7 +1990,8 @@ function findTargetSelection(
   // ----------------------------------------------------------
 
   if (
-    event.target_1h_over_05 === true
+    event.target_1h_over_05 ===
+    true
   ) {
     const price =
       Number(
@@ -2004,7 +2036,6 @@ function findTargetSelection(
       const selection
       of event.selections
     ) {
-
       if (
         !isTargetSelection(
           selection
@@ -2065,8 +2096,10 @@ function findTargetSelection(
 
 function searchTargetRecursive(
   value: any,
-  marketContext: string | null,
-  submarketContext: string | null
+  marketContext:
+    string | null,
+  submarketContext:
+    string | null
 ): any | null {
 
   if (
@@ -2080,7 +2113,8 @@ function searchTargetRecursive(
     Array.isArray(value)
   ) {
     for (
-      const item of value
+      const item
+      of value
     ) {
       const found =
         searchTargetRecursive(
@@ -2174,12 +2208,10 @@ function searchTargetRecursive(
       value.selections
     )
   ) {
-
     for (
       const selection
       of value.selections
     ) {
-
       const selectionMarket =
         selection.market ||
         selection.market_key ||
@@ -2269,7 +2301,6 @@ function searchTargetRecursive(
     const key
     of containers
   ) {
-
     const child =
       value[key];
 
@@ -2345,9 +2376,7 @@ function buildOddsDiagnostic(
       ),
 
     match:
-      displayMatch(
-        event
-      ),
+      displayMatch(event),
 
     home:
       cloudbetHome(event),
@@ -2448,7 +2477,6 @@ async function resolveOddsOnce(
   }
 
   try {
-
     const event =
       await fetchCloudbetEvent(
         env,
@@ -2497,8 +2525,7 @@ async function resolveOddsOnce(
         ? error.toJSON()
         : {
             error:
-              error instanceof
-              Error
+              error instanceof Error
                 ? error.message
                 : String(error)
           };
@@ -2511,8 +2538,7 @@ async function resolveOddsOnce(
       event: null,
       diagnostic,
       error:
-        error instanceof
-        Error
+        error instanceof Error
           ? error.message
           : String(error)
     };
@@ -2544,6 +2570,20 @@ async function resolveOddsWithRetry(
 // ============================================================
 // D1 — PENDING ODDS
 // ============================================================
+//
+// IMPORTANT V5.9.7:
+// Existing pending_odds table does NOT contain last_error.
+// Therefore this worker intentionally does NOT reference
+// last_error in any SQL operation.
+//
+// Retry state is preserved with:
+// - retry_count
+// - missing_count
+// - next_check_at
+// - updated_at
+//
+// The error remains in the runtime response only.
+//
 
 interface PendingRow {
   id?: number;
@@ -2555,7 +2595,6 @@ interface PendingRow {
   next_check_at?: string;
   retry_count?: number;
   missing_count?: number;
-  last_error?: string | null;
 }
 
 interface PendingPayload {
@@ -2576,7 +2615,7 @@ function addSecondsISO(
 ): string {
   return new Date(
     Date.now() +
-    seconds * 1000
+      seconds * 1000
   ).toISOString();
 }
 
@@ -2608,16 +2647,16 @@ async function savePending(
 
   const payload:
     PendingPayload = {
-      bet,
-      signal,
-      matcher,
-      cloudbet,
-      odds: oddsResult,
-      diagnostic:
-        buildOddsDiagnostic(
-          cloudbet
-        )
-    };
+    bet,
+    signal,
+    matcher,
+    cloudbet,
+    odds: oddsResult,
+    diagnostic:
+      buildOddsDiagnostic(
+        cloudbet
+      )
+  };
 
   const payloadJson =
     JSON.stringify(
@@ -2640,11 +2679,10 @@ async function savePending(
   const nextCheck =
     addSecondsISO(
       ODDS_EVENT_RETRY_DELAY_MS /
-      1000
+        1000
     );
 
   if (existing) {
-
     await env.DB
       .prepare(`
         UPDATE pending_odds
@@ -2652,8 +2690,7 @@ async function savePending(
           execution_id = ?,
           payload_json = ?,
           updated_at = ?,
-          next_check_at = ?,
-          last_error = ?
+          next_check_at = ?
         WHERE cloudbet_id = ?
       `)
       .bind(
@@ -2661,8 +2698,6 @@ async function savePending(
         payloadJson,
         nowISO(),
         nextCheck,
-        oddsResult.error ||
-          null,
         cloudbetId
       )
       .run();
@@ -2676,7 +2711,7 @@ async function savePending(
       retry_count:
         Number(
           existing.retry_count ||
-          0
+            0
         ),
       next_check_at:
         nextCheck
@@ -2693,10 +2728,9 @@ async function savePending(
         updated_at,
         next_check_at,
         retry_count,
-        missing_count,
-        last_error
+        missing_count
       )
-      VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)
+      VALUES (?, ?, ?, ?, ?, ?, 0, 0)
     `)
     .bind(
       executionId,
@@ -2704,9 +2738,7 @@ async function savePending(
       payloadJson,
       nowISO(),
       nowISO(),
-      nextCheck,
-      oddsResult.error ||
-        null
+      nextCheck
     )
     .run();
 
@@ -2754,7 +2786,8 @@ async function incrementPendingRetry(
 
   const currentRetry =
     Number(
-      row.retry_count || 0
+      row.retry_count ||
+        0
     );
 
   const nextRetry =
@@ -2764,13 +2797,14 @@ async function incrementPendingRetry(
     nextRetry >=
     ODDS_EVENT_MAX_RETRIES
   ) {
-
     await env.DB
       .prepare(`
         DELETE FROM pending_odds
         WHERE id = ?
       `)
-      .bind(row.id)
+      .bind(
+        row.id
+      )
       .run();
 
     return {
@@ -2790,7 +2824,7 @@ async function incrementPendingRetry(
   const nextCheck =
     addSecondsISO(
       ODDS_EVENT_RETRY_DELAY_MS /
-      1000
+        1000
     );
 
   await env.DB
@@ -2799,15 +2833,13 @@ async function incrementPendingRetry(
       SET
         retry_count = ?,
         updated_at = ?,
-        next_check_at = ?,
-        last_error = ?
+        next_check_at = ?
       WHERE id = ?
     `)
     .bind(
       nextRetry,
       nowISO(),
       nextCheck,
-      error,
       row.id
     )
     .run();
@@ -2837,7 +2869,8 @@ async function incrementPendingMissing(
 
   const currentMissing =
     Number(
-      row.missing_count || 0
+      row.missing_count ||
+        0
     );
 
   const nextMissing =
@@ -2847,13 +2880,14 @@ async function incrementPendingMissing(
     nextMissing >=
     MAX_MISSING_CHECKS
   ) {
-
     await env.DB
       .prepare(`
         DELETE FROM pending_odds
         WHERE id = ?
       `)
-      .bind(row.id)
+      .bind(
+        row.id
+      )
       .run();
 
     return {
@@ -2873,7 +2907,7 @@ async function incrementPendingMissing(
   const nextCheck =
     addSecondsISO(
       ODDS_EVENT_RETRY_DELAY_MS /
-      1000
+        1000
     );
 
   await env.DB
@@ -2882,15 +2916,13 @@ async function incrementPendingMissing(
       SET
         missing_count = ?,
         updated_at = ?,
-        next_check_at = ?,
-        last_error = ?
+        next_check_at = ?
       WHERE id = ?
     `)
     .bind(
       nextMissing,
       nowISO(),
       nextCheck,
-      error,
       row.id
     )
     .run();
@@ -2998,7 +3030,9 @@ async function processPending(
 ): Promise<any> {
 
   const rows =
-    await loadPending(env);
+    await loadPending(
+      env
+    );
 
   if (!rows.length) {
     return {
@@ -3017,7 +3051,8 @@ async function processPending(
   let expired = 0;
   let missing = 0;
 
-  const results: any[] = [];
+  const results: any[] =
+    [];
 
   // One /live call for all pending records.
   const liveResponse =
@@ -3027,7 +3062,9 @@ async function processPending(
       SERVICE_TIMEOUT_MS
     );
 
-  if (!liveResponse.ok) {
+  if (
+    !liveResponse.ok
+  ) {
     return {
       success: false,
       pending_found:
@@ -3058,7 +3095,6 @@ async function processPending(
     const event
     of liveMatches
   ) {
-
     const id =
       extractMatchId(
         event
@@ -3083,11 +3119,10 @@ async function processPending(
     const cloudbetId =
       String(
         row.cloudbet_id ||
-        ""
+          ""
       );
 
     if (!cloudbetId) {
-
       const r =
         await incrementPendingRetry(
           env,
@@ -3123,7 +3158,6 @@ async function processPending(
       );
 
     if (!liveEvent) {
-
       const r =
         await incrementPendingMissing(
           env,
@@ -3160,7 +3194,6 @@ async function processPending(
         liveEvent
       )
     ) {
-
       const r =
         await incrementPendingMissing(
           env,
@@ -3213,7 +3246,6 @@ async function processPending(
     if (
       !oddsResult.success
     ) {
-
       const r =
         await incrementPendingRetry(
           env,
@@ -3258,7 +3290,7 @@ async function processPending(
       storedPayload =
         JSON.parse(
           row.payload_json ||
-          "{}"
+            "{}"
         );
     } catch {
       storedPayload = {};
@@ -3272,8 +3304,10 @@ async function processPending(
       ...originalBet,
 
       cloudbet: {
-        ...(originalBet.cloudbet || {}),
-        ...(liveEvent || {}),
+        ...(originalBet.cloudbet ||
+          {}),
+        ...(liveEvent ||
+          {}),
 
         id:
           cloudbetId,
@@ -3283,7 +3317,8 @@ async function processPending(
       },
 
       odds: {
-        ...(originalBet.odds || {}),
+        ...(originalBet.odds ||
+          {}),
         ...oddsResult
       },
 
@@ -3323,7 +3358,6 @@ async function processPending(
     if (
       !archiveResult.success
     ) {
-
       const r =
         await incrementPendingRetry(
           env,
@@ -3362,7 +3396,9 @@ async function processPending(
         DELETE FROM pending_odds
         WHERE id = ?
       `)
-      .bind(row.id)
+      .bind(
+        row.id
+      )
       .run();
 
     completed++;
@@ -3452,7 +3488,6 @@ async function archiveBet(
     null;
 
   try {
-
     await env.DB
       .prepare(`
         INSERT INTO bet_archive (
@@ -3504,7 +3539,6 @@ async function archiveBet(
     };
 
   } catch (error) {
-
     return {
       success: false,
 
@@ -3818,9 +3852,9 @@ function getMatcherForSignal(
   let bestScore = 0;
 
   for (
-    const m of matches
+    const m
+    of matches
   ) {
-
     const mh =
       normalizeTeam(
         extractHome(m)
@@ -3903,7 +3937,6 @@ async function runWorker(
         env
       );
   } catch (error) {
-
     pendingResult = {
       success: false,
 
@@ -4105,10 +4138,17 @@ async function runWorker(
   // RESULTS
   // ----------------------------------------------------------
 
-  const entries: any[] = [];
-  const pending: any[] = [];
-  const skipped: any[] = [];
-  const errors: any[] = [];
+  const entries: any[] =
+    [];
+
+  const pending: any[] =
+    [];
+
+  const skipped: any[] =
+    [];
+
+  const errors: any[] =
+    [];
 
   let targetReady = 0;
   let targetPending = 0;
@@ -4122,7 +4162,6 @@ async function runWorker(
     const signal
     of hunterSignals
   ) {
-
     try {
 
       // ======================================================
@@ -4148,7 +4187,6 @@ async function runWorker(
       }
 
       if (!matcher) {
-
         skipped.push({
           reason:
             "NO_MATCHER",
@@ -4173,7 +4211,6 @@ async function runWorker(
       if (
         !verification.ok
       ) {
-
         skipped.push({
           reason:
             verification.error ||
@@ -4220,7 +4257,6 @@ async function runWorker(
         oddsResult.success &&
         oddsResult.odds != null
       ) {
-
         targetReady++;
 
         const archive =
@@ -4236,7 +4272,6 @@ async function runWorker(
         if (
           !archive.success
         ) {
-
           errors.push({
             type:
               "ARCHIVE_FAILED",
@@ -4317,7 +4352,6 @@ async function runWorker(
       if (
         !pendingResultForBet.success
       ) {
-
         errors.push({
           type:
             "PENDING_SAVE_FAILED",
@@ -4377,7 +4411,6 @@ async function runWorker(
       });
 
     } catch (error) {
-
       errors.push({
         type:
           "SIGNAL_PROCESSING_ERROR",
@@ -4932,7 +4965,6 @@ export default {
         path === "/" ||
         path === ""
       ) {
-
         return json({
           success:
             true,
@@ -4989,7 +5021,6 @@ export default {
       if (
         path === "/diagnostic"
       ) {
-
         const result =
           await runDiagnostic(
             env
@@ -5007,7 +5038,6 @@ export default {
       if (
         path === "/run"
       ) {
-
         const result =
           await runWorker(
             env
