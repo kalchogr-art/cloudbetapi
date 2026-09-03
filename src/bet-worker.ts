@@ -1,27 +1,26 @@
 // ============================================================
-// CLOUDBET BET WORKER V5.9.0
+// CLOUDBET BET WORKER V5.9.1
 // DRY RUN · EXACT 1H TOTAL GOALS OVER 0.5
 //
 // FLOW:
 // TRACKER → MATCHER → CLOUDBET EVENT → EXACT TARGET
 //
-// V5.9.0 FIX:
-// - V5.8.9 behavior preserved
-// - /run service timeout protection
-// - TRACKER / MATCHER / CLOUDBET independently diagnosed
-// - Promise.allSettled() prevents one service from hanging /run
-// - NEW /diagnostic endpoint
-// - /diagnostic calls TRACKER → MATCHER → CLOUDBET sequentially
-// - exact elapsed_ms / HTTP status / response bytes
-// - EXACT target only
-// - /lines diagnostic
+// V5.9.1 FIX:
+// - V5.9.0 behavior preserved
+// - /run SINGLE Cloudbet /event attempt
+// - persistent pending retry preserved
+// - EXACT 1H OVER 0.5 target preserved
+// - FIXED robust Cloudbet market extraction
+// - supports markets as array/object
+// - supports nested event/data structures
+// - supports submarkets as array/object
+// - supports alternative market/submarket key names
+// - supports params normalization
+// - expanded /lines diagnostic
+// - automatically diagnoses whatever event /run finds
+// - NO hard-coded match
+// - NO hard-coded event ID
 // - Real betting disabled
-//
-// IMPORTANT V5.9.0 RUN FIX:
-// - /run uses SINGLE Cloudbet /event attempt
-// - /run DOES NOT wait 20 × 30 sec for odds
-// - processPending() keeps persistent retry:
-//   20 attempts / 30 sec between attempts
 // ============================================================
 
 interface Env {
@@ -33,7 +32,7 @@ interface Env {
 
 type Obj = Record<string, any>;
 
-const VERSION = "V5.9.0";
+const VERSION = "V5.9.1";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -864,6 +863,17 @@ async function fetchCloudbetEvent(
     return data.data;
   }
 
+  if (
+    data?.event &&
+    typeof data.event ===
+      "object" &&
+    !Array.isArray(
+      data.event
+    )
+  ) {
+    return data.event;
+  }
+
   return data;
 }
 
@@ -1373,7 +1383,10 @@ function verifyCloudbet(
   };
 }
 
-// ─── EXACT TARGET EXTRACTION ───────────────────────────────
+// ============================================================
+// EXACT TARGET EXTRACTION
+// V5.9.1 ROBUST CLOUDbet STRUCTURE FIX
+// ============================================================
 
 function enabled(
   selection: Obj
@@ -1382,6 +1395,12 @@ function enabled(
     safe(
       selection?.status
     ).toUpperCase();
+
+  if (
+    selection?.enabled === false
+  ) {
+    return false;
+  }
 
   return (
     !status ||
@@ -1395,17 +1414,96 @@ function enabled(
   );
 }
 
+function normalizeParams(
+  value: any
+): string {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return "";
+  }
+
+  if (
+    typeof value === "string"
+  ) {
+    return value
+      .trim()
+      .toLowerCase()
+      .replace(/\s+/g, "");
+  }
+
+  if (
+    typeof value === "number"
+  ) {
+    return String(value)
+      .trim()
+      .toLowerCase();
+  }
+
+  if (
+    typeof value === "object"
+  ) {
+    const entries =
+      Object.entries(
+        value
+      )
+        .map(
+          ([key, val]) =>
+            `${key}=${val}`
+        )
+        .sort();
+
+    return entries
+      .join("&")
+      .toLowerCase()
+      .replace(/\s+/g, "");
+  }
+
+  return safe(value)
+    .toLowerCase()
+    .replace(/\s+/g, "");
+}
+
+function selectionParams(
+  selection: Obj
+): string {
+  return normalizeParams(
+    selection?.params ??
+      selection?.parameter ??
+      selection?.parameters ??
+      selection?.line ??
+      selection?.total
+  );
+}
+
+function selectionOutcome(
+  selection: Obj
+): string {
+  return safe(
+    selection?.outcome ??
+      selection?.selection ??
+      selection?.side
+  ).toLowerCase();
+}
+
 function targetSelection(
   selection: Obj
 ): boolean {
+  const outcome =
+    selectionOutcome(
+      selection
+    );
+
+  const params =
+    selectionParams(
+      selection
+    );
+
   return (
-    safe(
-      selection?.outcome
-    ).toLowerCase() ===
+    outcome ===
       TARGET_OUTCOME &&
-    safe(
-      selection?.params
-    ).toLowerCase() ===
+    params ===
       TARGET_PARAMS
   );
 }
@@ -1429,7 +1527,9 @@ function validTarget(
 
   const price =
     Number(
-      selection?.price
+      selection?.price ??
+        selection?.odds ??
+        selection?.decimal
     );
 
   if (
@@ -1454,141 +1554,438 @@ function validTarget(
   return true;
 }
 
+function marketKeyOf(
+  market: Obj,
+  fallback = ""
+): string {
+  return safe(
+    market?.market_key ??
+      market?.marketKey ??
+      market?.market_id ??
+      market?.marketId ??
+      market?.key ??
+      market?.name ??
+      market?.market ??
+      fallback
+  );
+}
+
+function submarketKeyOf(
+  sub: Obj,
+  fallback = ""
+): string {
+  return safe(
+    sub?.submarket_key ??
+      sub?.submarketKey ??
+      sub?.submarket_id ??
+      sub?.submarketId ??
+      sub?.key ??
+      sub?.name ??
+      sub?.market ??
+      fallback
+  );
+}
+
+// ─── RECURSIVE MARKET CONTAINER EXTRACTION ────────────────
+
 function marketEntries(
   event: Obj
 ): Obj[] {
-  const result: Obj[] =
-    [];
+  const result: Obj[] = [];
+  const seen =
+    new Set<any>();
 
-  if (
-    Array.isArray(
-      event?.markets
-    )
-  ) {
-    for (
-      const market of
-      event.markets
-    ) {
-      result.push({
-        ...market,
-        _market_key:
-          safe(
-            market?.market_key ??
-              market?.marketKey ??
-              market?.key ??
-              market?.market
-          )
-      });
-    }
-  } else if (
-    event?.markets &&
-    typeof event.markets ===
-      "object"
-  ) {
-    for (
-      const [
-        key,
-        value
-      ] of Object.entries(
-        event.markets
-      )
-    ) {
+  const addMarket =
+    (
+      value: any,
+      fallbackKey = ""
+    ) => {
       if (
-        value &&
-        typeof value ===
+        !value ||
+        typeof value !==
           "object"
       ) {
+        return;
+      }
+
+      if (
+        seen.has(value)
+      ) {
+        return;
+      }
+
+      seen.add(value);
+
+      const key =
+        marketKeyOf(
+          value,
+          fallbackKey
+        );
+
+      if (key) {
         result.push({
-          ...(value as Obj),
+          ...value,
           _market_key:
-            safe(
-              (value as Obj)
-                ?.market_key ??
-                (value as Obj)
-                  ?.marketKey ??
-                key
-            )
+            key
         });
       }
-    }
-  }
+    };
+
+  const scan =
+    (
+      node: any,
+      depth = 0
+    ) => {
+      if (
+        !node ||
+        typeof node !==
+          "object" ||
+        depth > 5
+      ) {
+        return;
+      }
+
+      if (
+        Array.isArray(node)
+      ) {
+        for (
+          const item of node
+        ) {
+          scan(
+            item,
+            depth + 1
+          );
+        }
+
+        return;
+      }
+
+      if (
+        node.markets
+      ) {
+        if (
+          Array.isArray(
+            node.markets
+          )
+        ) {
+          for (
+            const market of
+            node.markets
+          ) {
+            addMarket(market);
+          }
+        } else if (
+          typeof node.markets ===
+          "object"
+        ) {
+          for (
+            const [
+              key,
+              value
+            ] of Object.entries(
+              node.markets
+            )
+          ) {
+            if (
+              value &&
+              typeof value ===
+                "object"
+            ) {
+              addMarket(
+                value,
+                key
+              );
+            }
+          }
+        }
+      }
+
+      // Some API variants may expose market data
+      // under market_groups / marketGroups.
+      for (
+        const field of [
+          "market_groups",
+          "marketGroups",
+          "market_data",
+          "marketData"
+        ]
+      ) {
+        const value =
+          node[field];
+
+        if (
+          value &&
+          typeof value ===
+            "object"
+        ) {
+          if (
+            Array.isArray(
+              value
+            )
+          ) {
+            for (
+              const market of
+              value
+            ) {
+              addMarket(
+                market
+              );
+            }
+          } else {
+            for (
+              const [
+                key,
+                market
+              ] of Object.entries(
+                value
+              )
+            ) {
+              if (
+                market &&
+                typeof market ===
+                  "object"
+              ) {
+                addMarket(
+                  market,
+                  key
+                );
+              }
+            }
+          }
+        }
+      }
+
+      // If the node itself looks like a market,
+      // preserve it too.
+      const ownKey =
+        marketKeyOf(node);
+
+      if (
+        ownKey &&
+        (
+          node.submarkets ||
+          node.selections ||
+          node.market_key ||
+          node.marketKey
+        )
+      ) {
+        addMarket(node);
+      }
+
+      // Continue through wrapper objects.
+      for (
+        const [
+          key,
+          value
+        ] of Object.entries(
+          node
+        )
+      ) {
+        if (
+          [
+            "markets",
+            "market_groups",
+            "marketGroups",
+            "market_data",
+            "marketData"
+          ].includes(key)
+        ) {
+          continue;
+        }
+
+        if (
+          value &&
+          typeof value ===
+            "object"
+        ) {
+          scan(
+            value,
+            depth + 1
+          );
+        }
+      }
+    };
+
+  scan(event);
 
   return result;
 }
+
+// ─── SUBMARKET EXTRACTION ─────────────────────────────────
 
 function submarketEntries(
   market: Obj
 ): Obj[] {
-  const result: Obj[] =
-    [];
+  const result: Obj[] = [];
+  const seen =
+    new Set<any>();
 
-  if (
-    Array.isArray(
-      market?.submarkets
-    )
-  ) {
-    for (
-      const sub of
-      market.submarkets
-    ) {
-      result.push({
-        ...sub,
-        _submarket_key:
-          safe(
-            sub?.submarket_key ??
-              sub?.submarketKey ??
-              sub?.key ??
-              sub?.market
-          )
-      });
-    }
-  } else if (
-    market?.submarkets &&
-    typeof market.submarkets ===
-      "object"
-  ) {
-    for (
-      const [
-        key,
-        value
-      ] of Object.entries(
-        market.submarkets
-      )
-    ) {
+  const addSub =
+    (
+      value: any,
+      fallbackKey = ""
+    ) => {
       if (
-        value &&
-        typeof value ===
+        !value ||
+        typeof value !==
           "object"
       ) {
-        result.push({
-          ...(value as Obj),
-          _submarket_key:
-            safe(
-              (value as Obj)
-                ?.submarket_key ??
-                (value as Obj)
-                  ?.submarketKey ??
-                key
-            )
-        });
+        return;
+      }
+
+      if (
+        seen.has(value)
+      ) {
+        return;
+      }
+
+      seen.add(value);
+
+      result.push({
+        ...value,
+        _submarket_key:
+          submarketKeyOf(
+            value,
+            fallbackKey
+          )
+      });
+    };
+
+  for (
+    const field of [
+      "submarkets",
+      "subMarkets",
+      "sub_market",
+      "subMarket"
+    ]
+  ) {
+    const source =
+      market?.[field];
+
+    if (
+      Array.isArray(source)
+    ) {
+      for (
+        const sub of source
+      ) {
+        addSub(sub);
+      }
+    } else if (
+      source &&
+      typeof source ===
+        "object"
+    ) {
+      for (
+        const [
+          key,
+          value
+        ] of Object.entries(
+          source
+        )
+      ) {
+        if (
+          value &&
+          typeof value ===
+            "object"
+        ) {
+          addSub(
+            value,
+            key
+          );
+        }
       }
     }
+  }
+
+  // Some responses can put selections directly
+  // under the market for a single submarket.
+  if (
+    Array.isArray(
+      market?.selections
+    )
+  ) {
+    result.push({
+      selections:
+        market.selections,
+      _submarket_key:
+        safe(
+          market?.submarket_key ??
+            market?.submarketKey ??
+            market?.period ??
+            market?.key ??
+            ""
+        )
+    });
   }
 
   return result;
 }
 
+// ─── SELECTION EXTRACTION ─────────────────────────────────
+
+function selectionEntries(
+  sub: Obj
+): Obj[] {
+  for (
+    const field of [
+      "selections",
+      "selection",
+      "outcomes"
+    ]
+  ) {
+    const source =
+      sub?.[field];
+
+    if (
+      Array.isArray(source)
+    ) {
+      return source.filter(
+        x =>
+          x &&
+          typeof x ===
+            "object"
+      );
+    }
+
+    if (
+      source &&
+      typeof source ===
+        "object"
+    ) {
+      return Object.entries(
+        source
+      ).map(
+        ([key, value]) => ({
+          ...(value as Obj),
+          _selection_key:
+            key
+        })
+      );
+    }
+  }
+
+  return [];
+}
+
+// ─── EXACT FIND ────────────────────────────────────────────
+
 function findExactSelection(
   event: Obj
 ): Obj | null {
+  const markets =
+    marketEntries(event);
+
   for (
-    const market of
-    marketEntries(event)
+    const market of markets
   ) {
-    if (
-      safe(
+    const marketKey =
+      marketKeyOf(
+        market,
         market?._market_key
-      ).toLowerCase() !==
+      ).toLowerCase();
+
+    if (
+      marketKey !==
       TARGET_MARKET
     ) {
       continue;
@@ -1600,25 +1997,22 @@ function findExactSelection(
         market
       )
     ) {
-      if (
-        safe(
+      const subKey =
+        submarketKeyOf(
+          sub,
           sub?._submarket_key
-        ).toLowerCase() !==
+        ).toLowerCase();
+
+      if (
+        subKey !==
         TARGET_SUBMARKET
       ) {
         continue;
       }
 
-      const selections =
-        Array.isArray(
-          sub?.selections
-        )
-          ? sub.selections
-          : [];
-
       for (
         const selection of
-        selections
+        selectionEntries(sub)
       ) {
         if (
           validTarget(
@@ -1648,7 +2042,9 @@ function extractOdds(
 
   const price =
     Number(
-      selection.price
+      selection?.price ??
+        selection?.odds ??
+        selection?.decimal
     );
 
   return Number.isFinite(
@@ -1668,17 +2064,29 @@ function buildOddsDiagnostic(
   let selectionPresent = false;
   let selectionValid = false;
 
-  const rows: Obj[] =
-    [];
+  const rows: Obj[] = [];
+
+  const availableMarkets =
+    new Set<string>();
+
+  const availableSubmarkets =
+    new Set<string>();
 
   for (
     const market of
     marketEntries(event)
   ) {
     const marketKey =
-      safe(
+      marketKeyOf(
+        market,
         market?._market_key
       ).toLowerCase();
+
+    if (marketKey) {
+      availableMarkets.add(
+        marketKey
+      );
+    }
 
     if (
       marketKey !==
@@ -1696,9 +2104,16 @@ function buildOddsDiagnostic(
       )
     ) {
       const subKey =
-        safe(
+        submarketKeyOf(
+          sub,
           sub?._submarket_key
         ).toLowerCase();
+
+      if (subKey) {
+        availableSubmarkets.add(
+          subKey
+        );
+      }
 
       if (
         subKey !==
@@ -1709,30 +2124,25 @@ function buildOddsDiagnostic(
 
       submarketFound = true;
 
-      const selections =
-        Array.isArray(
-          sub?.selections
-        )
-          ? sub.selections
-          : [];
-
       for (
         const selection of
-        selections
+        selectionEntries(sub)
       ) {
         const outcome =
-          safe(
-            selection?.outcome
-          ).toLowerCase();
+          selectionOutcome(
+            selection
+          );
 
         const params =
-          safe(
-            selection?.params
-          ).toLowerCase();
+          selectionParams(
+            selection
+          );
 
         const price =
           Number(
-            selection?.price
+            selection?.price ??
+              selection?.odds ??
+              selection?.decimal
           );
 
         const maxStake =
@@ -1783,6 +2193,10 @@ function buildOddsDiagnostic(
 
           params,
 
+          raw_params:
+            selection?.params ??
+            null,
+
           price:
             Number.isFinite(
               price
@@ -1792,6 +2206,7 @@ function buildOddsDiagnostic(
 
           raw_price:
             selection?.price ??
+            selection?.odds ??
             null,
 
           status:
@@ -1838,7 +2253,8 @@ function buildOddsDiagnostic(
   }
 
   if (selectionValid) {
-    reason = "VALID";
+    reason =
+      "VALID";
   } else if (
     selectionPresent
   ) {
@@ -1923,6 +2339,17 @@ function buildOddsDiagnostic(
     selections:
       rows,
 
+    available_market_keys:
+      [...availableMarkets]
+        .slice(0, 300),
+
+    available_submarket_keys:
+      [...availableSubmarkets]
+        .slice(0, 300),
+
+    market_count:
+      availableMarkets.size,
+
     event_id:
       extractMatchId(event),
 
@@ -1932,12 +2359,6 @@ function buildOddsDiagnostic(
 }
 
 // ─── RETRY SAME EVENT ──────────────────────────────────────
-//
-// Used by PENDING CRON.
-// NOT used by /run.
-//
-// /run uses resolveOddsOnce() below.
-// ───────────────────────────────────────────────────────────
 
 async function resolveOddsWithRetry(
   env: Env,
@@ -2151,17 +2572,6 @@ async function resolveOddsWithRetry(
 }
 
 // ─── SINGLE ODDS ATTEMPT ───────────────────────────────────
-//
-// V5.9.0 FIX.
-//
-// Used by /run so the HTTP request cannot be held for
-// approximately 9.5 minutes by the persistent retry.
-//
-// If the exact target is not available on this attempt,
-// /run returns immediately and savePending() stores it.
-//
-// Persistent retry remains in processPending().
-// ───────────────────────────────────────────────────────────
 
 async function resolveOddsOnce(
   env: Env,
@@ -2497,14 +2907,21 @@ function buildBet(
 function buildCandidate(
   bet: Obj
 ): Obj {
+  const event =
+    bet?.event ??
+    bet?.cloudbet ??
+    {};
+
   const odds =
-    extractOdds(
-      bet?.cloudbet ??
-        {}
-    );
+    bet?.cloudbet
+      ?.odds ??
+    null;
 
   const complete =
-    odds !== null;
+    Number.isFinite(
+      Number(odds)
+    ) &&
+    Number(odds) > 1;
 
   return {
     status:
@@ -2552,16 +2969,19 @@ function buildCandidate(
     stake_eur:
       BET_STAKE_EUR,
 
-    odds,
+    odds:
+      complete
+        ? Number(odds)
+        : null,
 
     odds_available:
-      odds !== null,
+      complete,
 
     candidate_complete:
       complete,
 
     odds_source:
-      odds !== null
+      complete
         ? "CLOUDBET_EVENT"
         : null,
 
@@ -3397,8 +3817,6 @@ async function processPending(
       continue;
     }
 
-    // IMPORTANT:
-    // Persistent retry is intentionally preserved here.
     const oddsResult =
       await resolveOddsWithRetry(
         env,
@@ -3823,16 +4241,8 @@ async function runWorker(
       continue;
     }
 
-    // ========================================================
-    // V5.9.0 FIX:
-    //
-    // DO NOT use resolveOddsWithRetry() here.
-    //
-    // One /run request must not wait:
-    // 20 attempts × 30 seconds.
-    //
-    // One Cloudbet event request only.
-    // ========================================================
+    // SINGLE EVENT ATTEMPT.
+    // Persistent retry remains in processPending().
 
     const oddsResult =
       await resolveOddsOnce(
@@ -4408,6 +4818,11 @@ async function linesResponse(
         id
       );
 
+    const diagnostic =
+      buildOddsDiagnostic(
+        event
+      );
+
     return json({
       success: true,
 
@@ -4440,10 +4855,7 @@ async function linesResponse(
           TARGET_PARAMS
       },
 
-      diagnostic:
-        buildOddsDiagnostic(
-          event
-        ),
+      diagnostic,
 
       raw_event:
         event
