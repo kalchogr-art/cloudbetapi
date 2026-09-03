@@ -1,21 +1,16 @@
 // ============================================================
-// CLOUDBET BET WORKER V5.9.7
+// CLOUDBET BET WORKER V5.9.8
 // DRY RUN · PERSISTENT ODDS RETRY
 // EXACT 1H TOTAL GOALS OVER 0.5
 //
-// V5.9.7 FIXES:
-// - CLOUDBET binding uses /live
-// - /events remains internal to Cloudbet detector
-// - Exact verified Cloudbet event ID is preserved
-// - Alphanumeric Cloudbet event IDs are supported
-// - /event?id=<EXACT_EVENT_ID> used for odds
-// - Persistent retry: SAME EVENT / SAME MARKET / SAME LINE
-// - Removed last_error dependency from pending_odds D1 SQL
-// - OddsResult uses success consistently
-// - All target constants explicitly defined
-// - No event switching during retry
-// - No market switching during retry
-// - No line switching during retry
+// V5.9.8:
+// - PUBLIC /entries diagnostic proxy -> TRACKER /entries
+// - PUBLIC /match diagnostic proxy -> MATCHER /match
+// - /diagnostic exposes raw Tracker signals
+// - /diagnostic exposes Hunter filter diagnostics
+// - Existing V5.9.7 betting/odds logic preserved
+// - Persistent retry preserved
+// - SAME EVENT / SAME MARKET / SAME LINE
 // - REAL BETTING DISABLED
 // ============================================================
 
@@ -32,7 +27,7 @@ type Obj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V5.9.7";
+const VERSION = "V5.9.8";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -66,11 +61,6 @@ const TARGET_SUBMARKET_KEY =
   TARGET_SUBMARKET;
 
 // CLOUDBET SERVICE BINDING
-//
-// IMPORTANT:
-// The detector exposes /live.
-// The detector itself internally calls Cloudbet /events.
-
 const CLOUDBET_LIVE_PATH =
   "/live";
 
@@ -1030,11 +1020,20 @@ function extractSignals(
   return [];
 }
 
-function isHunterEntry(
+// ============================================================
+// HUNTER FILTER
+// ============================================================
+
+function hunterFilterDiagnostic(
   signal: any
-): boolean {
+): any {
+
   if (!signal) {
-    return false;
+    return {
+      accepted: false,
+      reason:
+        "SIGNAL_NULL"
+    };
   }
 
   const status =
@@ -1044,49 +1043,118 @@ function isHunterEntry(
       ""
     ).toUpperCase();
 
-  if (
-    status &&
-    ![
+  const home =
+    signal.home ||
+    signal.home_team ||
+    signal.home_name ||
+    "";
+
+  const away =
+    signal.away ||
+    signal.away_team ||
+    signal.away_name ||
+    "";
+
+  const minuteRaw =
+    signal.entry_minute ??
+    signal.minute ??
+    signal.elapsed ??
+    0;
+
+  const minute =
+    Number(minuteRaw);
+
+  const statusValid =
+    !status ||
+    [
       "ENTRY",
       "SIGNAL",
       "TRACKING",
       "ACTIVE",
       "HUNTER"
-    ].includes(status)
-  ) {
-    return false;
-  }
+    ].includes(status);
 
-  const home =
-    signal.home ||
-    signal.home_team ||
-    signal.home_name;
-
-  const away =
-    signal.away ||
-    signal.away_team ||
-    signal.away_name;
-
-  if (!home || !away) {
-    return false;
-  }
-
-  const minute =
-    Number(
-      signal.entry_minute ??
-      signal.minute ??
-      signal.elapsed ??
-      0
+  const teamsValid =
+    Boolean(
+      home &&
+      away
     );
 
-  if (
-    Number.isFinite(minute) &&
-    minute > 45
-  ) {
-    return false;
+  const minuteValid =
+    !(
+      Number.isFinite(minute) &&
+      minute > 45
+    );
+
+  let reason =
+    "ACCEPTED";
+
+  if (!statusValid) {
+    reason =
+      "INVALID_STATUS";
+  } else if (!teamsValid) {
+    reason =
+      "TEAMS_MISSING";
+  } else if (!minuteValid) {
+    reason =
+      "MINUTE_OVER_45";
   }
 
-  return true;
+  return {
+    accepted:
+      statusValid &&
+      teamsValid &&
+      minuteValid,
+
+    reason,
+
+    signal_type:
+      signal?.signal_type ??
+      signal?.type ??
+      signal?.entry_type ??
+      null,
+
+    status,
+
+    home:
+      safe(home),
+
+    away:
+      safe(away),
+
+    match:
+      signalMatch(signal),
+
+    match_id:
+      signal?.match_id ??
+      signal?.id ??
+      null,
+
+    entry_minute:
+      signal?.entry_minute ??
+      null,
+
+    minute:
+      signal?.minute ??
+      null,
+
+    elapsed:
+      signal?.elapsed ??
+      null,
+
+    hunter_score:
+      signal?.hunter_score ??
+      signal?.score ??
+      null
+  };
+}
+
+function isHunterEntry(
+  signal: any
+): boolean {
+  return hunterFilterDiagnostic(
+    signal
+  ).accepted;
 }
 
 function signalId(
@@ -1367,10 +1435,6 @@ function findBestMatcher(
 
   return best;
 }
-
-// ============================================================
-// TEAM SIMILARITY
-// ============================================================
 
 function teamSimilarity(
   a: string,
@@ -1707,10 +1771,6 @@ function verifyCloudbet(
     };
   }
 
-  // ----------------------------------------------------------
-  // MATCHER-PROVIDED EVENT ID
-  // ----------------------------------------------------------
-
   const matcherEventId =
     matcherCloudbet(
       matcher
@@ -1768,10 +1828,6 @@ function verifyCloudbet(
       }
     };
   }
-
-  // ----------------------------------------------------------
-  // DIRECT FALLBACK
-  // ----------------------------------------------------------
 
   const fallback =
     directCloudbetFallback(
@@ -1985,10 +2041,6 @@ function findTargetSelection(
     return null;
   }
 
-  // ----------------------------------------------------------
-  // NORMALIZED TARGET
-  // ----------------------------------------------------------
-
   if (
     event.target_1h_over_05 ===
     true
@@ -2022,10 +2074,6 @@ function findTargetSelection(
       };
     }
   }
-
-  // ----------------------------------------------------------
-  // STANDARD SELECTIONS
-  // ----------------------------------------------------------
 
   if (
     Array.isArray(
@@ -2078,10 +2126,6 @@ function findTargetSelection(
       };
     }
   }
-
-  // ----------------------------------------------------------
-  // RECURSIVE RAW SEARCH
-  // ----------------------------------------------------------
 
   return searchTargetRecursive(
     event,
@@ -2166,10 +2210,6 @@ function searchTargetRecursive(
       currentSubmarket
     );
 
-  // ----------------------------------------------------------
-  // CURRENT OBJECT AS SELECTION
-  // ----------------------------------------------------------
-
   if (
     marketMatches &&
     submarketMatches &&
@@ -2198,10 +2238,6 @@ function searchTargetRecursive(
       }
     }
   }
-
-  // ----------------------------------------------------------
-  // SELECTIONS
-  // ----------------------------------------------------------
 
   if (
     Array.isArray(
@@ -2284,10 +2320,6 @@ function searchTargetRecursive(
     }
   }
 
-  // ----------------------------------------------------------
-  // COMMON NESTED CONTAINERS
-  // ----------------------------------------------------------
-
   const containers = [
     "markets",
     "odds",
@@ -2335,7 +2367,7 @@ function searchTargetRecursive(
 }
 
 // ============================================================
-// ODDS EXTRACTION
+// ODDS
 // ============================================================
 
 function extractOdds(
@@ -2355,10 +2387,6 @@ function extractOdds(
     target
   );
 }
-
-// ============================================================
-// ODDS DIAGNOSTIC
-// ============================================================
 
 function buildOddsDiagnostic(
   event: any
@@ -2429,7 +2457,7 @@ function buildOddsDiagnostic(
 }
 
 // ============================================================
-// EXACT ODDS RESULT
+// ODDS RESULT
 // ============================================================
 
 interface OddsResult {
@@ -2449,9 +2477,6 @@ async function resolveOddsOnce(
   env: Env,
   cloudbet: Obj
 ): Promise<OddsResult> {
-
-  // IMPORTANT:
-  // Preserve the exact verified Cloudbet event ID.
 
   const eventId =
     extractMatchId(
@@ -2545,17 +2570,6 @@ async function resolveOddsOnce(
   }
 }
 
-// ============================================================
-// ODDS RETRY
-// ============================================================
-//
-// One attempt only.
-//
-// Persistent retry is handled by pending_odds.
-//
-// /run does NOT wait for 20 attempts.
-//
-
 async function resolveOddsWithRetry(
   env: Env,
   cloudbet: Obj
@@ -2570,20 +2584,6 @@ async function resolveOddsWithRetry(
 // ============================================================
 // D1 — PENDING ODDS
 // ============================================================
-//
-// IMPORTANT V5.9.7:
-// Existing pending_odds table does NOT contain last_error.
-// Therefore this worker intentionally does NOT reference
-// last_error in any SQL operation.
-//
-// Retry state is preserved with:
-// - retry_count
-// - missing_count
-// - next_check_at
-// - updated_at
-//
-// The error remains in the runtime response only.
-//
 
 interface PendingRow {
   id?: number;
@@ -2753,10 +2753,6 @@ async function savePending(
       nextCheck
   };
 }
-
-// ============================================================
-// PENDING RETRY HELPERS
-// ============================================================
 
 async function loadPending(
   env: Env
@@ -2974,7 +2970,6 @@ function pendingValid(
     score === "0:0" ||
     score === "0 - 0"
   ) {
-    // still valid
   } else if (score) {
     return false;
   }
@@ -3015,15 +3010,6 @@ function pendingValid(
 // ============================================================
 // PENDING RETRY
 // ============================================================
-//
-// CRITICAL:
-//
-// - SAME Cloudbet event ID
-// - NO event switching
-// - NO market switching
-// - NO line switching
-// - EXACT 1H OVER 0.5
-// ============================================================
 
 async function processPending(
   env: Env
@@ -3054,7 +3040,6 @@ async function processPending(
   const results: any[] =
     [];
 
-  // One /live call for all pending records.
   const liveResponse =
     await fetchServiceJSON(
       env.CLOUDBET,
@@ -3148,10 +3133,6 @@ async function processPending(
       continue;
     }
 
-    // ========================================================
-    // SAME EVENT ID ONLY
-    // ========================================================
-
     const liveEvent =
       liveById.get(
         cloudbetId
@@ -3225,7 +3206,6 @@ async function processPending(
       continue;
     }
 
-    // Force the verified original event ID.
     const retryEvent = {
       ...liveEvent,
 
@@ -3236,7 +3216,6 @@ async function processPending(
         cloudbetId
     };
 
-    // EXACT SAME EVENT.
     const oddsResult =
       await resolveOddsWithRetry(
         env,
@@ -3278,10 +3257,6 @@ async function processPending(
 
       continue;
     }
-
-    // ========================================================
-    // ODDS FOUND
-    // ========================================================
 
     let storedPayload:
       PendingPayload = {};
@@ -3786,10 +3761,6 @@ function getMatcherForSignal(
       ""
     );
 
-  // ----------------------------------------------------------
-  // DIRECT SOURCE ID
-  // ----------------------------------------------------------
-
   const direct =
     matches.find(
       (m: any) => {
@@ -3815,10 +3786,6 @@ function getMatcherForSignal(
     return direct;
   }
 
-  // ----------------------------------------------------------
-  // BEST MATCH
-  // ----------------------------------------------------------
-
   const best =
     findBestMatcher(
       signal,
@@ -3831,10 +3798,6 @@ function getMatcherForSignal(
   ) {
     return best;
   }
-
-  // ----------------------------------------------------------
-  // MANUAL TEAM FALLBACK
-  // ----------------------------------------------------------
 
   const home =
     normalizeTeam(
@@ -3924,10 +3887,6 @@ async function runWorker(
   const executionId =
     crypto.randomUUID();
 
-  // ----------------------------------------------------------
-  // PERSISTENT PENDING RETRY
-  // ----------------------------------------------------------
-
   let pendingResult:
     any = null;
 
@@ -3946,10 +3905,6 @@ async function runWorker(
           : String(error)
     };
   }
-
-  // ----------------------------------------------------------
-  // TRACKER + MATCHER + CLOUDBET /live
-  // ----------------------------------------------------------
 
   const [
     trackerResult,
@@ -3976,138 +3931,92 @@ async function runWorker(
       )
     ]);
 
-  // ----------------------------------------------------------
-  // TRACKER
-  // ----------------------------------------------------------
-
   if (
     !trackerResult.ok
   ) {
     return {
       success: false,
-
       worker:
         "cloudbet-bet-worker",
-
       version:
         VERSION,
-
       mode:
         MODE,
-
       betting_enabled:
         BETTING_ENABLED,
-
       action:
         "RUN",
-
       execution_id:
         executionId,
-
       error:
         "TRACKER_FAILED",
-
       tracker:
         trackerResult,
-
       pending:
         pendingResult,
-
       processing_ms:
         Date.now() -
         started
     };
   }
-
-  // ----------------------------------------------------------
-  // MATCHER
-  // ----------------------------------------------------------
 
   if (
     !matcherResult.ok
   ) {
     return {
       success: false,
-
       worker:
         "cloudbet-bet-worker",
-
       version:
         VERSION,
-
       mode:
         MODE,
-
       betting_enabled:
         BETTING_ENABLED,
-
       action:
         "RUN",
-
       execution_id:
         executionId,
-
       error:
         "MATCHER_FAILED",
-
       matcher:
         matcherResult,
-
       pending:
         pendingResult,
-
       processing_ms:
         Date.now() -
         started
     };
   }
-
-  // ----------------------------------------------------------
-  // CLOUDBET
-  // ----------------------------------------------------------
 
   if (
     !cloudbetResult.ok
   ) {
     return {
       success: false,
-
       worker:
         "cloudbet-bet-worker",
-
       version:
         VERSION,
-
       mode:
         MODE,
-
       betting_enabled:
         BETTING_ENABLED,
-
       action:
         "RUN",
-
       execution_id:
         executionId,
-
       error:
         "CLOUDBET_LIVE_FAILED",
-
       cloudbet:
         cloudbetResult,
-
       pending:
         pendingResult,
-
       processing_ms:
         Date.now() -
         started
     };
   }
-
-  // ----------------------------------------------------------
-  // NORMALIZE
-  // ----------------------------------------------------------
 
   const trackerSignals =
     trackerEntries(
@@ -4134,10 +4043,6 @@ async function runWorker(
       isHunterEntry
     );
 
-  // ----------------------------------------------------------
-  // RESULTS
-  // ----------------------------------------------------------
-
   const entries: any[] =
     [];
 
@@ -4154,29 +4059,17 @@ async function runWorker(
   let targetPending = 0;
   let targetMissing = 0;
 
-  // ----------------------------------------------------------
-  // PROCESS HUNTER SIGNALS
-  // ----------------------------------------------------------
-
   for (
     const signal
     of hunterSignals
   ) {
     try {
 
-      // ======================================================
-      // STEP 1 — MATCHER
-      // ======================================================
-
       let matcher =
         getMatcherForSignal(
           signal,
           matcherResult.data
         );
-
-      // ======================================================
-      // STEP 2 — DIRECT CLOUDBET FALLBACK
-      // ======================================================
 
       if (!matcher) {
         matcher =
@@ -4190,16 +4083,11 @@ async function runWorker(
         skipped.push({
           reason:
             "NO_MATCHER",
-
           signal
         });
 
         continue;
       }
-
-      // ======================================================
-      // STEP 3 — STRICT CLOUDBET VERIFICATION
-      // ======================================================
 
       const verification =
         verifyCloudbet(
@@ -4227,19 +4115,11 @@ async function runWorker(
       const verifiedCloudbet =
         verification.cloudbet;
 
-      // ======================================================
-      // STEP 4 — EXACT TARGET ODDS
-      // ======================================================
-
       const oddsResult =
         await resolveOddsOnce(
           env,
           verifiedCloudbet
         );
-
-      // ======================================================
-      // STEP 5 — BUILD BET
-      // ======================================================
 
       const bet =
         buildBet(
@@ -4248,10 +4128,6 @@ async function runWorker(
           verifiedCloudbet,
           oddsResult
         );
-
-      // ======================================================
-      // TARGET AVAILABLE
-      // ======================================================
 
       if (
         oddsResult.success &&
@@ -4329,12 +4205,6 @@ async function runWorker(
 
         continue;
       }
-
-      // ======================================================
-      // TARGET ODDS MISSING
-      //
-      // SAVE SAME EVENT ID FOR PERSISTENT RETRY.
-      // ======================================================
 
       targetMissing++;
 
@@ -4424,10 +4294,6 @@ async function runWorker(
       });
     }
   }
-
-  // ----------------------------------------------------------
-  // FINAL RESPONSE
-  // ----------------------------------------------------------
 
   return {
     success: true,
@@ -4617,6 +4483,33 @@ async function runDiagnostic(
       )
     ]);
 
+  const trackerSignals =
+    tracker.ok
+      ? trackerEntries(
+          tracker.data
+        )
+      : [];
+
+  const hunterDiagnostics =
+    trackerSignals.map(
+      signal =>
+        hunterFilterDiagnostic(
+          signal
+        )
+    );
+
+  const hunterSignals =
+    trackerSignals.filter(
+      isHunterEntry
+    );
+
+  const matcherParsed =
+    matcher.ok
+      ? matcherMatches(
+          matcher.data
+        )
+      : [];
+
   const cloudbetParsed =
     cloudbet.ok
       ? cloudbetMatches(
@@ -4698,15 +4591,6 @@ async function runDiagnostic(
       }
     );
 
-  const hunterSignals =
-    tracker.ok
-      ? trackerEntries(
-          tracker.data
-        ).filter(
-          isHunterEntry
-        )
-      : [];
-
   return {
     success:
       tracker.ok &&
@@ -4735,8 +4619,11 @@ async function runDiagnostic(
       odds_endpoint:
         "/event?id=CLOUDBET_EVENT_ID",
 
-      cloudbet_live_parser:
-        "CLOUDBET /live → events[]",
+      tracker_endpoint:
+        "/entries",
+
+      matcher_endpoint:
+        `/match?threshold=${MATCHER_THRESHOLD}`,
 
       target_market:
         TARGET_MARKET_KEY,
@@ -4782,8 +4669,17 @@ async function runDiagnostic(
       endpoint:
         "/entries",
 
+      total_signals:
+        trackerSignals.length,
+
       hunter_signals:
         hunterSignals.length,
+
+      raw:
+        tracker.data,
+
+      hunter_filter:
+        hunterDiagnostics,
 
       error:
         tracker.error ||
@@ -4804,11 +4700,10 @@ async function runDiagnostic(
         `/match?threshold=${MATCHER_THRESHOLD}`,
 
       matches:
-        matcher.ok
-          ? matcherMatches(
-              matcher.data
-            ).length
-          : 0,
+        matcherParsed.length,
+
+      raw:
+        matcher.data,
 
       error:
         matcher.error ||
@@ -4854,6 +4749,124 @@ async function runDiagnostic(
     processing_ms:
       Date.now() -
       started
+  };
+}
+
+// ============================================================
+// PUBLIC TRACKER PROXY
+// ============================================================
+
+async function runEntriesProxy(
+  env: Env
+): Promise<any> {
+
+  const result =
+    await fetchServiceJSON(
+      env.TRACKER,
+      "/entries",
+      SERVICE_TIMEOUT_MS
+    );
+
+  return {
+    success:
+      result.ok,
+
+    worker:
+      "cloudbet-bet-worker",
+
+    version:
+      VERSION,
+
+    proxy:
+      "TRACKER",
+
+    endpoint:
+      "/entries",
+
+    status:
+      result.status,
+
+    latency_ms:
+      result.latency_ms,
+
+    data:
+      result.data,
+
+    error:
+      result.error ||
+      null
+  };
+}
+
+// ============================================================
+// PUBLIC MATCHER PROXY
+// ============================================================
+
+async function runMatchProxy(
+  env: Env,
+  url: URL
+): Promise<any> {
+
+  const threshold =
+    url.searchParams.get(
+      "threshold"
+    ) ||
+    String(
+      MATCHER_THRESHOLD
+    );
+
+  const endpoint =
+    `/match?threshold=${encodeURIComponent(
+      threshold
+    )}`;
+
+  const result =
+    await fetchServiceJSON(
+      env.MATCHER,
+      endpoint,
+      SERVICE_TIMEOUT_MS
+    );
+
+  return {
+    success:
+      result.ok,
+
+    worker:
+      "cloudbet-bet-worker",
+
+    version:
+      VERSION,
+
+    proxy:
+      "MATCHER",
+
+    endpoint,
+
+    threshold:
+
+      Number(
+        threshold
+      ),
+
+    status:
+      result.status,
+
+    latency_ms:
+      result.latency_ms,
+
+    data:
+      result.data,
+
+    parsed_matches:
+      result.ok
+        ? matcherMatches(
+            result.data
+          ).length
+        : 0,
+
+    error:
+      result.error ||
+      null
   };
 }
 
@@ -4932,6 +4945,17 @@ function healthResponse():
         true
     },
 
+    diagnostics: {
+      tracker:
+        "/entries",
+
+      matcher:
+        "/match",
+
+      full:
+        "/diagnostic"
+    },
+
     status:
       "OK"
   });
@@ -4985,7 +5009,9 @@ export default {
             "/",
             "/health",
             "/run",
-            "/diagnostic"
+            "/diagnostic",
+            "/entries",
+            "/match"
           ],
 
           target: {
@@ -5012,6 +5038,41 @@ export default {
         path === "/health"
       ) {
         return healthResponse();
+      }
+
+      // ------------------------------------------------------
+      // PUBLIC TRACKER /entries
+      // ------------------------------------------------------
+
+      if (
+        path === "/entries"
+      ) {
+        const result =
+          await runEntriesProxy(
+            env
+          );
+
+        return json(
+          result
+        );
+      }
+
+      // ------------------------------------------------------
+      // PUBLIC MATCHER /match
+      // ------------------------------------------------------
+
+      if (
+        path === "/match"
+      ) {
+        const result =
+          await runMatchProxy(
+            env,
+            url
+          );
+
+        return json(
+          result
+        );
       }
 
       // ------------------------------------------------------
