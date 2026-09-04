@@ -95,7 +95,7 @@ const CLOUDBET_LIVE_PATH =
 
 // SERVICE TIMEOUT
 const SERVICE_TIMEOUT_MS =
-  10_000;
+  25_000;
 
 // Persistent odds retry
 const ODDS_EVENT_MAX_RETRIES =
