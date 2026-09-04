@@ -1,6 +1,6 @@
 // ============================================================
 // CLOUDBET LIVE SOCCER DETECTOR
-// V5.8.5
+// V5.8.4
 //
 // FIX:
 // - Cloudbet /events returns:
@@ -9,21 +9,11 @@
 //     competitions[].events[]
 // - TRADING_LIVE is recognized as live
 //
-// NEW V5.7.9:
-// - /diagnostic-target-market
-// - Inspects every live event
-// - Checks exact target market/submarket/selection
-// - Shows disabled selections, price and maxStake
-//
-// NEW V5.8.5:
-// - /trading-check
-// - Account API checked with GET
-// - Trading API history checked with:
-//     GET /pub/v4/bets/history?limit=1&offset=0
-// - HTTP 200 = Trading history endpoint accepted
-//
-// READ ONLY
-// NO BETTING
+// NEW V5.8.4:
+// - /trading-check now tests Trading API history with POST
+// - Uses /pub/v3/bets/history?limit=1&offset=0
+// - Keeps Account API GET checks
+// - READ ONLY / NO BET PLACEMENT
 // ============================================================
 
 interface Env {
@@ -39,7 +29,7 @@ const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
 const VERSION =
-  "V5.8.5";
+  "V5.8.6";
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
@@ -856,6 +846,7 @@ function searchEvents(
 
 // ============================================================
 // EVENT LOOKUP
+// V5.7.8 FIX
 // ============================================================
 
 async function getEvent(
@@ -2749,8 +2740,10 @@ async function diagnosticTargetMarket(
 }
 
 
+
 // ============================================================
 // LINE FETCH
+// V5.7.9
 // READ ONLY — DOES NOT PLACE A BET
 // ============================================================
 
@@ -2763,7 +2756,7 @@ async function fetchTargetLine(
     Date.now();
 
   const url =
-    `${API_BASE}/lines`;
+    "https://sports-api.cloudbet.com/pub/v2/odds/lines";
 
   const body = {
 
@@ -2942,8 +2935,15 @@ async function fetchTargetLine(
 }
 
 
+
 // ============================================================
-// AUTHENTICATED GET
+// TRADING / ACCOUNT ACCESS CHECK
+// V5.8.4
+//
+// READ ONLY
+// - NO BET PLACEMENT
+// - Account API checks use GET
+// - Trading history check uses POST /pub/v3/bets/history
 // ============================================================
 
 async function authenticatedCloudbetGet(
@@ -3068,20 +3068,131 @@ async function authenticatedCloudbetGet(
 }
 
 
-// ============================================================
-// TRADING / ACCOUNT ACCESS CHECK
-// V5.8.5
-//
-// READ ONLY
-// NO BET PLACEMENT
-//
-// Account API:
-// GET /pub/v1/account/currencies
-// GET /pub/v1/account/currencies/USDT/balance
-//
-// Trading API:
-// GET /pub/v4/bets/history?limit=1&offset=0
-// ============================================================
+async function authenticatedCloudbetPost(
+  env: Env,
+  fullUrl: string,
+  body: any = {}
+): Promise<AnyObj> {
+
+  const started =
+    Date.now();
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      CLOUDBET_TIMEOUT_MS
+    );
+
+  try {
+
+    const response =
+      await fetch(
+        fullUrl,
+        {
+          method:
+            "POST",
+
+          headers: {
+            "accept":
+              "application/json",
+
+            "content-type":
+              "application/json",
+
+            "x-api-key":
+              env.CLOUDBET_API_KEY || ""
+          },
+
+          body:
+            JSON.stringify(body),
+
+          signal:
+            controller.signal
+        }
+      );
+
+    const raw =
+      await response.text();
+
+    let data:
+      any = null;
+
+    try {
+
+      data =
+        raw
+          ? JSON.parse(raw)
+          : null;
+
+    } catch {
+
+      data =
+        null;
+
+    }
+
+    return {
+      ok:
+        response.ok,
+
+      status:
+        response.status,
+
+      elapsed_ms:
+        Date.now() -
+        started,
+
+      content_type:
+        response.headers.get(
+          "content-type"
+        ),
+
+      data,
+
+      raw:
+        data === null
+          ? raw.slice(
+              0,
+              2000
+            )
+          : null
+    };
+
+  } catch (
+    error
+  ) {
+
+    return {
+      ok:
+        false,
+
+      status:
+        0,
+
+      elapsed_ms:
+        Date.now() -
+        started,
+
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error)
+    };
+
+  } finally {
+
+    clearTimeout(
+      timer
+    );
+
+  }
+
+}
+
 
 async function tradingAccessCheck(
   env: Env
@@ -3096,16 +3207,15 @@ async function tradingAccessCheck(
   const balanceUrl =
     "https://sports-api.cloudbet.com/pub/v1/account/currencies/USDT/balance";
 
-  const historyV4Url =
-    "https://sports-api.cloudbet.com/pub/v4/bets/history?limit=1&offset=0";
+  const historyV3Url =
+    "https://sports-api.cloudbet.com/pub/v3/bets/history?limit=1&offset=0";
 
   const [
     currencies,
     balance,
-    historyV4
+    historyV3
   ] =
     await Promise.all([
-
       authenticatedCloudbetGet(
         env,
         currenciesUrl
@@ -3116,13 +3226,12 @@ async function tradingAccessCheck(
         balanceUrl
       ),
 
-      authenticatedCloudbetGet(
+      authenticatedCloudbetPost(
         env,
-        historyV4Url
+        historyV3Url,
+        {}
       )
-
     ]);
-
 
   const currenciesAuthenticated =
     currencies.status === 200;
@@ -3130,31 +3239,21 @@ async function tradingAccessCheck(
   const balanceAuthenticated =
     balance.status === 200;
 
-  const historyV4Authenticated =
-    historyV4.status === 200;
-
-
-  const accountAuthenticated =
-    currenciesAuthenticated ||
-    balanceAuthenticated;
+  const historyV3Authenticated =
+    historyV3.status === 200;
 
   const tradingReadAuthenticated =
-    historyV4Authenticated;
-
+    historyV3Authenticated;
 
   const access =
-    accountAuthenticated &&
+    balanceAuthenticated &&
     tradingReadAuthenticated
       ? "ACCOUNT_AND_TRADING_READ_ACCESS_OK"
-
-      : accountAuthenticated
+      : balanceAuthenticated
       ? "ACCOUNT_ACCESS_OK_TRADING_HISTORY_FAILED"
-
       : tradingReadAuthenticated
       ? "TRADING_HISTORY_OK_ACCOUNT_ACCESS_FAILED"
-
       : "AUTHENTICATED_ACCESS_FAILED";
-
 
   const availableCurrencies =
     Array.isArray(
@@ -3163,25 +3262,16 @@ async function tradingAccessCheck(
       ? currencies.data.currencies
       : [];
 
-
   const usdtListed =
     availableCurrencies.includes(
       "USDT"
     );
 
-
-  const bets =
-    Array.isArray(
-      historyV4?.data?.bets
-    )
-      ? historyV4.data.bets
-      : [];
-
-
   return json({
 
     success:
-      accountAuthenticated ||
+      currenciesAuthenticated ||
+      balanceAuthenticated ||
       tradingReadAuthenticated,
 
     worker:
@@ -3245,7 +3335,6 @@ async function tradingAccessCheck(
           null
       },
 
-
       account_balance_usdt: {
 
         method:
@@ -3279,52 +3368,46 @@ async function tradingAccessCheck(
           null
       },
 
-
-      trading_history_v4: {
+      trading_history_v3: {
 
         method:
-          "GET",
+          "POST",
 
         endpoint:
-          "/pub/v4/bets/history?limit=1&offset=0",
+          "/pub/v3/bets/history?limit=1&offset=0",
+
+        request_body:
+          {},
 
         ok:
-          historyV4.ok,
+          historyV3.ok,
 
         http_status:
-          historyV4.status,
+          historyV3.status,
 
         elapsed_ms:
-          historyV4.elapsed_ms,
+          historyV3.elapsed_ms,
 
         authenticated:
-          historyV4Authenticated,
-
-        bets_count:
-          bets.length,
-
-        bets,
+          historyV3Authenticated,
 
         response:
-          historyV4.data ??
-          historyV4.raw ??
+          historyV3.data ??
+          historyV3.raw ??
           null,
 
         error:
-          historyV4.error ??
+          historyV3.error ??
           null
       }
 
     },
 
-
     summary: {
 
       account_api_authenticated:
-        accountAuthenticated,
-
-      currencies_endpoint_ok:
-        currenciesAuthenticated,
+        currenciesAuthenticated ||
+        balanceAuthenticated,
 
       usdt_available:
         usdtListed ||
@@ -3333,50 +3416,30 @@ async function tradingAccessCheck(
       usdt_balance_endpoint_ok:
         balanceAuthenticated,
 
-      trading_v4_history_get_ok:
-        historyV4Authenticated,
+      trading_v3_history_post_ok:
+        historyV3Authenticated,
 
       trading_read_access_ok:
-        tradingReadAuthenticated,
-
-      api_key_account_access:
-        accountAuthenticated,
-
-      api_key_trading_access:
         tradingReadAuthenticated
-
     },
-
 
     interpretation: {
 
       purpose:
-        "Test Account API and Trading API authentication.",
+        "Confirm Account API access and test Trading API history using POST.",
 
-      trading_history_method:
-        "GET",
-
-      trading_history_endpoint:
-        "/pub/v4/bets/history",
-
-      http_200:
-        "HTTP 200 means the Trading API history request was accepted.",
-
-      empty_bets:
-        "An empty bets array does not make the authentication test fail.",
+      trading_history:
+        "POST /pub/v3/bets/history is tested read-only. No bet is placed.",
 
       no_bet_placed:
         true
-
     },
-
 
     performance: {
 
       total_elapsed_ms:
         Date.now() -
         started
-
     }
 
   });
@@ -3384,8 +3447,10 @@ async function tradingAccessCheck(
 }
 
 
+
 // ============================================================
 // GRAPHQL ACCESS CHECK
+// V5.8.3
 // ============================================================
 
 const CLOUDBET_GRAPHQL_URL =
@@ -3687,10 +3752,6 @@ async function graphqlCheck(
 
 }
 
-
-// ============================================================
-// GRAPHQL SINGLE CHECK
-// ============================================================
 
 async function graphqlSingleCheck(
   env: Env,
@@ -4048,11 +4109,6 @@ export default {
 
     }
 
-
-    // ========================================================
-    // LIVE
-    // ========================================================
-
     if (
       pathname ===
       "/live"
@@ -4117,11 +4173,6 @@ export default {
       }
 
     }
-
-
-    // ========================================================
-    // SEARCH
-    // ========================================================
 
     if (
       pathname ===
@@ -4218,11 +4269,6 @@ export default {
 
     }
 
-
-    // ========================================================
-    // EVENT
-    // ========================================================
-
     if (
       pathname ===
       "/event"
@@ -4307,11 +4353,6 @@ export default {
       }
 
     }
-
-
-    // ========================================================
-    // LINE TEST
-    // ========================================================
 
     if (
       pathname ===
@@ -4437,10 +4478,6 @@ export default {
     }
 
 
-    // ========================================================
-    // TRADING CHECK
-    // ========================================================
-
     if (
       pathname ===
       "/trading-check"
@@ -4489,10 +4526,6 @@ export default {
     }
 
 
-    // ========================================================
-    // GRAPHQL
-    // ========================================================
-
     if (
       pathname ===
       "/graphql-check"
@@ -4530,10 +4563,6 @@ export default {
 
     }
 
-
-    // ========================================================
-    // RAW DIAGNOSTIC
-    // ========================================================
 
     if (
       pathname ===
@@ -4575,11 +4604,6 @@ export default {
 
     }
 
-
-    // ========================================================
-    // TARGET DIAGNOSTIC
-    // ========================================================
-
     if (
       pathname ===
       "/diagnostic-target-market"
@@ -4619,11 +4643,6 @@ export default {
       }
 
     }
-
-
-    // ========================================================
-    // CLOUD0007
-    // ========================================================
 
     if (
       pathname ===
@@ -4685,7 +4704,6 @@ export default {
 
     }
 
-
     if (
       pathname ===
       "/diagnostic-cloud0007-api"
@@ -4724,7 +4742,6 @@ export default {
 
     }
 
-
     if (
       pathname ===
       "/diagnostic-cloud0007-routes"
@@ -4762,11 +4779,6 @@ export default {
       }
 
     }
-
-
-    // ========================================================
-    // 404
-    // ========================================================
 
     return json({
 
