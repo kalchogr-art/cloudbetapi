@@ -1,6 +1,6 @@
 // ============================================================
 // CLOUDBET LIVE SOCCER DETECTOR
-// V5.8.3
+// V5.8.4
 //
 // FIX:
 // - Cloudbet /events returns:
@@ -9,14 +9,11 @@
 //     competitions[].events[]
 // - TRADING_LIVE is recognized as live
 //
-// NEW V5.7.9:
-// - /diagnostic-target-market
-// - Inspects every live event
-// - Checks exact target market/submarket/selection
-// - Shows disabled selections, price and maxStake
-//
-// READ ONLY
-// NO BETTING
+// NEW V5.8.4:
+// - /trading-check now tests Trading API history with POST
+// - Uses /pub/v3/bets/history?limit=1&offset=0
+// - Keeps Account API GET checks
+// - READ ONLY / NO BET PLACEMENT
 // ============================================================
 
 interface Env {
@@ -32,7 +29,7 @@ const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
 const VERSION =
-  "V5.8.3";
+  "V5.8.4";
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
@@ -850,12 +847,6 @@ function searchEvents(
 // ============================================================
 // EVENT LOOKUP
 // V5.7.8 FIX
-//
-// Cloudbet pub/v2/odds does NOT accept:
-//   /event?id=EVENT_ID
-//
-// We load the live /events feed and select the SAME event by ID.
-// This preserves the complete event object including markets.
 // ============================================================
 
 async function getEvent(
@@ -2947,12 +2938,12 @@ async function fetchTargetLine(
 
 // ============================================================
 // TRADING / ACCOUNT ACCESS CHECK
-// V5.8.0
+// V5.8.4
 //
 // READ ONLY
 // - NO BET PLACEMENT
-// - Checks authenticated Account API access
-// - Checks authenticated Trading API history access
+// - Account API checks use GET
+// - Trading history check uses POST /pub/v3/bets/history
 // ============================================================
 
 async function authenticatedCloudbetGet(
@@ -3077,6 +3068,132 @@ async function authenticatedCloudbetGet(
 }
 
 
+async function authenticatedCloudbetPost(
+  env: Env,
+  fullUrl: string,
+  body: any = {}
+): Promise<AnyObj> {
+
+  const started =
+    Date.now();
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      CLOUDBET_TIMEOUT_MS
+    );
+
+  try {
+
+    const response =
+      await fetch(
+        fullUrl,
+        {
+          method:
+            "POST",
+
+          headers: {
+            "accept":
+              "application/json",
+
+            "content-type":
+              "application/json",
+
+            "x-api-key":
+              env.CLOUDBET_API_KEY || ""
+          },
+
+          body:
+            JSON.stringify(body),
+
+          signal:
+            controller.signal
+        }
+      );
+
+    const raw =
+      await response.text();
+
+    let data:
+      any = null;
+
+    try {
+
+      data =
+        raw
+          ? JSON.parse(raw)
+          : null;
+
+    } catch {
+
+      data =
+        null;
+
+    }
+
+    return {
+      ok:
+        response.ok,
+
+      status:
+        response.status,
+
+      elapsed_ms:
+        Date.now() -
+        started,
+
+      content_type:
+        response.headers.get(
+          "content-type"
+        ),
+
+      data,
+
+      raw:
+        data === null
+          ? raw.slice(
+              0,
+              2000
+            )
+          : null
+    };
+
+  } catch (
+    error
+  ) {
+
+    return {
+      ok:
+        false,
+
+      status:
+        0,
+
+      elapsed_ms:
+        Date.now() -
+        started,
+
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error)
+    };
+
+  } finally {
+
+    clearTimeout(
+      timer
+    );
+
+  }
+
+}
+
+
 async function tradingAccessCheck(
   env: Env
 ): Promise<Response> {
@@ -3090,16 +3207,12 @@ async function tradingAccessCheck(
   const balanceUrl =
     "https://sports-api.cloudbet.com/pub/v1/account/currencies/USDT/balance";
 
-  const historyV4Url =
-    "https://sports-api.cloudbet.com/pub/v4/bets/history?limit=1&offset=0";
-
   const historyV3Url =
     "https://sports-api.cloudbet.com/pub/v3/bets/history?limit=1&offset=0";
 
   const [
     currencies,
     balance,
-    historyV4,
     historyV3
   ] =
     await Promise.all([
@@ -3113,14 +3226,10 @@ async function tradingAccessCheck(
         balanceUrl
       ),
 
-      authenticatedCloudbetGet(
+      authenticatedCloudbetPost(
         env,
-        historyV4Url
-      ),
-
-      authenticatedCloudbetGet(
-        env,
-        historyV3Url
+        historyV3Url,
+        {}
       )
     ]);
 
@@ -3130,14 +3239,10 @@ async function tradingAccessCheck(
   const balanceAuthenticated =
     balance.status === 200;
 
-  const historyV4Authenticated =
-    historyV4.status === 200;
-
   const historyV3Authenticated =
     historyV3.status === 200;
 
   const tradingReadAuthenticated =
-    historyV4Authenticated ||
     historyV3Authenticated;
 
   const access =
@@ -3196,6 +3301,9 @@ async function tradingAccessCheck(
 
       account_currencies: {
 
+        method:
+          "GET",
+
         endpoint:
           "/pub/v1/account/currencies",
 
@@ -3229,6 +3337,9 @@ async function tradingAccessCheck(
 
       account_balance_usdt: {
 
+        method:
+          "GET",
+
         endpoint:
           "/pub/v1/account/currencies/USDT/balance",
 
@@ -3257,37 +3368,16 @@ async function tradingAccessCheck(
           null
       },
 
-      trading_history_v4: {
+      trading_history_v3: {
 
-        endpoint:
-          "/pub/v4/bets/history?limit=1&offset=0",
-
-        ok:
-          historyV4.ok,
-
-        http_status:
-          historyV4.status,
-
-        elapsed_ms:
-          historyV4.elapsed_ms,
-
-        authenticated:
-          historyV4Authenticated,
-
-        response:
-          historyV4.data ??
-          historyV4.raw ??
-          null,
-
-        error:
-          historyV4.error ??
-          null
-      },
-
-      trading_history_v3_legacy: {
+        method:
+          "POST",
 
         endpoint:
           "/pub/v3/bets/history?limit=1&offset=0",
+
+        request_body:
+          {},
 
         ok:
           historyV3.ok,
@@ -3326,10 +3416,7 @@ async function tradingAccessCheck(
       usdt_balance_endpoint_ok:
         balanceAuthenticated,
 
-      trading_v4_history_ok:
-        historyV4Authenticated,
-
-      trading_v3_history_ok:
+      trading_v3_history_post_ok:
         historyV3Authenticated,
 
       trading_read_access_ok:
@@ -3339,13 +3426,10 @@ async function tradingAccessCheck(
     interpretation: {
 
       purpose:
-        "Confirm the API key against Account API and Trading API read endpoints using the real account currency USDT.",
+        "Confirm Account API access and test Trading API history using POST.",
 
-      v4:
-        "v4 is checked as the current Trading API history route.",
-
-      v3:
-        "v3 is checked only as a legacy compatibility diagnostic.",
+      trading_history:
+        "POST /pub/v3/bets/history is tested read-only. No bet is placed.",
 
       no_bet_placed:
         true
@@ -3367,12 +3451,6 @@ async function tradingAccessCheck(
 // ============================================================
 // GRAPHQL ACCESS CHECK
 // V5.8.3
-//
-// READ ONLY
-// Official Cloudbet GraphQL endpoint
-// - accountBalances
-// - bets(limit: 1)
-// NO BET PLACEMENT
 // ============================================================
 
 const CLOUDBET_GRAPHQL_URL =
@@ -3675,102 +3753,284 @@ async function graphqlCheck(
 }
 
 
-
-
 async function graphqlSingleCheck(
   env: Env,
   kind: "account" | "bets"
 ): Promise<Response> {
-  const started = Date.now();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), CLOUDBET_TIMEOUT_MS);
 
-  const query = kind === "account"
-    ? `query AccountBalances { accountBalances { currency amount } }`
-    : `query Bets($limit: Int) { bets(limit: $limit) { referenceId categoryKey sportsKey eventId eventName marketUrl currency price stake side returnAmount betStatus betErrorCode } }`;
+  const started =
+    Date.now();
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      CLOUDBET_TIMEOUT_MS
+    );
+
+  const query =
+    kind === "account"
+      ? `query AccountBalances { accountBalances { currency amount } }`
+      : `query Bets($limit: Int) { bets(limit: $limit) { referenceId categoryKey sportsKey eventId eventName marketUrl currency price stake side returnAmount betStatus betErrorCode } }`;
 
   try {
-    const response = await fetch(CLOUDBET_GRAPHQL_URL, {
-      method: "POST",
-      headers: {
-        "accept": "application/json",
-        "content-type": "application/json",
-        "x-api-key": env.CLOUDBET_API_KEY || ""
-      },
-      body: JSON.stringify({
-        query,
-        variables: kind === "bets" ? { limit: 1 } : undefined
-      }),
-      signal: controller.signal
-    });
 
-    const raw = await response.text();
-    let data: any = null;
-    try { data = raw ? JSON.parse(raw) : null; } catch { data = null; }
+    const response =
+      await fetch(
+        CLOUDBET_GRAPHQL_URL,
+        {
+          method:
+            "POST",
 
-    const errors = Array.isArray(data?.errors) ? data.errors : [];
-    const balances = Array.isArray(data?.data?.accountBalances) ? data.data.accountBalances : [];
-    const bets = Array.isArray(data?.data?.bets) ? data.data.bets : [];
-    const graphqlOk = response.ok && !!data && errors.length === 0;
+          headers: {
+            "accept":
+              "application/json",
+
+            "content-type":
+              "application/json",
+
+            "x-api-key":
+              env.CLOUDBET_API_KEY || ""
+          },
+
+          body:
+            JSON.stringify({
+              query,
+              variables:
+                kind === "bets"
+                  ? { limit: 1 }
+                  : undefined
+            }),
+
+          signal:
+            controller.signal
+        }
+      );
+
+    const raw =
+      await response.text();
+
+    let data:
+      any = null;
+
+    try {
+
+      data =
+        raw
+          ? JSON.parse(raw)
+          : null;
+
+    } catch {
+
+      data =
+        null;
+
+    }
+
+    const errors =
+      Array.isArray(
+        data?.errors
+      )
+        ? data.errors
+        : [];
+
+    const balances =
+      Array.isArray(
+        data?.data?.accountBalances
+      )
+        ? data.data.accountBalances
+        : [];
+
+    const bets =
+      Array.isArray(
+        data?.data?.bets
+      )
+        ? data.data.bets
+        : [];
+
+    const graphqlOk =
+      response.ok &&
+      !!data &&
+      errors.length === 0;
 
     return json({
-      success: graphqlOk,
-      worker: "cloudbet-live-soccer-detector",
-      version: VERSION,
-      action: kind === "account" ? "GRAPHQL_ACCOUNT_CHECK" : "GRAPHQL_BETS_CHECK",
-      read_only: true,
-      betting: false,
-      api_key_present: !!env.CLOUDBET_API_KEY,
-      endpoint: CLOUDBET_GRAPHQL_URL,
+
+      success:
+        graphqlOk,
+
+      worker:
+        "cloudbet-live-soccer-detector",
+
+      version:
+        VERSION,
+
+      action:
+        kind === "account"
+          ? "GRAPHQL_ACCOUNT_CHECK"
+          : "GRAPHQL_BETS_CHECK",
+
+      read_only:
+        true,
+
+      betting:
+        false,
+
+      api_key_present:
+        !!env.CLOUDBET_API_KEY,
+
+      endpoint:
+        CLOUDBET_GRAPHQL_URL,
+
       request: {
-        method: "POST",
-        operation: kind === "account" ? "accountBalances only" : "bets(limit:1) only"
+        method:
+          "POST",
+
+        operation:
+          kind === "account"
+            ? "accountBalances only"
+            : "bets(limit:1) only"
       },
+
       response: {
-        http_status: response.status,
-        ok: response.ok,
-        elapsed_ms: Date.now() - started,
-        content_type: response.headers.get("content-type")
+        http_status:
+          response.status,
+
+        ok:
+          response.ok,
+
+        elapsed_ms:
+          Date.now() -
+          started,
+
+        content_type:
+          response.headers.get(
+            "content-type"
+          )
       },
+
       authentication: {
-        accepted: graphqlOk,
-        graphql_errors: errors
+        accepted:
+          graphqlOk,
+
+        graphql_errors:
+          errors
       },
-      account: kind === "account" ? {
-        balances,
-        balances_count: balances.length,
-        usdt: balances.find((x: AnyObj) => String(x?.currency ?? "").toUpperCase() === "USDT") ?? null
-      } : null,
-      trading: kind === "bets" ? {
-        bets,
-        bets_count: bets.length
-      } : null,
-      raw: data === null ? raw.slice(0, 3000) : data,
+
+      account:
+        kind === "account"
+          ? {
+              balances,
+              balances_count:
+                balances.length,
+
+              usdt:
+                balances.find(
+                  (x: AnyObj) =>
+                    String(
+                      x?.currency ??
+                      ""
+                    ).toUpperCase() ===
+                    "USDT"
+                ) ?? null
+            }
+          : null,
+
+      trading:
+        kind === "bets"
+          ? {
+              bets,
+              bets_count:
+                bets.length
+            }
+          : null,
+
+      raw:
+        data === null
+          ? raw.slice(
+              0,
+              3000
+            )
+          : data,
+
       interpretation: {
-        isolated_query: true,
-        purpose: kind === "account"
-          ? "Tests accountBalances without invoking the bets resolver."
-          : "Tests bets(limit:1) without invoking the accountBalances resolver.",
-        no_bet_placed: true
+
+        isolated_query:
+          true,
+
+        purpose:
+          kind === "account"
+            ? "Tests accountBalances without invoking the bets resolver."
+            : "Tests bets(limit:1) without invoking the accountBalances resolver.",
+
+        no_bet_placed:
+          true
       },
-      performance: { total_elapsed_ms: Date.now() - started }
+
+      performance: {
+        total_elapsed_ms:
+          Date.now() -
+          started
+      }
+
     });
-  } catch (error) {
-    return json({
-      success: false,
-      worker: "cloudbet-live-soccer-detector",
-      version: VERSION,
-      action: kind === "account" ? "GRAPHQL_ACCOUNT_CHECK" : "GRAPHQL_BETS_CHECK",
-      read_only: true,
-      betting: false,
-      api_key_present: !!env.CLOUDBET_API_KEY,
-      endpoint: CLOUDBET_GRAPHQL_URL,
-      error: error instanceof Error ? error.message : String(error),
-      performance: { total_elapsed_ms: Date.now() - started }
-    }, 500);
+
+  } catch (
+    error
+  ) {
+
+    return json(
+      {
+        success:
+          false,
+
+        worker:
+          "cloudbet-live-soccer-detector",
+
+        version:
+          VERSION,
+
+        action:
+          kind === "account"
+            ? "GRAPHQL_ACCOUNT_CHECK"
+            : "GRAPHQL_BETS_CHECK",
+
+        read_only:
+          true,
+
+        betting:
+          false,
+
+        api_key_present:
+          !!env.CLOUDBET_API_KEY,
+
+        endpoint:
+          CLOUDBET_GRAPHQL_URL,
+
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+
+        performance: {
+          total_elapsed_ms:
+            Date.now() -
+            started
+        }
+      },
+      500
+    );
+
   } finally {
-    clearTimeout(timer);
+
+    clearTimeout(
+      timer
+    );
+
   }
+
 }
 
 
@@ -4094,10 +4354,6 @@ export default {
 
     }
 
-    // --------------------------------------------------------
-    // LINE TEST
-    // --------------------------------------------------------
-
     if (
       pathname ===
       "/line-test"
@@ -4222,10 +4478,6 @@ export default {
     }
 
 
-    // --------------------------------------------------------
-    // TRADING / ACCOUNT READ ACCESS CHECK
-    // --------------------------------------------------------
-
     if (
       pathname ===
       "/trading-check"
@@ -4274,10 +4526,6 @@ export default {
     }
 
 
-    // --------------------------------------------------------
-    // GRAPHQL READ ACCESS CHECK
-    // --------------------------------------------------------
-
     if (
       pathname ===
       "/graphql-check"
@@ -4294,14 +4542,25 @@ export default {
       pathname ===
       "/graphql-account-check"
     ) {
-      return await graphqlSingleCheck(env, "account");
+
+      return await graphqlSingleCheck(
+        env,
+        "account"
+      );
+
     }
+
 
     if (
       pathname ===
       "/graphql-bets-check"
     ) {
-      return await graphqlSingleCheck(env, "bets");
+
+      return await graphqlSingleCheck(
+        env,
+        "bets"
+      );
+
     }
 
 
