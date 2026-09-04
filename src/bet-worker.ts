@@ -22,6 +22,14 @@
 // - If /line-test has a usable price it is preferred
 // - Full source comparison is exposed in odds_diagnostic
 // - DRY RUN remains enabled; no real bet placement
+//
+// V6.0.7:
+// - Restores dual Cloudbet market support:
+//     soccer.total_goals_period_first_half
+//     soccer.total_goals + period=1h
+// - Still requires exact OVER + total=0.5
+// - Team totals remain explicitly excluded
+// - Recursive keyed-object fallback added for market payload variations
 // ============================================================
 
 interface Env {
@@ -37,7 +45,7 @@ type Obj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V6.0.6";
+const VERSION = "V6.0.7";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -51,6 +59,17 @@ const BET_SELECTION = "OVER 0.5";
 // EXACT TARGET
 const TARGET_MARKET =
   "soccer.total_goals_period_first_half";
+
+// Modern Cloudbet representation of the same market.
+// Period is still required to be exactly 1H, so team totals and FT totals
+// are not accepted.
+const TARGET_MARKET_MODERN =
+  "soccer.total_goals";
+
+const TARGET_MARKETS = [
+  TARGET_MARKET,
+  TARGET_MARKET_MODERN
+] as const;
 
 const TARGET_SUBMARKET =
   "period=1h";
@@ -2097,9 +2116,26 @@ function isTargetMarket(
   const normalized =
     norm(value);
 
-  return (
-    normalized ===
-    norm(TARGET_MARKET)
+  if (!normalized) {
+    return false;
+  }
+
+  // Explicitly reject team-total variants.
+  if (
+    normalized.includes(
+      "team_total"
+    ) ||
+    normalized.includes(
+      "team total"
+    )
+  ) {
+    return false;
+  }
+
+  return TARGET_MARKETS.some(
+    market =>
+      normalized ===
+      norm(market)
   );
 }
 
@@ -2244,68 +2280,88 @@ function findTargetSelection(
   // The previous recursive fallback entered event.markets but did not
   // iterate arbitrary market-key properties, so the exact target could
   // exist with a valid price and still be missed.
-  const directMarket =
-    event?.markets?.[
-      TARGET_MARKET_KEY
-    ];
-
-  const directSubmarket =
-    directMarket?.submarkets?.[
-      TARGET_SUBMARKET_KEY
-    ];
-
-  const directSelections =
-    Array.isArray(
-      directSubmarket?.selections
-    )
-      ? directSubmarket.selections
-      : [];
-
+  // V6.0.7:
+  // Cloudbet has been observed exposing the same 1H O0.5 market in
+  // two equivalent structures:
+  //
+  // 1) soccer.total_goals_period_first_half
+  //      -> submarkets["period=1h"]
+  //
+  // 2) soccer.total_goals
+  //      -> submarkets["period=1h"]
+  //
+  // We accept both market keys, but still require:
+  //   period=1h + outcome=over + params=total=0.5.
+  //
+  // Team totals remain rejected by isTargetMarket().
   for (
-    const selection
-    of directSelections
+    const marketKey
+    of TARGET_MARKETS
   ) {
-    if (
-      !isTargetSelection(
-        selection
+
+    const directMarket =
+      event?.markets?.[
+        marketKey
+      ];
+
+    const directSubmarket =
+      directMarket?.submarkets?.[
+        TARGET_SUBMARKET_KEY
+      ];
+
+    const directSelections =
+      Array.isArray(
+        directSubmarket?.selections
       )
+        ? directSubmarket.selections
+        : [];
+
+    for (
+      const selection
+      of directSelections
     ) {
-      continue;
+      if (
+        !isTargetSelection(
+          selection
+        )
+      ) {
+        continue;
+      }
+
+      if (
+        !selectionEnabled(
+          selection
+        )
+      ) {
+        continue;
+      }
+
+      const price =
+        extractPrice(
+          selection
+        );
+
+      if (
+        price === null
+      ) {
+        continue;
+      }
+
+      return {
+        ...selection,
+
+        price,
+
+        market:
+          marketKey,
+
+        submarket:
+          TARGET_SUBMARKET_KEY,
+
+        target:
+          true
+      };
     }
-
-    if (
-      !selectionEnabled(
-        selection
-      )
-    ) {
-      continue;
-    }
-
-    const price =
-      extractPrice(
-        selection
-      );
-
-    if (
-      price === null
-    ) {
-      continue;
-    }
-
-    return {
-      ...selection,
-
-      price,
-
-      market:
-        TARGET_MARKET_KEY,
-
-      submarket:
-        TARGET_SUBMARKET_KEY,
-
-      target:
-        true
-    };
   }
 
   if (
@@ -2596,6 +2652,13 @@ function searchTargetRecursive(
     "data"
   ];
 
+  // V6.0.7:
+  // Some Cloudbet payloads store market/submarket keys as arbitrary
+  // object properties. The direct lookup above catches the known layout;
+  // this generic fallback prevents those keyed objects from being skipped.
+  const visitedContainerKeys =
+    new Set(containers);
+
   for (
     const key
     of containers
@@ -2623,6 +2686,51 @@ function searchTargetRecursive(
               currentSubmarket
             )
           : submarketContext
+      );
+
+    if (found) {
+      return found;
+    }
+  }
+
+  // Generic keyed-object fallback.
+  for (
+    const [key, child]
+    of Object.entries(value)
+  ) {
+
+    if (
+      visitedContainerKeys.has(key) ||
+      child === null ||
+      child === undefined ||
+      typeof child !== "object"
+    ) {
+      continue;
+    }
+
+    const nextMarketContext =
+      isTargetMarket(key)
+        ? key
+        : (
+            currentMarket
+              ? String(currentMarket)
+              : marketContext
+          );
+
+    const nextSubmarketContext =
+      isTargetSubmarket(key)
+        ? key
+        : (
+            currentSubmarket
+              ? String(currentSubmarket)
+              : submarketContext
+          );
+
+    const found =
+      searchTargetRecursive(
+        child,
+        nextMarketContext,
+        nextSubmarketContext
       );
 
     if (found) {
@@ -2919,7 +3027,7 @@ async function resolveOddsOnce(
 
     const diagnostic = {
       comparison_version:
-        "V6.0.6",
+        "V6.0.7",
 
       event_id:
         eventId,
