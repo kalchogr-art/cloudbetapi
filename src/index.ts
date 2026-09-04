@@ -1,6 +1,6 @@
 // ============================================================
 // CLOUDBET LIVE SOCCER DETECTOR
-// V5.7.8
+// V5.8.5
 //
 // FIX:
 // - Cloudbet /events returns:
@@ -9,11 +9,18 @@
 //     competitions[].events[]
 // - TRADING_LIVE is recognized as live
 //
-// NEW V5.7.8:
+// NEW V5.7.9:
 // - /diagnostic-target-market
 // - Inspects every live event
 // - Checks exact target market/submarket/selection
 // - Shows disabled selections, price and maxStake
+//
+// NEW V5.8.5:
+// - /trading-check
+// - Account API checked with GET
+// - Trading API history checked with:
+//     GET /pub/v4/bets/history?limit=1&offset=0
+// - HTTP 200 = Trading history endpoint accepted
 //
 // READ ONLY
 // NO BETTING
@@ -32,7 +39,7 @@ const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
 const VERSION =
-  "V5.7.8";
+  "V5.8.5";
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
@@ -381,6 +388,9 @@ const TARGET_OUTCOME =
 
 const TARGET_PARAMS =
   "total=0.5";
+
+const TARGET_MARKET_URL =
+  "soccer.total_goals_period_first_half/over?total=0.5";
 
 
 // ============================================================
@@ -846,13 +856,6 @@ function searchEvents(
 
 // ============================================================
 // EVENT LOOKUP
-// V5.7.8 FIX
-//
-// Cloudbet pub/v2/odds does NOT accept:
-//   /event?id=EVENT_ID
-//
-// We load the live /events feed and select the SAME event by ID.
-// This preserves the complete event object including markets.
 // ============================================================
 
 async function getEvent(
@@ -2747,6 +2750,1230 @@ async function diagnosticTargetMarket(
 
 
 // ============================================================
+// LINE FETCH
+// READ ONLY — DOES NOT PLACE A BET
+// ============================================================
+
+async function fetchTargetLine(
+  env: Env,
+  eventId: string
+): Promise<AnyObj> {
+
+  const started =
+    Date.now();
+
+  const url =
+    `${API_BASE}/lines`;
+
+  const body = {
+
+    eventId:
+      String(eventId),
+
+    marketUrl:
+      TARGET_MARKET_URL
+
+  };
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      CLOUDBET_TIMEOUT_MS
+    );
+
+  try {
+
+    const response =
+      await fetch(
+        url,
+        {
+          method:
+            "POST",
+
+          headers: {
+            "accept":
+              "application/json",
+
+            "content-type":
+              "application/json",
+
+            "x-api-key":
+              env.CLOUDBET_API_KEY || ""
+          },
+
+          body:
+            JSON.stringify(body),
+
+          signal:
+            controller.signal
+        }
+      );
+
+    const text =
+      await response.text();
+
+    let data:
+      any = null;
+
+    try {
+
+      data =
+        text
+          ? JSON.parse(text)
+          : null;
+
+    } catch {
+
+      data =
+        null;
+
+    }
+
+    return {
+
+      success:
+        response.ok,
+
+      request: {
+
+        method:
+          "POST",
+
+        endpoint:
+          "/lines",
+
+        eventId:
+          String(eventId),
+
+        marketUrl:
+          TARGET_MARKET_URL
+
+      },
+
+      response: {
+
+        status:
+          response.status,
+
+        ok:
+          response.ok,
+
+        elapsed_ms:
+          Date.now() -
+          started,
+
+        content_type:
+          response.headers.get(
+            "content-type"
+          )
+
+      },
+
+      data,
+
+      raw:
+        data === null
+          ? text.slice(
+              0,
+              3000
+            )
+          : null
+
+    };
+
+  } catch (
+    error
+  ) {
+
+    return {
+
+      success:
+        false,
+
+      request: {
+
+        method:
+          "POST",
+
+        endpoint:
+          "/lines",
+
+        eventId:
+          String(eventId),
+
+        marketUrl:
+          TARGET_MARKET_URL
+
+      },
+
+      response: {
+
+        status:
+          0,
+
+        ok:
+          false,
+
+        elapsed_ms:
+          Date.now() -
+          started
+
+      },
+
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error)
+
+    };
+
+  } finally {
+
+    clearTimeout(
+      timer
+    );
+
+  }
+
+}
+
+
+// ============================================================
+// AUTHENTICATED GET
+// ============================================================
+
+async function authenticatedCloudbetGet(
+  env: Env,
+  fullUrl: string
+): Promise<AnyObj> {
+
+  const started =
+    Date.now();
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      CLOUDBET_TIMEOUT_MS
+    );
+
+  try {
+
+    const response =
+      await fetch(
+        fullUrl,
+        {
+          method:
+            "GET",
+
+          headers: {
+            "accept":
+              "application/json",
+
+            "content-type":
+              "application/json",
+
+            "x-api-key":
+              env.CLOUDBET_API_KEY || ""
+          },
+
+          signal:
+            controller.signal
+        }
+      );
+
+    const raw =
+      await response.text();
+
+    let data:
+      any = null;
+
+    try {
+
+      data =
+        raw
+          ? JSON.parse(raw)
+          : null;
+
+    } catch {
+
+      data =
+        null;
+
+    }
+
+    return {
+      ok:
+        response.ok,
+
+      status:
+        response.status,
+
+      elapsed_ms:
+        Date.now() -
+        started,
+
+      content_type:
+        response.headers.get(
+          "content-type"
+        ),
+
+      data,
+
+      raw:
+        data === null
+          ? raw.slice(
+              0,
+              2000
+            )
+          : null
+    };
+
+  } catch (
+    error
+  ) {
+
+    return {
+      ok:
+        false,
+
+      status:
+        0,
+
+      elapsed_ms:
+        Date.now() -
+        started,
+
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error)
+    };
+
+  } finally {
+
+    clearTimeout(
+      timer
+    );
+
+  }
+
+}
+
+
+// ============================================================
+// TRADING / ACCOUNT ACCESS CHECK
+// V5.8.5
+//
+// READ ONLY
+// NO BET PLACEMENT
+//
+// Account API:
+// GET /pub/v1/account/currencies
+// GET /pub/v1/account/currencies/USDT/balance
+//
+// Trading API:
+// GET /pub/v4/bets/history?limit=1&offset=0
+// ============================================================
+
+async function tradingAccessCheck(
+  env: Env
+): Promise<Response> {
+
+  const started =
+    Date.now();
+
+  const currenciesUrl =
+    "https://sports-api.cloudbet.com/pub/v1/account/currencies";
+
+  const balanceUrl =
+    "https://sports-api.cloudbet.com/pub/v1/account/currencies/USDT/balance";
+
+  const historyV4Url =
+    "https://sports-api.cloudbet.com/pub/v4/bets/history?limit=1&offset=0";
+
+  const [
+    currencies,
+    balance,
+    historyV4
+  ] =
+    await Promise.all([
+
+      authenticatedCloudbetGet(
+        env,
+        currenciesUrl
+      ),
+
+      authenticatedCloudbetGet(
+        env,
+        balanceUrl
+      ),
+
+      authenticatedCloudbetGet(
+        env,
+        historyV4Url
+      )
+
+    ]);
+
+
+  const currenciesAuthenticated =
+    currencies.status === 200;
+
+  const balanceAuthenticated =
+    balance.status === 200;
+
+  const historyV4Authenticated =
+    historyV4.status === 200;
+
+
+  const accountAuthenticated =
+    currenciesAuthenticated ||
+    balanceAuthenticated;
+
+  const tradingReadAuthenticated =
+    historyV4Authenticated;
+
+
+  const access =
+    accountAuthenticated &&
+    tradingReadAuthenticated
+      ? "ACCOUNT_AND_TRADING_READ_ACCESS_OK"
+
+      : accountAuthenticated
+      ? "ACCOUNT_ACCESS_OK_TRADING_HISTORY_FAILED"
+
+      : tradingReadAuthenticated
+      ? "TRADING_HISTORY_OK_ACCOUNT_ACCESS_FAILED"
+
+      : "AUTHENTICATED_ACCESS_FAILED";
+
+
+  const availableCurrencies =
+    Array.isArray(
+      currencies?.data?.currencies
+    )
+      ? currencies.data.currencies
+      : [];
+
+
+  const usdtListed =
+    availableCurrencies.includes(
+      "USDT"
+    );
+
+
+  const bets =
+    Array.isArray(
+      historyV4?.data?.bets
+    )
+      ? historyV4.data.bets
+      : [];
+
+
+  return json({
+
+    success:
+      accountAuthenticated ||
+      tradingReadAuthenticated,
+
+    worker:
+      "cloudbet-live-soccer-detector",
+
+    version:
+      VERSION,
+
+    action:
+      "TRADING_CHECK",
+
+    read_only:
+      true,
+
+    betting:
+      false,
+
+    api_key_present:
+      !!env.CLOUDBET_API_KEY,
+
+    configured_currency:
+      "USDT",
+
+    access,
+
+    checks: {
+
+      account_currencies: {
+
+        method:
+          "GET",
+
+        endpoint:
+          "/pub/v1/account/currencies",
+
+        ok:
+          currencies.ok,
+
+        http_status:
+          currencies.status,
+
+        elapsed_ms:
+          currencies.elapsed_ms,
+
+        authenticated:
+          currenciesAuthenticated,
+
+        usdt_listed:
+          usdtListed,
+
+        currencies:
+          availableCurrencies,
+
+        response:
+          currencies.data ??
+          currencies.raw ??
+          null,
+
+        error:
+          currencies.error ??
+          null
+      },
+
+
+      account_balance_usdt: {
+
+        method:
+          "GET",
+
+        endpoint:
+          "/pub/v1/account/currencies/USDT/balance",
+
+        ok:
+          balance.ok,
+
+        http_status:
+          balance.status,
+
+        elapsed_ms:
+          balance.elapsed_ms,
+
+        authenticated:
+          balanceAuthenticated,
+
+        currency:
+          "USDT",
+
+        response:
+          balance.data ??
+          balance.raw ??
+          null,
+
+        error:
+          balance.error ??
+          null
+      },
+
+
+      trading_history_v4: {
+
+        method:
+          "GET",
+
+        endpoint:
+          "/pub/v4/bets/history?limit=1&offset=0",
+
+        ok:
+          historyV4.ok,
+
+        http_status:
+          historyV4.status,
+
+        elapsed_ms:
+          historyV4.elapsed_ms,
+
+        authenticated:
+          historyV4Authenticated,
+
+        bets_count:
+          bets.length,
+
+        bets,
+
+        response:
+          historyV4.data ??
+          historyV4.raw ??
+          null,
+
+        error:
+          historyV4.error ??
+          null
+      }
+
+    },
+
+
+    summary: {
+
+      account_api_authenticated:
+        accountAuthenticated,
+
+      currencies_endpoint_ok:
+        currenciesAuthenticated,
+
+      usdt_available:
+        usdtListed ||
+        balanceAuthenticated,
+
+      usdt_balance_endpoint_ok:
+        balanceAuthenticated,
+
+      trading_v4_history_get_ok:
+        historyV4Authenticated,
+
+      trading_read_access_ok:
+        tradingReadAuthenticated,
+
+      api_key_account_access:
+        accountAuthenticated,
+
+      api_key_trading_access:
+        tradingReadAuthenticated
+
+    },
+
+
+    interpretation: {
+
+      purpose:
+        "Test Account API and Trading API authentication.",
+
+      trading_history_method:
+        "GET",
+
+      trading_history_endpoint:
+        "/pub/v4/bets/history",
+
+      http_200:
+        "HTTP 200 means the Trading API history request was accepted.",
+
+      empty_bets:
+        "An empty bets array does not make the authentication test fail.",
+
+      no_bet_placed:
+        true
+
+    },
+
+
+    performance: {
+
+      total_elapsed_ms:
+        Date.now() -
+        started
+
+    }
+
+  });
+
+}
+
+
+// ============================================================
+// GRAPHQL ACCESS CHECK
+// ============================================================
+
+const CLOUDBET_GRAPHQL_URL =
+  "https://sports-api-graphql.cloudbet.com/graphql";
+
+
+async function graphqlCheck(
+  env: Env
+): Promise<Response> {
+
+  const started =
+    Date.now();
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      CLOUDBET_TIMEOUT_MS
+    );
+
+  const query = `
+    query Query($limit: Int) {
+      accountBalances {
+        currency
+        amount
+      }
+
+      bets(limit: $limit) {
+        referenceId
+        categoryKey
+        sportsKey
+        eventId
+        eventName
+        marketUrl
+        currency
+        price
+        stake
+        side
+        returnAmount
+        betStatus
+        betErrorCode
+      }
+    }
+  `;
+
+  try {
+
+    const response =
+      await fetch(
+        CLOUDBET_GRAPHQL_URL,
+        {
+          method:
+            "POST",
+
+          headers: {
+            "accept":
+              "application/json",
+
+            "content-type":
+              "application/json",
+
+            "x-api-key":
+              env.CLOUDBET_API_KEY || ""
+          },
+
+          body:
+            JSON.stringify({
+              query,
+              variables: {
+                limit: 1
+              }
+            }),
+
+          signal:
+            controller.signal
+        }
+      );
+
+    const raw =
+      await response.text();
+
+    let data:
+      any = null;
+
+    try {
+
+      data =
+        raw
+          ? JSON.parse(raw)
+          : null;
+
+    } catch {
+
+      data =
+        null;
+
+    }
+
+    const balances =
+      Array.isArray(
+        data?.data?.accountBalances
+      )
+        ? data.data.accountBalances
+        : [];
+
+    const bets =
+      Array.isArray(
+        data?.data?.bets
+      )
+        ? data.data.bets
+        : [];
+
+    const graphqlErrors =
+      Array.isArray(
+        data?.errors
+      )
+        ? data.errors
+        : [];
+
+    const usdtBalance =
+      balances.find(
+        (item: AnyObj) =>
+          String(
+            item?.currency ??
+            ""
+          ).toUpperCase() ===
+          "USDT"
+      ) ?? null;
+
+    const authenticated =
+      response.status === 200 &&
+      !!data &&
+      graphqlErrors.length === 0;
+
+    return json({
+
+      success:
+        authenticated,
+
+      worker:
+        "cloudbet-live-soccer-detector",
+
+      version:
+        VERSION,
+
+      action:
+        "GRAPHQL_CHECK",
+
+      read_only:
+        true,
+
+      betting:
+        false,
+
+      api_key_present:
+        !!env.CLOUDBET_API_KEY,
+
+      endpoint:
+        CLOUDBET_GRAPHQL_URL,
+
+      request: {
+        method:
+          "POST",
+
+        operation:
+          "accountBalances + bets(limit:1)"
+      },
+
+      response: {
+        http_status:
+          response.status,
+
+        ok:
+          response.ok,
+
+        elapsed_ms:
+          Date.now() -
+          started,
+
+        content_type:
+          response.headers.get(
+            "content-type"
+          )
+      },
+
+      authentication: {
+        accepted:
+          authenticated,
+
+        graphql_errors:
+          graphqlErrors
+      },
+
+      account: {
+        balances,
+        balances_count:
+          balances.length,
+
+        usdt:
+          usdtBalance,
+
+        usdt_present:
+          !!usdtBalance
+      },
+
+      trading: {
+        bets,
+        bets_count:
+          bets.length,
+
+        note:
+          "GraphQL bet history reflects API-accepted bets, not necessarily website UI bet history."
+      },
+
+      raw:
+        data === null
+          ? raw.slice(
+              0,
+              3000
+            )
+          : data,
+
+      interpretation: {
+        http_200_no_errors:
+          "GraphQL accepted the API key and executed the read-only query.",
+
+        balances_present:
+          "Account API data is visible through GraphQL.",
+
+        bets_empty:
+          "An empty bets array can be normal when no bets were placed via the public Trading API.",
+
+        no_bet_placed:
+          true
+      },
+
+      performance: {
+        total_elapsed_ms:
+          Date.now() -
+          started
+      }
+
+    });
+
+  } catch (
+    error
+  ) {
+
+    return json(
+      {
+        success:
+          false,
+
+        worker:
+          "cloudbet-live-soccer-detector",
+
+        version:
+          VERSION,
+
+        action:
+          "GRAPHQL_CHECK",
+
+        read_only:
+          true,
+
+        betting:
+          false,
+
+        api_key_present:
+          !!env.CLOUDBET_API_KEY,
+
+        endpoint:
+          CLOUDBET_GRAPHQL_URL,
+
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+
+        performance: {
+          total_elapsed_ms:
+            Date.now() -
+            started
+        }
+      },
+      500
+    );
+
+  } finally {
+
+    clearTimeout(
+      timer
+    );
+
+  }
+
+}
+
+
+// ============================================================
+// GRAPHQL SINGLE CHECK
+// ============================================================
+
+async function graphqlSingleCheck(
+  env: Env,
+  kind: "account" | "bets"
+): Promise<Response> {
+
+  const started =
+    Date.now();
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      CLOUDBET_TIMEOUT_MS
+    );
+
+  const query =
+    kind === "account"
+      ? `query AccountBalances { accountBalances { currency amount } }`
+      : `query Bets($limit: Int) { bets(limit: $limit) { referenceId categoryKey sportsKey eventId eventName marketUrl currency price stake side returnAmount betStatus betErrorCode } }`;
+
+  try {
+
+    const response =
+      await fetch(
+        CLOUDBET_GRAPHQL_URL,
+        {
+          method:
+            "POST",
+
+          headers: {
+            "accept":
+              "application/json",
+
+            "content-type":
+              "application/json",
+
+            "x-api-key":
+              env.CLOUDBET_API_KEY || ""
+          },
+
+          body:
+            JSON.stringify({
+              query,
+              variables:
+                kind === "bets"
+                  ? { limit: 1 }
+                  : undefined
+            }),
+
+          signal:
+            controller.signal
+        }
+      );
+
+    const raw =
+      await response.text();
+
+    let data:
+      any = null;
+
+    try {
+
+      data =
+        raw
+          ? JSON.parse(raw)
+          : null;
+
+    } catch {
+
+      data =
+        null;
+
+    }
+
+    const errors =
+      Array.isArray(
+        data?.errors
+      )
+        ? data.errors
+        : [];
+
+    const balances =
+      Array.isArray(
+        data?.data?.accountBalances
+      )
+        ? data.data.accountBalances
+        : [];
+
+    const bets =
+      Array.isArray(
+        data?.data?.bets
+      )
+        ? data.data.bets
+        : [];
+
+    const graphqlOk =
+      response.ok &&
+      !!data &&
+      errors.length === 0;
+
+    return json({
+
+      success:
+        graphqlOk,
+
+      worker:
+        "cloudbet-live-soccer-detector",
+
+      version:
+        VERSION,
+
+      action:
+        kind === "account"
+          ? "GRAPHQL_ACCOUNT_CHECK"
+          : "GRAPHQL_BETS_CHECK",
+
+      read_only:
+        true,
+
+      betting:
+        false,
+
+      api_key_present:
+        !!env.CLOUDBET_API_KEY,
+
+      endpoint:
+        CLOUDBET_GRAPHQL_URL,
+
+      request: {
+        method:
+          "POST",
+
+        operation:
+          kind === "account"
+            ? "accountBalances only"
+            : "bets(limit:1) only"
+      },
+
+      response: {
+        http_status:
+          response.status,
+
+        ok:
+          response.ok,
+
+        elapsed_ms:
+          Date.now() -
+          started,
+
+        content_type:
+          response.headers.get(
+            "content-type"
+          )
+      },
+
+      authentication: {
+        accepted:
+          graphqlOk,
+
+        graphql_errors:
+          errors
+      },
+
+      account:
+        kind === "account"
+          ? {
+              balances,
+              balances_count:
+                balances.length,
+
+              usdt:
+                balances.find(
+                  (x: AnyObj) =>
+                    String(
+                      x?.currency ??
+                      ""
+                    ).toUpperCase() ===
+                    "USDT"
+                ) ?? null
+            }
+          : null,
+
+      trading:
+        kind === "bets"
+          ? {
+              bets,
+              bets_count:
+                bets.length
+            }
+          : null,
+
+      raw:
+        data === null
+          ? raw.slice(
+              0,
+              3000
+            )
+          : data,
+
+      interpretation: {
+
+        isolated_query:
+          true,
+
+        purpose:
+          kind === "account"
+            ? "Tests accountBalances without invoking the bets resolver."
+            : "Tests bets(limit:1) without invoking the accountBalances resolver.",
+
+        no_bet_placed:
+          true
+      },
+
+      performance: {
+        total_elapsed_ms:
+          Date.now() -
+          started
+      }
+
+    });
+
+  } catch (
+    error
+  ) {
+
+    return json(
+      {
+        success:
+          false,
+
+        worker:
+          "cloudbet-live-soccer-detector",
+
+        version:
+          VERSION,
+
+        action:
+          kind === "account"
+            ? "GRAPHQL_ACCOUNT_CHECK"
+            : "GRAPHQL_BETS_CHECK",
+
+        read_only:
+          true,
+
+        betting:
+          false,
+
+        api_key_present:
+          !!env.CLOUDBET_API_KEY,
+
+        endpoint:
+          CLOUDBET_GRAPHQL_URL,
+
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error),
+
+        performance: {
+          total_elapsed_ms:
+            Date.now() -
+            started
+        }
+      },
+      500
+    );
+
+  } finally {
+
+    clearTimeout(
+      timer
+    );
+
+  }
+
+}
+
+
+// ============================================================
 // MAIN
 // ============================================================
 
@@ -2795,6 +4022,16 @@ export default {
 
           "/event?id=EVENT_ID",
 
+          "/line-test?id=EVENT_ID",
+
+          "/trading-check",
+
+          "/graphql-check",
+
+          "/graphql-account-check",
+
+          "/graphql-bets-check",
+
           "/diagnostic-events-raw",
 
           "/diagnostic-target-market",
@@ -2810,6 +4047,11 @@ export default {
       });
 
     }
+
+
+    // ========================================================
+    // LIVE
+    // ========================================================
 
     if (
       pathname ===
@@ -2875,6 +4117,11 @@ export default {
       }
 
     }
+
+
+    // ========================================================
+    // SEARCH
+    // ========================================================
 
     if (
       pathname ===
@@ -2971,6 +4218,11 @@ export default {
 
     }
 
+
+    // ========================================================
+    // EVENT
+    // ========================================================
+
     if (
       pathname ===
       "/event"
@@ -3056,6 +4308,233 @@ export default {
 
     }
 
+
+    // ========================================================
+    // LINE TEST
+    // ========================================================
+
+    if (
+      pathname ===
+      "/line-test"
+    ) {
+
+      const id =
+        url.searchParams.get(
+          "id"
+        );
+
+      if (!id) {
+
+        return json(
+          {
+
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "LINE_TEST",
+
+            error:
+              "Missing id"
+
+          },
+          400
+        );
+
+      }
+
+      try {
+
+        const result =
+          await fetchTargetLine(
+            env,
+            id
+          );
+
+        return json({
+
+          success:
+            true,
+
+          worker:
+            "cloudbet-live-soccer-detector",
+
+          version:
+            VERSION,
+
+          action:
+            "LINE_TEST",
+
+          read_only:
+            true,
+
+          betting:
+            false,
+
+          target: {
+
+            event_id:
+              id,
+
+            market:
+              TARGET_MARKET,
+
+            submarket:
+              TARGET_SUBMARKET,
+
+            outcome:
+              TARGET_OUTCOME,
+
+            params:
+              TARGET_PARAMS,
+
+            marketUrl:
+              TARGET_MARKET_URL
+
+          },
+
+          line:
+            result
+
+        });
+
+      } catch (
+        error
+      ) {
+
+        return json(
+          {
+
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "LINE_TEST",
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(error)
+
+          },
+          500
+        );
+
+      }
+
+    }
+
+
+    // ========================================================
+    // TRADING CHECK
+    // ========================================================
+
+    if (
+      pathname ===
+      "/trading-check"
+    ) {
+
+      try {
+
+        return await tradingAccessCheck(
+          env
+        );
+
+      } catch (
+        error
+      ) {
+
+        return json(
+          {
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "TRADING_CHECK",
+
+            read_only:
+              true,
+
+            betting:
+              false,
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(error)
+          },
+          500
+        );
+
+      }
+
+    }
+
+
+    // ========================================================
+    // GRAPHQL
+    // ========================================================
+
+    if (
+      pathname ===
+      "/graphql-check"
+    ) {
+
+      return await graphqlCheck(
+        env
+      );
+
+    }
+
+
+    if (
+      pathname ===
+      "/graphql-account-check"
+    ) {
+
+      return await graphqlSingleCheck(
+        env,
+        "account"
+      );
+
+    }
+
+
+    if (
+      pathname ===
+      "/graphql-bets-check"
+    ) {
+
+      return await graphqlSingleCheck(
+        env,
+        "bets"
+      );
+
+    }
+
+
+    // ========================================================
+    // RAW DIAGNOSTIC
+    // ========================================================
+
     if (
       pathname ===
       "/diagnostic-events-raw"
@@ -3096,6 +4575,11 @@ export default {
 
     }
 
+
+    // ========================================================
+    // TARGET DIAGNOSTIC
+    // ========================================================
+
     if (
       pathname ===
       "/diagnostic-target-market"
@@ -3135,6 +4619,11 @@ export default {
       }
 
     }
+
+
+    // ========================================================
+    // CLOUD0007
+    // ========================================================
 
     if (
       pathname ===
@@ -3196,6 +4685,7 @@ export default {
 
     }
 
+
     if (
       pathname ===
       "/diagnostic-cloud0007-api"
@@ -3234,6 +4724,7 @@ export default {
 
     }
 
+
     if (
       pathname ===
       "/diagnostic-cloud0007-routes"
@@ -3271,6 +4762,11 @@ export default {
       }
 
     }
+
+
+    // ========================================================
+    // 404
+    // ========================================================
 
     return json({
 
