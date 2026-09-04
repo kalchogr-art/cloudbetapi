@@ -29,7 +29,7 @@ const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
 const VERSION =
-  "V5.8.8";
+  "V5.8.9";
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
@@ -4931,6 +4931,87 @@ export default {
           },
           500
         );
+
+      }
+
+    }
+
+
+
+    // ========================================================
+    // EVENT STATUS SUMMARY — V5.8.9
+    // ========================================================
+
+    if (
+      pathname ===
+      "/event-status"
+    ) {
+
+      const id =
+        url.searchParams.get(
+          "id"
+        );
+
+      if (!id) {
+
+        return json({
+
+          success:
+            false,
+
+          worker:
+            "cloudbet-live-soccer-detector",
+
+          version:
+            VERSION,
+
+          action:
+            "EVENT_STATUS",
+
+          error:
+            "Missing id"
+
+        }, 400);
+
+      }
+
+      try {
+
+        return await eventStatusCheck(
+          env,
+          id
+        );
+
+      } catch (
+        error
+      ) {
+
+        return json({
+
+          success:
+            false,
+
+          worker:
+            "cloudbet-live-soccer-detector",
+
+          version:
+            VERSION,
+
+          action:
+            "EVENT_STATUS",
+
+          read_only:
+            true,
+
+          betting:
+            false,
+
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error)
+
+        }, 500);
 
       }
 
