@@ -29,7 +29,7 @@ const API_KEY_NAME =
   "CLOUDBET_API_KEY";
 
 const VERSION =
-  "V5.8.6";
+  "V5.8.7";
 
 const CLOUDBET_TIMEOUT_MS =
   8000;
@@ -964,6 +964,89 @@ async function getEvent(
         event
       ),
 
+  };
+}
+
+
+
+// ============================================================
+// DIRECT EVENT LOOKUP
+// V5.8.7
+//
+// READ ONLY
+// GET /pub/v2/odds/events/{EVENT_ID}
+// Returns the direct Cloudbet event response and target diagnostic.
+// ============================================================
+
+async function getEventDirect(
+  env: Env,
+  id: string
+): Promise<AnyObj> {
+
+  const targetId =
+    String(id).trim();
+
+  const path =
+    `/events/${encodeURIComponent(targetId)}`;
+
+  const result =
+    await cloudbetFetch(
+      env,
+      path
+    );
+
+  const raw =
+    await result.response.text();
+
+  let data: any = null;
+
+  try {
+    data = raw ? JSON.parse(raw) : null;
+  } catch {
+    data = null;
+  }
+
+  // Support either a direct event object or a wrapped event response.
+  const event =
+    data?.event &&
+    typeof data.event === "object"
+      ? data.event
+      : data &&
+        typeof data === "object" &&
+        !Array.isArray(data)
+      ? data
+      : null;
+
+  return {
+    request: {
+      method: "GET",
+      path,
+      requested_event_id: targetId,
+      http_status: result.response.status,
+      ok: result.response.ok,
+      elapsed_ms: result.elapsedMs,
+      content_type: result.response.headers.get("content-type")
+    },
+
+    found:
+      result.response.ok && !!event,
+
+    event,
+
+    target:
+      event
+        ? findTargetSelection(event)
+        : null,
+
+    target_diagnostic:
+      event
+        ? diagnoseTargetMarket(event)
+        : null,
+
+    raw:
+      data === null
+        ? raw.slice(0, 5000)
+        : data
   };
 }
 
@@ -4082,6 +4165,8 @@ export default {
           "/search?q=HOME%20AWAY",
 
           "/event?id=EVENT_ID",
+
+          "/event-direct?id=EVENT_ID",
 
           "/line-test?id=EVENT_ID",
 
