@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.9.9 — ALL LIVE AUDIT WITH MINUTE
+// CLOUDBET LIVE SOCCER DETECTOR V5.10 — BET PREFLIGHT CONFIG
 //
 // EXISTING PURPOSE:
 // - fast /live for matcher
@@ -23,7 +23,7 @@ interface Env {
 
 type AnyObj = Record<string, any>;
 
-const VERSION = "V5.9.9 ALL LIVE AUDIT WITH MINUTE";
+const VERSION = "V5.10 BET PREFLIGHT CONFIG";
 
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
@@ -32,6 +32,30 @@ const ACCOUNT_API_BASE =
   "https://sports-api.cloudbet.com/pub/v1/account";
 
 const TIMEOUT_MS = 8000;
+
+
+// ============================================================
+// BET CONFIG — USER SETTINGS
+// ============================================================
+//
+// ENABLED:
+//   false = preflight only
+//   true  = preflight still only; this worker does NOT send a wager.
+//
+// AMOUNT:
+//   Intended stake in account currency.
+//
+// MIN_MINUTE / MAX_MINUTE:
+//   Betting window for candidate generation.
+// ============================================================
+
+const BET_CONFIG = {
+  ENABLED: false,
+  AMOUNT: 0.10,
+  MIN_MINUTE: 10,
+  MAX_MINUTE: 20
+};
+
 
 const TARGET_MARKET =
   "soccer.total_goals_period_first_half";
@@ -2373,6 +2397,552 @@ async function allLiveLineAudit(
 }
 
 
+
+// ============================================================
+// BET PREFLIGHT HELPERS
+// ============================================================
+
+function preflightEventMinute(
+  event: AnyObj
+): number | null {
+
+  const raw =
+    event?.metadata?.eventTimeExtended ??
+    event?.metadata?.eventTime ??
+    event?.minute_extended ??
+    event?.minute ??
+    null;
+
+  if (
+    raw === null ||
+    raw === undefined
+  ) {
+    return null;
+  }
+
+  const match =
+    String(raw)
+      .trim()
+      .match(/^(\d{1,3})/);
+
+  if (!match) {
+    return null;
+  }
+
+  const minute =
+    Number(match[1]);
+
+  return Number.isFinite(minute)
+    ? minute
+    : null;
+}
+
+
+function preflightScore(
+  event: AnyObj
+): AnyObj | null {
+
+  const raw =
+    event?.metadata?.score ??
+    event?.score ??
+    null;
+
+  if (
+    Array.isArray(raw) &&
+    raw.length >= 2
+  ) {
+
+    const home =
+      finiteNumber(raw[0]);
+
+    const away =
+      finiteNumber(raw[1]);
+
+    if (
+      home !== null &&
+      away !== null
+    ) {
+      return {
+        home,
+        away
+      };
+    }
+  }
+
+  if (
+    raw &&
+    typeof raw === "object"
+  ) {
+
+    const home =
+      finiteNumber(
+        raw?.home ??
+        raw?.homeScore
+      );
+
+    const away =
+      finiteNumber(
+        raw?.away ??
+        raw?.awayScore
+      );
+
+    if (
+      home !== null &&
+      away !== null
+    ) {
+      return {
+        home,
+        away
+      };
+    }
+  }
+
+  return null;
+}
+
+
+function preflightFirstHalf(
+  event: AnyObj
+): boolean {
+
+  const period =
+    String(
+      event?.metadata?.eventStatus ??
+      event?.event_status ??
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+  return (
+    period === "1p" ||
+    period === "1h" ||
+    period === "first_half" ||
+    period === "first half"
+  );
+}
+
+
+function buildStraightBetPayload(
+  eventId: string,
+  marketUrl: string,
+  price: number,
+  amount: number,
+  currency: string
+): AnyObj {
+
+  return {
+    referenceId:
+      crypto.randomUUID(),
+
+    currency,
+
+    stake:
+      String(amount),
+
+    acceptPartialStake:
+      true,
+
+    priceChange: {
+      value:
+        "BETTER"
+    },
+
+    selection: {
+      eventId,
+      marketUrl,
+      price:
+        String(price)
+    }
+  };
+}
+
+
+async function getAccountBalance(
+  env: Env,
+  currency: string
+): Promise<AnyObj> {
+
+  const url =
+    "https://sports-api.cloudbet.com/pub/v1/account/currencies/" +
+    encodeURIComponent(currency) +
+    "/balance";
+
+  const started =
+    Date.now();
+
+  const response =
+    await fetch(
+      url,
+      {
+        method:
+          "GET",
+
+        headers: {
+          "Accept":
+            "application/json",
+
+          "X-API-Key":
+            String(
+              env.CLOUDBET_API_KEY ??
+              ""
+            )
+        }
+      }
+    );
+
+  let data: AnyObj | null =
+    null;
+
+  let raw: string | null =
+    null;
+
+  try {
+    data =
+      await response.json();
+  } catch {
+    try {
+      raw =
+        await response.text();
+    } catch {
+      raw =
+        null;
+    }
+  }
+
+  const amount =
+    finiteNumber(
+      data?.amount
+    );
+
+  return {
+    success:
+      response.ok &&
+      amount !== null,
+
+    status:
+      response.status,
+
+    amount,
+
+    elapsed_ms:
+      Date.now() -
+      started,
+
+    data,
+
+    raw
+  };
+}
+
+
+async function betPreflight(
+  env: Env,
+  eventId: string
+): Promise<AnyObj> {
+
+  const direct =
+    await getEventDirect(
+      env,
+      eventId
+    );
+
+  if (
+    !direct?.found ||
+    !direct?.event
+  ) {
+    return {
+      success:
+        false,
+
+      ready_to_place_bet:
+        false,
+
+      reason:
+        "EVENT_NOT_FOUND",
+
+      event_id:
+        eventId
+    };
+  }
+
+  const event =
+    direct.event;
+
+  const minute =
+    preflightEventMinute(
+      event
+    );
+
+  const score =
+    preflightScore(
+      event
+    );
+
+  const firstHalf =
+    preflightFirstHalf(
+      event
+    );
+
+  const inMinuteWindow =
+    minute !== null &&
+    minute >= BET_CONFIG.MIN_MINUTE &&
+    minute <= BET_CONFIG.MAX_MINUTE;
+
+  const zeroZero =
+    score !== null &&
+    score.home === 0 &&
+    score.away === 0;
+
+  const target =
+    findExactTarget(
+      event
+    );
+
+  if (!target) {
+    return {
+      success:
+        true,
+
+      ready_to_place_bet:
+        false,
+
+      config:
+        BET_CONFIG,
+
+      event_id:
+        eventId,
+
+      minute,
+
+      score,
+
+      checks: {
+        first_half:
+          firstHalf,
+
+        zero_zero:
+          zeroZero,
+
+        in_minute_window:
+          inMinuteWindow,
+
+        target_found:
+          false
+      },
+
+      reason:
+        "TARGET_NOT_FOUND"
+    };
+  }
+
+  const marketUrl =
+    String(
+      target?.marketUrl ??
+      TARGET_MARKET_URL
+    ).trim();
+
+  const line =
+    await latestLineFetch(
+      env,
+      eventId,
+      marketUrl
+    );
+
+  const price =
+    finiteNumber(
+      line?.line?.price
+    );
+
+  const minStake =
+    finiteNumber(
+      line?.line?.minStake
+    );
+
+  const maxStake =
+    finiteNumber(
+      line?.line?.maxStake
+    );
+
+  const selectionEnabled =
+    line?.available ===
+    true;
+
+  const amount =
+    Number(
+      BET_CONFIG.AMOUNT
+    );
+
+  const stakeAboveMin =
+    minStake !== null &&
+    Number.isFinite(amount) &&
+    amount >= minStake;
+
+  const stakeBelowMax =
+    maxStake !== null &&
+    Number.isFinite(amount) &&
+    amount <= maxStake;
+
+  const priceValid =
+    price !== null &&
+    price > 1;
+
+  const currency =
+    "USDT";
+
+  const balance =
+    await getAccountBalance(
+      env,
+      currency
+    );
+
+  const balanceEnough =
+    balance?.success === true &&
+    balance?.amount !== null &&
+    balance.amount >= amount;
+
+  const ready =
+    firstHalf &&
+    zeroZero &&
+    inMinuteWindow &&
+    selectionEnabled &&
+    priceValid &&
+    stakeAboveMin &&
+    stakeBelowMax &&
+    balanceEnough;
+
+  const payload =
+    ready
+      ? buildStraightBetPayload(
+          eventId,
+          marketUrl,
+          price as number,
+          amount,
+          currency
+        )
+      : null;
+
+  return {
+    success:
+      true,
+
+    action:
+      "BET_PREFLIGHT",
+
+    read_only:
+      true,
+
+    betting_enabled_setting:
+      BET_CONFIG.ENABLED,
+
+    wager_sent:
+      false,
+
+    place_bet_called:
+      false,
+
+    ready_to_place_bet:
+      ready,
+
+    config:
+      BET_CONFIG,
+
+    event: {
+      event_id:
+        eventId,
+
+      home:
+        event?.home?.name ??
+        event?.home ??
+        null,
+
+      away:
+        event?.away?.name ??
+        event?.away ??
+        null,
+
+      status:
+        event?.status ??
+        null,
+
+      minute,
+
+      score
+    },
+
+    selection: {
+      market:
+        target?.market ??
+        null,
+
+      market_url:
+        marketUrl,
+
+      status:
+        line?.line?.status ??
+        null,
+
+      price,
+
+      min_stake:
+        minStake,
+
+      max_stake:
+        maxStake
+    },
+
+    account: {
+      currency,
+
+      balance:
+        balance?.amount ??
+        null,
+
+      balance_request_status:
+        balance?.status ??
+        null
+    },
+
+    checks: {
+      first_half:
+        firstHalf,
+
+      zero_zero:
+        zeroZero,
+
+      minute_known:
+        minute !== null,
+
+      in_minute_window:
+        inMinuteWindow,
+
+      selection_enabled:
+        selectionEnabled,
+
+      price_valid:
+        priceValid,
+
+      stake_above_min:
+        stakeAboveMin,
+
+      stake_below_max:
+        stakeBelowMax,
+
+      balance_sufficient:
+        balanceEnough
+    },
+
+    would_send:
+      payload,
+
+    note:
+      BET_CONFIG.ENABLED
+        ? "ENABLED=true, but this worker remains PREVIEW ONLY and does not send POST /pub/v4/bets/place/straight."
+        : "ENABLED=false. Preview only."
+  };
+}
+
+
 // ============================================================
 // MAIN
 // ============================================================
@@ -2430,7 +3000,8 @@ export default {
           "/account-test",
           "/trading-preflight?id=EVENT_ID",
           "/trading-access-test",
-          "/all-live-line-audit"
+          "/all-live-line-audit",
+          "/bet-preflight?id=EVENT_ID"
         ]
       });
     }
@@ -3124,6 +3695,99 @@ export default {
               false,
 
             betting:
+              false,
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(error)
+          },
+          500
+        );
+      }
+    }
+
+
+    // ========================================================
+    // BET PREFLIGHT — PREVIEW ONLY
+    // ========================================================
+
+    if (
+      path ===
+      "/bet-preflight"
+    ) {
+
+      const eventId =
+        String(
+          url.searchParams.get("id") ??
+          ""
+        ).trim();
+
+      if (!eventId) {
+        return json(
+          {
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "BET_PREFLIGHT",
+
+            error:
+              "Missing query parameter: id"
+          },
+          400
+        );
+      }
+
+      try {
+
+        const result =
+          await betPreflight(
+            env,
+            eventId
+          );
+
+        return json({
+          worker:
+            "cloudbet-live-soccer-detector",
+
+          version:
+            VERSION,
+
+          ...result
+        });
+
+      } catch (
+        error
+      ) {
+
+        return json(
+          {
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "BET_PREFLIGHT",
+
+            read_only:
+              true,
+
+            wager_sent:
+              false,
+
+            place_bet_called:
               false,
 
             error:
