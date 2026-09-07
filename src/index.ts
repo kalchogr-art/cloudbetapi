@@ -50,7 +50,7 @@ const TIMEOUT_MS = 8000;
 // ============================================================
 
 const BET_CONFIG = {
-  ENABLED: enable,
+  ENABLED: true,
   AMOUNT: 0.10,
   MIN_MINUTE: 5,
   MAX_MINUTE: 40
