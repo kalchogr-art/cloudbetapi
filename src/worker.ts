@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7.4.1
+// CLOUDBET MATCH MATCHER V7.4.2
 // FAST HUNTER + SEPARATE EVENT DISCOVERY / ODDS LOOKUP
 // LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
 // V27 SERVICE BINDING + DIRECT CLOUDBET PUBLIC SPORTS API
@@ -43,7 +43,7 @@ interface Env {
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.4.1-DISCOVERY-SEPARATE-FROM-ODDS";
+  "V7.4.2-GENERAL-DISTINCTIVE-TOKEN-MATCH";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -634,6 +634,70 @@ function tokenSimilarity(
 
 
 // ============================================================
+// DISTINCTIVE TOKEN BRIDGE
+// ============================================================
+//
+// General abbreviation protection.
+//
+// Examples that may receive the bridge:
+//   Atletico Colina <-> AC Colina
+//   SC Freiburg     <-> Freiburg
+//   CD Example      <-> Example
+//
+// The bridge is intentionally NOT allowed for weak/common tokens
+// such as city, united, sporting, real, deportivo, etc.
+//
+// It does not by itself create a match. classifyMatch() still
+// requires a strong TWO-SIDED match and all existing live/category/
+// minute protections remain active.
+// ============================================================
+
+function distinctiveSingleTokenBridge(
+  aTokens: string[],
+  bTokens: string[]
+): number | null {
+
+  const shorter =
+    aTokens.length <= bTokens.length
+      ? aTokens
+      : bTokens;
+
+  const longer =
+    aTokens.length <= bTokens.length
+      ? bTokens
+      : aTokens;
+
+  if (
+    shorter.length !== 1 ||
+    longer.length < 2
+  ) {
+    return null;
+  }
+
+  const token =
+    shorter[0];
+
+  if (
+    !token ||
+    token.length < 4 ||
+    WEAK_TEAM_TOKENS.has(token)
+  ) {
+    return null;
+  }
+
+  if (
+    !longer.includes(token)
+  ) {
+    return null;
+  }
+
+  // A unique, exact, meaningful token is a strong abbreviation bridge,
+  // but deliberately below an exact full-name match.
+  return 0.88;
+}
+
+
+// ============================================================
 // TEAM SCORE
 // ============================================================
 
@@ -688,6 +752,12 @@ function teamScore(
   ) {
     return 0;
   }
+
+  const distinctiveBridge =
+    distinctiveSingleTokenBridge(
+      aTokens,
+      bTokens
+    );
 
   const shorter =
     aTokens.length <=
@@ -898,6 +968,16 @@ function teamScore(
       Math.min(
         score,
         0.58
+      );
+  }
+
+  if (
+    distinctiveBridge !== null
+  ) {
+    score =
+      Math.max(
+        score,
+        distinctiveBridge
       );
   }
 
