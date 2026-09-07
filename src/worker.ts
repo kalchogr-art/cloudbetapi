@@ -1,6 +1,6 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7.4.0
-// FAST HUNTER + DIRECT ODDS
+// CLOUDBET MATCH MATCHER V7.4.1
+// FAST HUNTER + SEPARATE EVENT DISCOVERY / ODDS LOOKUP
 // LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
 // V27 SERVICE BINDING + DIRECT CLOUDBET PUBLIC SPORTS API
 // READ ONLY
@@ -14,13 +14,15 @@
 // - /match?signals=...
 //   -> FAST_HUNTER mode
 //   -> DOES NOT fetch/process V27
-//   -> Cloudbet candidates first filtered to:
+//   -> discovers ALL live soccer WITHOUT market filter
+//   -> Cloudbet candidates then filtered to:
 //      LIVE + 1H + 0:0 + valid minute
 //   -> per Hunter signal: only candidates within +/-5 minutes
 //   -> then strict two-sided team matching
 //   -> aliases + fuzzy + category protection
 //   -> only CONFIDENT_MATCH => secure_match=true
-//   -> returns exact 1H Over 0.5 odds
+//   -> preserves event_id even when odds are unavailable
+//   -> exact 1H Over 0.5 odds queried separately AFTER match
 //
 // - /diagnostic
 //   -> light V27 + Cloudbet diagnostic
@@ -41,7 +43,7 @@ interface Env {
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.4.0-FAST-HUNTER-LIVE-00-MINUTE";
+  "V7.4.1-DISCOVERY-SEPARATE-FROM-ODDS";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -2038,8 +2040,9 @@ async function fetchCloudbetJson(
 // sports[].competitions[].events[]
 // ============================================================
 
-async function getDirectCloudbetLive():
-  Promise<AnyObj[]> {
+async function getDirectCloudbetLive(
+  includeOddsMarket = false
+): Promise<AnyObj[]> {
 
   const url =
     new URL(
@@ -2053,10 +2056,17 @@ async function getDirectCloudbetLive():
     "soccer"
   );
 
-  url.searchParams.set(
-    "markets",
-    ODDS_MARKET
-  );
+  // V7.4.1:
+  // Event discovery MUST NOT depend on odds/market availability.
+  // Only the separate odds lookup uses markets=ODDS_MARKET.
+  if (
+    includeOddsMarket
+  ) {
+    url.searchParams.set(
+      "markets",
+      ODDS_MARKET
+    );
+  }
 
   url.searchParams.set(
     "live",
@@ -2318,15 +2328,80 @@ function matchDisplayName(
 
 
 // ============================================================
+// CLOUDBET EVENT ID
+// ============================================================
+
+function cloudbetEventId(
+  event: AnyObj
+): string | null {
+
+  const value =
+    event?.event_id ??
+    event?.id ??
+    null;
+
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return null;
+  }
+
+  const id =
+    String(
+      value
+    ).trim();
+
+  return id || null;
+}
+
+
+function buildOddsEventMap(
+  events: AnyObj[]
+): Map<string, AnyObj> {
+
+  const map =
+    new Map<
+      string,
+      AnyObj
+    >();
+
+  for (
+    const event
+    of events
+  ) {
+
+    const id =
+      cloudbetEventId(
+        event
+      );
+
+    if (!id) {
+      continue;
+    }
+
+    map.set(
+      id,
+      event
+    );
+  }
+
+  return map;
+}
+
+
+// ============================================================
 // LIVE DISPLAY RECORD
 // ============================================================
 
 function buildCloudbetLiveRecord(
-  event: AnyObj
+  event: AnyObj,
+  oddsEvent: AnyObj | null = null
 ): AnyObj {
 
   const odds =
     extractOver05(
+      oddsEvent ??
       event
     );
 
@@ -3159,18 +3234,27 @@ async function runFastHunter(
   const started =
     Date.now();
 
-  const cloudbetStarted =
+  // ==========================================================
+  // STEP 1 — DISCOVER EVENTS
+  // IMPORTANT:
+  // NO markets= filter here.
+  // A missing/disabled O0.5 market must NEVER hide the match.
+  // ==========================================================
+
+  const discoveryStarted =
     Date.now();
 
   const rawCloudbet =
-    await getDirectCloudbetLive();
+    await getDirectCloudbetLive(
+      false
+    );
 
-  const cloudbetFetchMs =
+  const cloudbetDiscoveryMs =
     Date.now() -
-    cloudbetStarted;
+    discoveryStarted;
 
-  // V7.4 HARD PRE-FILTER:
-  // only LIVE + FIRST HALF + 0:0 + valid minute
+  // HARD PRE-FILTER:
+  // LIVE + FIRST HALF + 0:0 + valid minute.
   const cloudbetLive =
     rawCloudbet.filter(
       isHunterEligibleCloudbetEvent
@@ -3193,14 +3277,23 @@ async function runFastHunter(
     Date.now() -
     prepareStarted;
 
-  const hunterResults:
-    AnyObj[] = [];
 
-  let totalCandidateEvaluations =
-    0;
+  // ==========================================================
+  // STEP 2 — MATCH HUNTER SIGNALS TO EVENTS
+  // Still NO odds dependency.
+  // ==========================================================
 
   const matchStarted =
     Date.now();
+
+  const matchedRows:
+    {
+      signal: AnyObj;
+      result: AnyObj;
+    }[] = [];
+
+  let totalCandidateEvaluations =
+    0;
 
   for (
     const signal
@@ -3218,17 +3311,119 @@ async function runFastHunter(
     totalCandidateEvaluations +=
       result.candidateEvaluations;
 
+    matchedRows.push({
+      signal,
+      result
+    });
+  }
+
+  const matchingMs =
+    Date.now() -
+    matchStarted;
+
+
+  // ==========================================================
+  // STEP 3 — SEPARATE ODDS LOOKUP
+  //
+  // Only now, after the match/event_id was found, query the
+  // exact 1H O0.5 market feed.
+  //
+  // If the event is absent from this odds feed:
+  // - MATCH remains valid
+  // - event_id remains valid
+  // - odds.available = false
+  //
+  // This is the critical V7.4.1 behavior.
+  // ==========================================================
+
+  const hasSecureMatch =
+    matchedRows.some(
+      row =>
+        row.result?.found ===
+        true
+    );
+
+  let oddsEvents:
+    AnyObj[] = [];
+
+  let oddsFetchMs =
+    0;
+
+  if (
+    hasSecureMatch
+  ) {
+
+    const oddsStarted =
+      Date.now();
+
+    try {
+
+      oddsEvents =
+        await getDirectCloudbetLive(
+          true
+        );
+
+    } catch {
+
+      // Odds failure must NOT destroy a secure event match.
+      oddsEvents = [];
+    }
+
+    oddsFetchMs =
+      Date.now() -
+      oddsStarted;
+  }
+
+  const oddsByEventId =
+    buildOddsEventMap(
+      oddsEvents
+    );
+
+
+  // ==========================================================
+  // STEP 4 — BUILD RESPONSE
+  // ==========================================================
+
+  const hunterResults:
+    AnyObj[] = [];
+
+  for (
+    const row
+    of matchedRows
+  ) {
+
+    const signal =
+      row.signal;
+
+    const result =
+      row.result;
+
     const detail =
       result.detail;
 
     const cb =
       result.best;
 
+    const matchedEventId =
+      cb
+        ? cloudbetEventId(
+            cb.raw
+          )
+        : null;
+
+    const oddsEvent =
+      matchedEventId
+        ? oddsByEventId.get(
+            matchedEventId
+          ) ??
+          null
+        : null;
+
     const odds =
       result.found &&
-      cb
+      oddsEvent
         ? extractOver05(
-            cb.raw
+            oddsEvent
           )
         : null;
 
@@ -3461,11 +3656,14 @@ async function runFastHunter(
         exact_id_alone:
           false,
 
+        provider_id_match_used:
+          false,
+
         required_classification:
           "CONFIDENT_MATCH",
 
         candidate_discovery:
-          "LIVE_1H_00_THEN_MINUTE_THEN_TOKEN_INDEX_WITH_FULL_FALLBACK"
+          "ALL_LIVE_SOCCER_THEN_1H_00_MINUTE_THEN_NAME_MATCH"
       },
 
       diagnostics: {
@@ -3497,6 +3695,16 @@ async function runFastHunter(
         live_filter:
           "LIVE + 1H + 0:0 + CLOSE_MINUTE",
 
+        event_discovery:
+          "ALL_LIVE_SOCCER_WITHOUT_MARKET_FILTER",
+
+        odds_lookup:
+          "SEPARATE_AFTER_SECURE_MATCH",
+
+        odds_event_found:
+          oddsEvent !==
+          null,
+
         target_normalized_home:
           normalizeTeam(
             signal?.home
@@ -3510,9 +3718,6 @@ async function runFastHunter(
     });
   }
 
-  const matchingMs =
-    Date.now() -
-    matchStarted;
 
   return json({
     success:
@@ -3537,8 +3742,11 @@ async function runFastHunter(
       cloudbet:
         "DIRECT CLOUDBET PUBLIC SPORTS API",
 
+      event_discovery:
+        "ALL LIVE SOCCER — NO MARKET FILTER",
+
       odds:
-        "DIRECT FROM MATCHED CLOUDBET LIVE EVENT"
+        "SEPARATE EXACT 1H OVER 0.5 LOOKUP AFTER MATCH"
     },
 
     settings: {
@@ -3565,6 +3773,15 @@ async function runFastHunter(
 
       prefilter:
         "LIVE + 1H + 0:0 + VALID MINUTE",
+
+      discovery_market_filter:
+        false,
+
+      odds_lookup_after_match:
+        true,
+
+      preserve_event_id_without_odds:
+        true,
 
       matcher:
         "STRICT TWO-SIDED TEAM NORMALIZATION + ALIAS + TOKEN FUZZY + CATEGORY PROTECTION",
@@ -3594,6 +3811,9 @@ async function runFastHunter(
 
       cloudbet_live_1h_00_matches:
         cloudbetLive.length,
+
+      cloudbet_odds_feed_matches:
+        oddsEvents.length,
 
       hunter_secure_matches:
         hunterResults.filter(
@@ -3630,8 +3850,11 @@ async function runFastHunter(
       hunter_candidate_evaluations:
         totalCandidateEvaluations,
 
-      cloudbet_fetch_ms:
-        cloudbetFetchMs,
+      cloudbet_discovery_ms:
+        cloudbetDiscoveryMs,
+
+      odds_fetch_ms:
+        oddsFetchMs,
 
       prepare_ms:
         prepareMs,
@@ -3675,7 +3898,9 @@ async function runLightDiagnostic(
         "/"
       ),
 
-      getDirectCloudbetLive()
+      getDirectCloudbetLive(
+        false
+      )
     ]);
 
   const v27Matches =
@@ -3703,8 +3928,23 @@ async function runLightDiagnostic(
       isHunterEligibleCloudbetEvent
     );
 
+  let oddsEvents:
+    AnyObj[] = [];
+
+  try {
+
+    oddsEvents =
+      await getDirectCloudbetLive(
+        true
+      );
+
+  } catch {
+
+    oddsEvents = [];
+  }
+
   const withOdds =
-    live1h00.filter(
+    oddsEvents.filter(
       event =>
         extractOver05(
           event
@@ -3732,18 +3972,27 @@ async function runLightDiagnostic(
         "V27 SERVICE BINDING",
 
       cloudbet:
-        "DIRECT CLOUDBET PUBLIC SPORTS API"
+        "DIRECT CLOUDBET PUBLIC SPORTS API",
+
+      event_discovery:
+        "ALL LIVE SOCCER — NO MARKET FILTER",
+
+      odds:
+        "SEPARATE MARKET QUERY"
     },
 
     note:
-      "Full all-vs-all diagnostic matching is intentionally disabled to avoid CPU limit.",
+      "Event discovery is independent from odds availability. Full all-vs-all diagnostic matching is disabled to avoid CPU limit.",
 
     settings: {
       prefilter:
         "LIVE + 1H + 0:0 + VALID MINUTE",
 
       minute_tolerance:
-        MATCH_MINUTE_TOLERANCE
+        MATCH_MINUTE_TOLERANCE,
+
+      discovery_market_filter:
+        false
     },
 
     stats: {
@@ -3758,6 +4007,9 @@ async function runLightDiagnostic(
 
       cloudbet_live_1h_00_matches:
         live1h00.length,
+
+      cloudbet_odds_feed_matches:
+        oddsEvents.length,
 
       cloudbet_over_05_found:
         withOdds.length,
@@ -3880,10 +4132,13 @@ export default {
           true,
 
         filter:
-          "LIVE + 1H + 0:0 + +/-5 MINUTES",
+          "ALL LIVE SOCCER -> 1H + 0:0 + +/-5 MINUTES -> NAME MATCH",
+
+        discovery_market_filter:
+          false,
 
         odds:
-          "1H OVER 0.5",
+          "SEPARATE 1H OVER 0.5 LOOKUP AFTER MATCH",
 
         routes: [
           "/live",
@@ -3909,7 +4164,29 @@ export default {
           Date.now();
 
         const events =
-          await getDirectCloudbetLive();
+          await getDirectCloudbetLive(
+            false
+          );
+
+        let oddsEvents:
+          AnyObj[] = [];
+
+        try {
+
+          oddsEvents =
+            await getDirectCloudbetLive(
+              true
+            );
+
+        } catch {
+
+          oddsEvents = [];
+        }
+
+        const oddsByEventId =
+          buildOddsEventMap(
+            oddsEvents
+          );
 
         const matches =
           events
@@ -3917,7 +4194,26 @@ export default {
               isHunterEligibleCloudbetEvent
             )
             .map(
-              buildCloudbetLiveRecord
+              event => {
+
+                const id =
+                  cloudbetEventId(
+                    event
+                  );
+
+                const oddsEvent =
+                  id
+                    ? oddsByEventId.get(
+                        id
+                      ) ??
+                      null
+                    : null;
+
+                return buildCloudbetLiveRecord(
+                  event,
+                  oddsEvent
+                );
+              }
             );
 
         const withOdds =
@@ -3945,6 +4241,12 @@ export default {
 
           source:
             "DIRECT CLOUDBET PUBLIC SPORTS API",
+
+          event_discovery:
+            "ALL LIVE SOCCER — NO MARKET FILTER",
+
+          odds_lookup:
+            "SEPARATE MARKET QUERY",
 
           target: {
             sport:
