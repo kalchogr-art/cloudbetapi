@@ -1,20 +1,26 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7.3.0 — FAST HUNTER + DIRECT ODDS
+// CLOUDBET MATCH MATCHER V7.4.0
+// FAST HUNTER + DIRECT ODDS
+// LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
 // V27 SERVICE BINDING + DIRECT CLOUDBET PUBLIC SPORTS API
 // READ ONLY
 //
 // FEATURES:
 // - /live
-//   -> reads current Cloudbet live soccer events directly
-//   -> returns exact 1H Over 0.5 odds
+//   -> current Cloudbet LIVE soccer
+//   -> only 1H + 0:0
+//   -> exact 1H Over 0.5 odds
 //
 // - /match?signals=...
 //   -> FAST_HUNTER mode
 //   -> DOES NOT fetch/process V27
-//   -> reads Cloudbet live soccer directly
-//   -> matches Hunter signals by team names
+//   -> Cloudbet candidates first filtered to:
+//      LIVE + 1H + 0:0 + valid minute
+//   -> per Hunter signal: only candidates within +/-5 minutes
+//   -> then strict two-sided team matching
+//   -> aliases + fuzzy + category protection
 //   -> only CONFIDENT_MATCH => secure_match=true
-//   -> returns exact 1H Over 0.5 odds from matched Cloudbet event
+//   -> returns exact 1H Over 0.5 odds
 //
 // - /diagnostic
 //   -> light V27 + Cloudbet diagnostic
@@ -35,7 +41,7 @@ interface Env {
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.3.1-FAST-HUNTER-ODDS-1H-00";
+  "V7.4.0-FAST-HUNTER-LIVE-00-MINUTE";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -63,6 +69,9 @@ const COMPETITION_BONUS =
 
 const COUNTRY_BONUS =
   0.02;
+
+const MATCH_MINUTE_TOLERANCE =
+  5;
 
 
 // ============================================================
@@ -261,13 +270,33 @@ const TEAM_ALIASES:
     "schwarz weiss bregenz",
 
   "schwarz weiss bregenz":
-    "schwarz weiss bregenz"
+    "schwarz weiss bregenz",
+
+  // Bulgaria
+  "dunav ruse":
+    "dunav 2010",
+
+  "dunav 2010":
+    "dunav 2010",
+
+  "fc dunav 2010":
+    "dunav 2010",
+
+  "fc dunav ruse":
+    "dunav 2010",
+
+  "slavia sofia":
+    "slavia sofia",
+
+  "pfc slavia sofia":
+    "slavia sofia"
 };
 
 
 const GENERIC_WORDS =
   new Set([
     "fc",
+    "pfc",
     "cf",
     "sc",
     "ac",
@@ -1661,6 +1690,252 @@ function numericOrNull(
 
 
 // ============================================================
+// HUNTER LIVE STATE FILTER
+// LIVE + 1H + 0:0 + CLOSE MINUTE
+// ============================================================
+
+function parseMatchMinute(
+  value: any
+): number | null {
+
+  if (
+    typeof value ===
+      "number" &&
+    Number.isFinite(
+      value
+    )
+  ) {
+    return Math.floor(
+      value
+    );
+  }
+
+  const text =
+    String(
+      value ?? ""
+    ).trim();
+
+  if (!text) {
+    return null;
+  }
+
+  const match =
+    text.match(
+      /^(\d{1,3})/
+    );
+
+  if (!match) {
+    return null;
+  }
+
+  const minute =
+    Number(
+      match[1]
+    );
+
+  return Number.isFinite(
+    minute
+  )
+    ? minute
+    : null;
+}
+
+
+function cloudbetMinute(
+  event: AnyObj
+): number | null {
+
+  return parseMatchMinute(
+    event?.metadata
+      ?.eventTimeExtended ??
+    event?.metadata
+      ?.eventTime ??
+    event?.minute_extended ??
+    event?.minute ??
+    null
+  );
+}
+
+
+function hunterReferenceMinute(
+  signal: AnyObj
+): number | null {
+
+  return parseMatchMinute(
+    signal?.current_minute ??
+    signal?.minute ??
+    signal?.entry_minute ??
+    null
+  );
+}
+
+
+function isCloudbetFirstHalf(
+  event: AnyObj
+): boolean {
+
+  const status =
+    String(
+      event?.metadata
+        ?.eventStatus ??
+      event?.event_status ??
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+  return (
+    status === "1p" ||
+    status === "1h" ||
+    status === "first_half" ||
+    status === "first half"
+  );
+}
+
+
+// ============================================================
+// CLOUD BET SCORE
+// ============================================================
+
+function cloudbetScore(
+  score: any
+): AnyObj | null {
+
+  if (
+    !Array.isArray(
+      score
+    ) ||
+    score.length < 2
+  ) {
+    return null;
+  }
+
+  return {
+    home:
+      numericOrNull(
+        score[0]
+      ),
+
+    away:
+      numericOrNull(
+        score[1]
+      )
+  };
+}
+
+
+function isCloudbetZeroZero(
+  event: AnyObj
+): boolean {
+
+  const score =
+    cloudbetScore(
+      event?.metadata
+        ?.score
+    );
+
+  return (
+    score !== null &&
+    score.home === 0 &&
+    score.away === 0
+  );
+}
+
+
+function isHunterEligibleCloudbetEvent(
+  event: AnyObj
+): boolean {
+
+  if (
+    !isCloudbetLive(
+      event
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    !isCloudbetFirstHalf(
+      event
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    !isCloudbetZeroZero(
+      event
+    )
+  ) {
+    return false;
+  }
+
+  if (
+    cloudbetMinute(
+      event
+    ) === null
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+
+function minuteDifference(
+  signal: AnyObj,
+  event: AnyObj
+): number | null {
+
+  const hunterMinute =
+    hunterReferenceMinute(
+      signal
+    );
+
+  const cbMinute =
+    cloudbetMinute(
+      event
+    );
+
+  if (
+    hunterMinute === null ||
+    cbMinute === null
+  ) {
+    return null;
+  }
+
+  return Math.abs(
+    hunterMinute -
+    cbMinute
+  );
+}
+
+
+function minuteCompatible(
+  signal: AnyObj,
+  event: AnyObj
+): boolean {
+
+  const difference =
+    minuteDifference(
+      signal,
+      event
+    );
+
+  if (
+    difference === null
+  ) {
+    return false;
+  }
+
+  return (
+    difference <=
+    MATCH_MINUTE_TOLERANCE
+  );
+}
+
+
+// ============================================================
 // CLOUDBET HTTP GET
 // ============================================================
 
@@ -2017,37 +2292,6 @@ function extractOver05(
 
 
 // ============================================================
-// CLOUD BET SCORE
-// ============================================================
-
-function cloudbetScore(
-  score: any
-): AnyObj | null {
-
-  if (
-    !Array.isArray(
-      score
-    ) ||
-    score.length < 2
-  ) {
-    return null;
-  }
-
-  return {
-    home:
-      numericOrNull(
-        score[0]
-      ),
-
-    away:
-      numericOrNull(
-        score[1]
-      )
-  };
-}
-
-
-// ============================================================
 // EVENT NAME
 // ============================================================
 
@@ -2131,6 +2375,11 @@ function buildCloudbetLiveRecord(
       event?.metadata
         ?.eventTimeExtended ??
       null,
+
+    parsed_minute:
+      cloudbetMinute(
+        event
+      ),
 
     score:
       cloudbetScore(
@@ -2314,6 +2563,14 @@ function normalizeHunterSignal(
 
     entry_minute:
       signal?.entry_minute ??
+      null,
+
+    current_minute:
+      signal?.current_minute ??
+      null,
+
+    period:
+      signal?.period ??
       null,
 
     hunter_score:
@@ -2505,6 +2762,9 @@ function candidateIndexesForSignal(
     }
   }
 
+  // Important:
+  // If name tokens fail because names are very different,
+  // evaluate the already-small LIVE+1H+0:0 list.
   if (
     set.size === 0
   ) {
@@ -2650,7 +2910,66 @@ function findHunterTargetMatch(
         0,
 
       candidates:
-        0
+        0,
+
+      minuteCandidates:
+        0,
+
+      targetMinute:
+        hunterReferenceMinute(
+          signal
+        ),
+
+      bestMinute:
+        null,
+
+      bestMinuteDifference:
+        null
+    };
+  }
+
+  const targetMinute =
+    hunterReferenceMinute(
+      signal
+    );
+
+  if (
+    targetMinute === null
+  ) {
+
+    return {
+      found:
+        false,
+
+      best:
+        null,
+
+      detail:
+        null,
+
+      classification:
+        "TRUE_UNMATCHED",
+
+      reason:
+        "HUNTER_SIGNAL_MINUTE_MISSING",
+
+      candidateEvaluations:
+        0,
+
+      candidates:
+        0,
+
+      minuteCandidates:
+        0,
+
+      targetMinute:
+        null,
+
+      bestMinute:
+        null,
+
+      bestMinuteDifference:
+        null
     };
   }
 
@@ -2675,6 +2994,17 @@ function findHunterTargetMatch(
   let candidateEvaluations =
     0;
 
+  let minuteCandidates =
+    0;
+
+  let bestMinute:
+    number | null =
+    null;
+
+  let bestMinuteDifference:
+    number | null =
+    null;
+
   for (
     const index
     of candidates
@@ -2687,6 +3017,19 @@ function findHunterTargetMatch(
       continue;
     }
 
+    // HARD FILTER:
+    // candidate must be within +/-5 minutes
+    // of the Hunter current/entry minute.
+    if (
+      !minuteCompatible(
+        signal,
+        cb.raw
+      )
+    ) {
+      continue;
+    }
+
+    minuteCandidates++;
     candidateEvaluations++;
 
     const detail =
@@ -2708,6 +3051,17 @@ function findHunterTargetMatch(
 
       bestScore =
         detail.total;
+
+      bestMinute =
+        cloudbetMinute(
+          cb.raw
+        );
+
+      bestMinuteDifference =
+        minuteDifference(
+          signal,
+          cb.raw
+        );
     }
   }
 
@@ -2730,12 +3084,24 @@ function findHunterTargetMatch(
         "TRUE_UNMATCHED",
 
       reason:
-        "NO_VALID_CLOUDBET_CANDIDATE",
+        minuteCandidates === 0
+          ? "NO_CLOUDBET_CANDIDATE_WITHIN_MINUTE_WINDOW"
+          : "NO_VALID_CLOUDBET_CANDIDATE",
 
       candidateEvaluations,
 
       candidates:
-        candidates.length
+        candidates.length,
+
+      minuteCandidates,
+
+      targetMinute,
+
+      bestMinute:
+        null,
+
+      bestMinuteDifference:
+        null
     };
   }
 
@@ -2766,7 +3132,15 @@ function findHunterTargetMatch(
     candidateEvaluations,
 
     candidates:
-      candidates.length
+      candidates.length,
+
+    minuteCandidates,
+
+    targetMinute,
+
+    bestMinute,
+
+    bestMinuteDifference
   };
 }
 
@@ -2795,9 +3169,11 @@ async function runFastHunter(
     Date.now() -
     cloudbetStarted;
 
+  // V7.4 HARD PRE-FILTER:
+  // only LIVE + FIRST HALF + 0:0 + valid minute
   const cloudbetLive =
     rawCloudbet.filter(
-      isCloudbetLive
+      isHunterEligibleCloudbetEvent
     );
 
   const prepareStarted =
@@ -2888,6 +3264,14 @@ async function runFastHunter(
           signal?.entry_minute ??
           null,
 
+        current_minute:
+          signal?.current_minute ??
+          null,
+
+        period:
+          signal?.period ??
+          null,
+
         hunter_score:
           signal?.hunter_score ??
           null
@@ -2949,6 +3333,11 @@ async function runFastHunter(
                 cb.raw?.metadata
                   ?.eventTimeExtended ??
                 null,
+
+              parsed_minute:
+                cloudbetMinute(
+                  cb.raw
+                ),
 
               score:
                 cloudbetScore(
@@ -3063,7 +3452,7 @@ async function runFastHunter(
 
         match_method:
           result.found
-            ? "FAST_HUNTER_TWO_SIDED"
+            ? "FAST_HUNTER_LIVE_00_CLOSE_MINUTE_TWO_SIDED"
             : null,
 
         score_only_match:
@@ -3076,7 +3465,7 @@ async function runFastHunter(
           "CONFIDENT_MATCH",
 
         candidate_discovery:
-          "TOKEN_INDEX_WITH_FULL_FALLBACK"
+          "LIVE_1H_00_THEN_MINUTE_THEN_TOKEN_INDEX_WITH_FULL_FALLBACK"
       },
 
       diagnostics: {
@@ -3085,6 +3474,28 @@ async function runFastHunter(
 
         candidates:
           result.candidates,
+
+        minute_candidates:
+          result.minuteCandidates ??
+          0,
+
+        target_minute:
+          result.targetMinute ??
+          null,
+
+        cloudbet_minute:
+          result.bestMinute ??
+          null,
+
+        minute_difference:
+          result.bestMinuteDifference ??
+          null,
+
+        minute_tolerance:
+          MATCH_MINUTE_TOLERANCE,
+
+        live_filter:
+          "LIVE + 1H + 0:0 + CLOSE_MINUTE",
 
         target_normalized_home:
           normalizeTeam(
@@ -3149,6 +3560,12 @@ async function runFastHunter(
       reversed_confident_score:
         REVERSED_CONFIDENT_SCORE,
 
+      minute_tolerance:
+        MATCH_MINUTE_TOLERANCE,
+
+      prefilter:
+        "LIVE + 1H + 0:0 + VALID MINUTE",
+
       matcher:
         "STRICT TWO-SIDED TEAM NORMALIZATION + ALIAS + TOKEN FUZZY + CATEGORY PROTECTION",
 
@@ -3175,7 +3592,7 @@ async function runFastHunter(
       cloudbet_raw_matches:
         rawCloudbet.length,
 
-      cloudbet_live_matches:
+      cloudbet_live_1h_00_matches:
         cloudbetLive.length,
 
       hunter_secure_matches:
@@ -3281,8 +3698,13 @@ async function runLightDiagnostic(
       isCloudbetLive
     );
 
+  const live1h00 =
+    cloudbetEvents.filter(
+      isHunterEligibleCloudbetEvent
+    );
+
   const withOdds =
-    live.filter(
+    live1h00.filter(
       event =>
         extractOver05(
           event
@@ -3316,6 +3738,14 @@ async function runLightDiagnostic(
     note:
       "Full all-vs-all diagnostic matching is intentionally disabled to avoid CPU limit.",
 
+    settings: {
+      prefilter:
+        "LIVE + 1H + 0:0 + VALID MINUTE",
+
+      minute_tolerance:
+        MATCH_MINUTE_TOLERANCE
+    },
+
     stats: {
       v27_matches:
         v27Matches.length,
@@ -3325,6 +3755,9 @@ async function runLightDiagnostic(
 
       cloudbet_live_matches:
         live.length,
+
+      cloudbet_live_1h_00_matches:
+        live1h00.length,
 
       cloudbet_over_05_found:
         withOdds.length,
@@ -3446,6 +3879,9 @@ export default {
         direct_cloudbet:
           true,
 
+        filter:
+          "LIVE + 1H + 0:0 + +/-5 MINUTES",
+
         odds:
           "1H OVER 0.5",
 
@@ -3478,48 +3914,7 @@ export default {
         const matches =
           events
             .filter(
-              event => {
-
-                // Only real LIVE events
-                if (
-                  !isCloudbetLive(
-                    event
-                  )
-                ) {
-                  return false;
-                }
-
-                // Only first half
-                if (
-                  String(
-                    event?.metadata
-                      ?.eventStatus ??
-                    ""
-                  )
-                    .toLowerCase()
-                    .trim() !==
-                  "1p"
-                ) {
-                  return false;
-                }
-
-                // Only exact 0:0
-                const score =
-                  cloudbetScore(
-                    event?.metadata
-                      ?.score
-                  );
-
-                if (
-                  !score ||
-                  score.home !== 0 ||
-                  score.away !== 0
-                ) {
-                  return false;
-                }
-
-                return true;
-              }
+              isHunterEligibleCloudbetEvent
             )
             .map(
               buildCloudbetLiveRecord
@@ -3555,6 +3950,15 @@ export default {
             sport:
               "soccer",
 
+            live:
+              true,
+
+            period:
+              "1H",
+
+            score:
+              "0:0",
+
             market:
               ODDS_MARKET,
 
@@ -3566,7 +3970,7 @@ export default {
           },
 
           summary: {
-            live_matches:
+            live_1h_00_matches:
               matches.length,
 
             odds_found:
