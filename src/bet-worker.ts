@@ -1,9 +1,9 @@
 // ============================================================
-// CLOUDBET BET WORKER V7.1.0
+// CLOUDBET BET WORKER V7.2.0
 // DRY RUN · TRACKER READY CANDIDATE · FINAL HANDOFF
 // EXACT 1H TOTAL GOALS OVER 0.5
 //
-// V7.1.0:
+// V7.2.0:
 // - BASED ON V7.0.2
 // - TRACKER /entries is the ONLY source for matched Cloudbet event_id
 // - Uses Tracker cloudbet.entry_odds / odds_available / matcher_score
@@ -15,8 +15,12 @@
 // - Keeps entry_odds and current_odds separately
 // - Persistent pending_odds retry preserved for SAME EVENT / MARKET / LINE
 // - D1 bet_archive preserved
-// - NEW: builds Trading API v4 HANDOFF after READY_TO_BET
-// - NEW: builds same HANDOFF when PENDING becomes READY
+// - Preserves Trading API v4 HANDOFF after READY_TO_BET
+// - Preserves same HANDOFF when PENDING becomes READY
+// - NEW: /run reads authenticated Cloudbet account snapshot via CLOUDBET /account-test
+// - NEW: account currency/balance are shown directly in /run
+// - NEW: READY_TO_BET gets balance + min/max stake preflight
+// - NEW: handoff.ready_to_send is true only when account/stake preflight passes
 // - REAL BETTING DISABLED
 // - NO POST /pub/v4/bets/place/straight is sent
 // ============================================================
@@ -34,7 +38,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.1.0 FINAL HANDOFF";
+  "V7.2.0 ACCOUNT PREFLIGHT";
 
 const MODE =
   "DRY_RUN";
@@ -1989,13 +1993,173 @@ function buildReadyBet(
 }
 
 // ============================================================
+// ACCOUNT SNAPSHOT + PREFLIGHT
+// ============================================================
+
+interface AccountSnapshot {
+  success: boolean;
+  authenticated: boolean;
+  currency: string;
+  currency_enabled: boolean;
+  balance: number | null;
+  endpoint: string;
+  status: number;
+  latency_ms: number;
+  error: string | null;
+}
+
+async function fetchAccountSnapshot(
+  env: Env
+): Promise<AccountSnapshot> {
+  const result =
+    await fetchServiceJSON(
+      env.CLOUDBET,
+      "/account-test",
+      SERVICE_TIMEOUT_MS
+    );
+
+  if (!result.ok) {
+    return {
+      success: false,
+      authenticated: false,
+      currency: BET_CURRENCY,
+      currency_enabled: false,
+      balance: null,
+      endpoint: "/account-test",
+      status: result.status,
+      latency_ms: result.latency_ms,
+      error: result.error || "ACCOUNT_TEST_FAILED"
+    };
+  }
+
+  const data = result.data || {};
+  const currencies = Array.isArray(data?.currencies)
+    ? data.currencies.map((v: any) => safe(v).toUpperCase())
+    : [];
+
+  const balanceRow = Array.isArray(data?.balances)
+    ? data.balances.find(
+        (row: any) =>
+          safe(row?.currency).toUpperCase() ===
+          BET_CURRENCY.toUpperCase()
+      )
+    : null;
+
+  const balance = numberOrNull(
+    balanceRow?.amount ??
+    balanceRow?.data?.amount ??
+    data?.balance?.amount ??
+    data?.amount ??
+    null
+  );
+
+  const authenticated =
+    data?.authenticated === true ||
+    balanceRow?.success === true;
+
+  const currencyEnabled =
+    currencies.includes(BET_CURRENCY.toUpperCase()) ||
+    safe(balanceRow?.currency).toUpperCase() ===
+      BET_CURRENCY.toUpperCase();
+
+  return {
+    success:
+      authenticated &&
+      currencyEnabled &&
+      balance !== null,
+    authenticated,
+    currency: BET_CURRENCY,
+    currency_enabled: currencyEnabled,
+    balance,
+    endpoint: "/account-test",
+    status: result.status,
+    latency_ms: result.latency_ms,
+    error:
+      authenticated && currencyEnabled && balance !== null
+        ? null
+        : "ACCOUNT_SNAPSHOT_INCOMPLETE"
+  };
+}
+
+function buildAccountPreflight(
+  account: AccountSnapshot,
+  current: CurrentOddsResult
+): any {
+  const stake = numberOrNull(BET_STAKE);
+  const minStake = numberOrNull(current?.min_stake);
+  const maxStake = numberOrNull(current?.max_stake);
+  const balance = numberOrNull(account?.balance);
+
+  const accountOk =
+    account.success === true &&
+    account.authenticated === true &&
+    account.currency_enabled === true &&
+    balance !== null;
+
+  const selectionEnabled =
+    current.success === true &&
+    current.selection_status === "SELECTION_ENABLED" &&
+    numberOrNull(current.current_odds) !== null &&
+    Number(current.current_odds) > 1;
+
+  const aboveMin =
+    stake !== null &&
+    (minStake === null || stake >= minStake);
+
+  const belowMax =
+    stake !== null &&
+    (maxStake === null || stake <= maxStake);
+
+  const balanceSufficient =
+    stake !== null &&
+    balance !== null &&
+    stake <= balance;
+
+  const stakeAllowed =
+    aboveMin && belowMax;
+
+  let blockReason: string | null = null;
+
+  if (!accountOk) {
+    blockReason = "ACCOUNT_NOT_READY";
+  } else if (!selectionEnabled) {
+    blockReason = "SELECTION_NOT_ENABLED";
+  } else if (!aboveMin) {
+    blockReason = "STAKE_BELOW_MIN";
+  } else if (!belowMax) {
+    blockReason = "STAKE_ABOVE_MAX";
+  } else if (!balanceSufficient) {
+    blockReason = "INSUFFICIENT_BALANCE";
+  }
+
+  return {
+    account_ok: accountOk,
+    authenticated: account.authenticated,
+    currency: BET_CURRENCY,
+    currency_enabled: account.currency_enabled,
+    balance,
+    stake,
+    min_stake: minStake,
+    max_stake: maxStake,
+    selection_enabled: selectionEnabled,
+    stake_above_min: aboveMin,
+    stake_below_max: belowMax,
+    stake_allowed: stakeAllowed,
+    balance_sufficient: balanceSufficient,
+    ready_to_send: blockReason === null,
+    block_reason: blockReason
+  };
+}
+
+// ============================================================
 // FINAL TRADING HANDOFF
 // ============================================================
 
 function buildTradingHandoff(
   bet: any,
   current:
-    CurrentOddsResult
+    CurrentOddsResult,
+  account: AccountSnapshot
 ): any | null {
   if (
     !HANDOFF_ENABLED
@@ -2037,11 +2201,20 @@ function buildTradingHandoff(
     return null;
   }
 
+  const preflight =
+    buildAccountPreflight(
+      account,
+      current
+    );
+
   return {
     ready_to_send:
-      true,
+      preflight.ready_to_send,
     sent:
       false,
+    block_reason:
+      preflight.block_reason,
+    preflight,
 
     method:
       "POST",
@@ -2599,7 +2772,8 @@ async function archiveBet(
 // ============================================================
 
 async function processPending(
-  env: Env
+  env: Env,
+  account: AccountSnapshot
 ): Promise<any> {
   const rows =
     await loadPending(
@@ -2833,7 +3007,8 @@ async function processPending(
     const handoff =
       buildTradingHandoff(
         bet,
-        current
+        current,
+        account
       );
 
     await env.DB
@@ -2889,13 +3064,19 @@ async function runWorker(
   const executionId =
     crypto.randomUUID();
 
+  const account =
+    await fetchAccountSnapshot(
+      env
+    );
+
   let pendingResult:
     any;
 
   try {
     pendingResult =
       await processPending(
-        env
+        env,
+        account
       );
   } catch (
     error
@@ -2939,6 +3120,7 @@ async function runWorker(
         "TRACKER_FAILED",
       tracker:
         trackerResult,
+      account,
       pending_retry:
         pendingResult,
       processing_ms:
@@ -3110,7 +3292,8 @@ async function runWorker(
       const handoff =
         buildTradingHandoff(
           bet,
-          current
+          current,
+          account
         );
 
       refreshedReady++;
@@ -3161,6 +3344,11 @@ async function runWorker(
             .market_url,
         target:
           bet.target,
+        account_preflight:
+          buildAccountPreflight(
+            account,
+            current
+          ),
         handoff,
         archive
       });
@@ -3244,6 +3432,10 @@ async function runWorker(
         true,
       retry_same_line:
         true,
+      account_preflight:
+        true,
+      account_endpoint:
+        "/account-test",
       handoff_only:
         true,
       real_bet_post:
@@ -3274,6 +3466,7 @@ async function runWorker(
         errors.length
     },
 
+    account,
     pending_retry:
       pendingResult,
     ready,
@@ -3595,6 +3788,8 @@ export default {
             "RETRY SAME EVENT / MARKET / LINE",
             "READY_TO_BET",
             "D1 ARCHIVE",
+            "ACCOUNT SNAPSHOT /account-test",
+            "BALANCE + MIN/MAX STAKE PREFLIGHT",
             "BUILD TRADING API HANDOFF",
             "STOP — NO REAL POST"
           ],
