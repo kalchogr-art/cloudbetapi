@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.9.8 — ALL LIVE LINE AUDIT FIX
+// CLOUDBET LIVE SOCCER DETECTOR V5.9.9 — ALL LIVE AUDIT WITH MINUTE
 //
 // EXISTING PURPOSE:
 // - fast /live for matcher
@@ -23,7 +23,7 @@ interface Env {
 
 type AnyObj = Record<string, any>;
 
-const VERSION = "V5.9.8 ALL LIVE LINE AUDIT FIX";
+const VERSION = "V5.9.9 ALL LIVE AUDIT WITH MINUTE";
 
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
@@ -1906,6 +1906,62 @@ async function tradingAccessTest(
 // NO WAGER IS SENT.
 // ============================================================
 
+function auditDisplayMinute(
+  event: AnyObj
+): AnyObj {
+
+  const raw =
+    event?.metadata?.eventTime ??
+    event?.minute ??
+    null;
+
+  const extended =
+    event?.metadata?.eventTimeExtended ??
+    event?.minute_extended ??
+    raw;
+
+  const source =
+    extended ??
+    raw;
+
+  const match =
+    source === null ||
+    source === undefined
+      ? null
+      : String(source)
+          .trim()
+          .match(/^(\d{1,3})/);
+
+  const parsed =
+    match
+      ? Number(match[1])
+      : null;
+
+  return {
+    minute:
+      raw,
+
+    minute_extended:
+      extended,
+
+    parsed_minute:
+      Number.isFinite(parsed)
+        ? parsed
+        : null,
+
+    period:
+      event?.metadata?.eventStatus ??
+      event?.event_status ??
+      null,
+
+    score:
+      event?.metadata?.score ??
+      event?.score ??
+      null
+  };
+}
+
+
 async function allLiveLineAudit(
   env: Env
 ): Promise<AnyObj> {
@@ -2050,6 +2106,10 @@ async function allLiveLineAudit(
           rawEvent?.status ??
           null,
 
+        ...auditDisplayMinute(
+          event
+        ),
+
         target_found:
           false,
 
@@ -2109,6 +2169,10 @@ async function allLiveLineAudit(
           event?.status ??
           rawEvent?.status ??
           null,
+
+        ...auditDisplayMinute(
+          event
+        ),
 
         target_found:
           true,
@@ -2187,6 +2251,10 @@ async function allLiveLineAudit(
           rawEvent?.status ??
           null,
 
+        ...auditDisplayMinute(
+          event
+        ),
+
         target_found:
           true,
 
@@ -2205,6 +2273,26 @@ async function allLiveLineAudit(
       });
     }
   }
+
+  results.sort(
+    (a, b) => {
+      const am =
+        Number.isFinite(
+          Number(a?.parsed_minute)
+        )
+          ? Number(a.parsed_minute)
+          : 9999;
+
+      const bm =
+        Number.isFinite(
+          Number(b?.parsed_minute)
+        )
+          ? Number(b.parsed_minute)
+          : 9999;
+
+      return am - bm;
+    }
+  );
 
   const checkedLines =
     enabledCount +
