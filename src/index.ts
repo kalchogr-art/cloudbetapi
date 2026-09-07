@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.9.4 — ACTIVE SELECTION FIX
+// CLOUDBET LIVE SOCCER DETECTOR V5.9.5 — LIVE LINE REFRESH
 //
 // EXISTING PURPOSE:
 // - fast /live for matcher
@@ -9,7 +9,7 @@
 // - /event uses direct event endpoint
 // - /line-test preserved for diagnostics
 //
-// V5.9.4:
+// V5.9.5:
 // - Added /account-test
 // - Uses official Cloudbet REST Account API
 // - Reads currencies and balance for each currency
@@ -23,7 +23,7 @@ interface Env {
 
 type AnyObj = Record<string, any>;
 
-const VERSION = "V5.9.4 ACTIVE SELECTION FIX";
+const VERSION = "V5.9.5 LIVE LINE REFRESH";
 
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
@@ -871,14 +871,22 @@ function findExactTarget(
 
 
 // ============================================================
-// LEGACY LINE TEST
-// Kept only so the existing endpoint is not removed.
-// Previous test showed this path returns 404 from Cloudbet.
+// LIVE LINE FETCH — OFFICIAL /v2/odds/lines
+//
+// Request body is officially:
+// {
+//   eventId,
+//   marketUrl
+// }
+//
+// This endpoint is used to obtain the latest available price/limits
+// immediately before a possible bet.
 // ============================================================
 
-async function lineTest(
+async function latestLineFetch(
   env: Env,
-  eventId: string
+  eventId: string,
+  marketUrl: string
 ): Promise<AnyObj> {
 
   const started =
@@ -923,7 +931,9 @@ async function lineTest(
                 ),
 
               marketUrl:
-                TARGET_MARKET_URL
+                String(
+                  marketUrl
+                )
             }),
 
           signal:
@@ -936,21 +946,114 @@ async function lineTest(
         response
       );
 
+    const data =
+      parsed.data;
+
+    const status =
+      String(
+        data?.status ??
+        ""
+      )
+        .trim()
+        .toUpperCase();
+
+    const price =
+      finiteNumber(
+        data?.price
+      );
+
+    const minStake =
+      finiteNumber(
+        data?.minStake ??
+        data?.minRiskStake
+      );
+
+    const maxStake =
+      finiteNumber(
+        data?.maxStake ??
+        data?.maxRiskStake
+      );
+
+    const successStatus =
+      [
+        "SUCCESS",
+        "OK",
+        "SELECTION_ENABLED",
+        "ACTIVE",
+        "TRADING"
+      ].includes(
+        status
+      );
+
+    const available =
+      response.ok &&
+      (
+        successStatus ||
+        (
+          price !== null &&
+          price > 1 &&
+          (
+            maxStake === null ||
+            maxStake > 0
+          )
+        )
+      );
+
     return {
       success:
         response.ok,
 
+      available,
+
+      request: {
+        eventId:
+          String(
+            eventId
+          ),
+
+        marketUrl:
+          String(
+            marketUrl
+          )
+      },
+
       response: {
         status:
           response.status,
+
+        ok:
+          response.ok,
 
         elapsed_ms:
           Date.now() -
           started
       },
 
-      data:
-        parsed.data,
+      line: {
+        status:
+          data?.status ??
+          null,
+
+        price,
+
+        minStake,
+
+        maxStake,
+
+        lineId:
+          data?.lineId ??
+          null,
+
+        altLineId:
+          data?.altLineId ??
+          null,
+
+        effectiveAsOf:
+          data?.effectiveAsOf ??
+          null
+      },
+
+      data,
 
       raw:
         parsed.raw
@@ -959,6 +1062,19 @@ async function lineTest(
   } finally {
     clearTimeout(timer);
   }
+}
+
+
+async function lineTest(
+  env: Env,
+  eventId: string
+): Promise<AnyObj> {
+
+  return latestLineFetch(
+    env,
+    eventId,
+    TARGET_MARKET_URL
+  );
 }
 
 
@@ -1348,26 +1464,78 @@ async function tradingPreflight(
         )
       : null;
 
-  const price =
+  const marketUrl =
+    String(
+      target?.marketUrl ??
+      TARGET_MARKET_URL
+    ).trim();
+
+  const lineRefresh =
+    eventResult.found &&
+    marketUrl
+      ? await latestLineFetch(
+          env,
+          eventId,
+          marketUrl
+        )
+      : null;
+
+  const eventPrice =
     finiteNumber(
       target?.price
     );
 
-  const minStake =
+  const eventMinStake =
     finiteNumber(
       target?.minStake
     );
 
-  const maxStake =
+  const eventMaxStake =
     finiteNumber(
       target?.maxStake
     );
 
-  const marketUrl =
-    String(
-      target?.marketUrl ??
-      ""
-    ).trim();
+  const livePrice =
+    finiteNumber(
+      lineRefresh?.line
+        ?.price
+    );
+
+  const liveMinStake =
+    finiteNumber(
+      lineRefresh?.line
+        ?.minStake
+    );
+
+  const liveMaxStake =
+    finiteNumber(
+      lineRefresh?.line
+        ?.maxStake
+    );
+
+  const effectivePrice =
+    livePrice !== null &&
+    livePrice > 0
+      ? livePrice
+      : eventPrice;
+
+  const effectiveMinStake =
+    liveMinStake !== null
+      ? liveMinStake
+      : eventMinStake;
+
+  const effectiveMaxStake =
+    liveMaxStake !== null
+      ? liveMaxStake
+      : eventMaxStake;
+
+  const lineAvailable =
+    lineRefresh?.available ===
+    true;
+
+  const eventSelectionEnabled =
+    target?.enabled ===
+    true;
 
   const checks = {
     api_authenticated:
@@ -1392,26 +1560,31 @@ async function tradingPreflight(
     exact_target_found:
       !!target,
 
-    selection_enabled:
-      target?.enabled ===
-      true,
-
     market_url_available:
       marketUrl.length > 0,
 
+    live_line_request_ok:
+      lineRefresh?.response
+        ?.ok === true,
+
+    live_line_available:
+      lineAvailable,
+
     price_valid:
-      price !== null &&
-      price > 1,
+      effectivePrice !== null &&
+      effectivePrice > 1,
 
     min_stake_ok:
-      minStake === null ||
+      effectiveMinStake ===
+        null ||
       PREFLIGHT_STAKE >=
-        minStake,
+        effectiveMinStake,
 
     max_stake_ok:
-      maxStake === null ||
+      effectiveMaxStake ===
+        null ||
       PREFLIGHT_STAKE <=
-        maxStake
+        effectiveMaxStake
   };
 
   const failedChecks =
@@ -1509,7 +1682,7 @@ async function tradingPreflight(
     selection_candidates_count:
       targetCandidates.length,
 
-    selection: target
+    event_selection: target
       ? {
           market:
             target.market ??
@@ -1531,21 +1704,44 @@ async function tradingPreflight(
             target.marketUrl ??
             null,
 
-          price,
+          price:
+            eventPrice,
 
           status:
             target.status ??
             null,
 
-          minStake,
+          minStake:
+            eventMinStake,
 
-          maxStake,
+          maxStake:
+            eventMaxStake,
 
           enabled:
-            target.enabled ===
-            true
+            eventSelectionEnabled
         }
       : null,
+
+    live_line_refresh:
+      lineRefresh,
+
+    effective_selection: {
+      marketUrl,
+
+      price:
+        effectivePrice,
+
+      minStake:
+        effectiveMinStake,
+
+      maxStake:
+        effectiveMaxStake,
+
+      source:
+        lineAvailable
+          ? "LIVE_LINE_ENDPOINT"
+          : "EVENT_FALLBACK"
+    },
 
     checks,
 
@@ -1564,7 +1760,9 @@ async function tradingPreflight(
           marketUrl,
 
           price:
-            String(price),
+            String(
+              effectivePrice
+            ),
 
           currency:
             PREFLIGHT_CURRENCY,
