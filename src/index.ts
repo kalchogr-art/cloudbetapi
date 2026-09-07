@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.9.1 — FAST LIVE + ACCOUNT TEST
+// CLOUDBET LIVE SOCCER DETECTOR V5.9.2 — FAST LIVE + REST ACCOUNT TEST
 //
 // EXISTING PURPOSE:
 // - fast /live for matcher
@@ -9,9 +9,10 @@
 // - /event uses direct event endpoint
 // - /line-test preserved for diagnostics
 //
-// V5.9.1:
+// V5.9.2:
 // - Added /account-test
-// - Reads Cloudbet accountBalances through GraphQL
+// - Uses official Cloudbet REST Account API
+// - Reads currencies and balance for each currency
 // - READ ONLY
 // - NO BET PLACEMENT
 // ============================================================
@@ -22,13 +23,13 @@ interface Env {
 
 type AnyObj = Record<string, any>;
 
-const VERSION = "V5.9.1 FAST LIVE + ACCOUNT TEST";
+const VERSION = "V5.9.2 FAST LIVE + REST ACCOUNT TEST";
 
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
 
-const ACCOUNT_GRAPHQL_URL =
-  "https://sports-api-graphql.cloudbet.com/graphql";
+const ACCOUNT_API_BASE =
+  "https://sports-api.cloudbet.com/pub/v1/account";
 
 const TIMEOUT_MS = 8000;
 
@@ -865,8 +866,85 @@ async function lineTest(
 
 
 // ============================================================
-// ACCOUNT TEST — READ ONLY
+// ACCOUNT TEST — REST API — READ ONLY
+// Official flow:
+// 1) GET /pub/v1/account/currencies
+// 2) GET /pub/v1/account/currencies/{CURRENCY}/balance
 // ============================================================
+
+async function accountRestFetch(
+  env: Env,
+  path: string
+): Promise<{
+  response: Response;
+  elapsedMs: number;
+  data: any;
+  raw: string | null;
+}> {
+
+  const started =
+    Date.now();
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      TIMEOUT_MS
+    );
+
+  try {
+
+    const response =
+      await fetch(
+        ACCOUNT_API_BASE +
+        path,
+        {
+          method:
+            "GET",
+
+          headers: {
+            "accept":
+              "application/json",
+
+            "content-type":
+              "application/json",
+
+            "x-api-key":
+              apiKey(env)
+          },
+
+          signal:
+            controller.signal
+        }
+      );
+
+    const parsed =
+      await readResponse(
+        response
+      );
+
+    return {
+      response,
+
+      elapsedMs:
+        Date.now() -
+        started,
+
+      data:
+        parsed.data,
+
+      raw:
+        parsed.raw
+    };
+
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 
 async function accountTest(
   env: Env
@@ -897,90 +975,44 @@ async function accountTest(
     };
   }
 
-  const started =
-    Date.now();
 
-  const controller =
-    new AbortController();
+  // ----------------------------------------------------------
+  // STEP 1 — CURRENCIES
+  // ----------------------------------------------------------
 
-  const timer =
-    setTimeout(
-      () =>
-        controller.abort(),
-      TIMEOUT_MS
+  const currenciesResult =
+    await accountRestFetch(
+      env,
+      "/currencies"
     );
 
-  try {
+  const currenciesData =
+    currenciesResult.data;
 
-    const response =
-      await fetch(
-        ACCOUNT_GRAPHQL_URL,
-        {
-          method:
-            "POST",
+  const currencies =
+    Array.isArray(
+      currenciesData?.currencies
+    )
+      ? currenciesData.currencies
+          .map(
+            (value: any) =>
+              String(value)
+                .trim()
+          )
+          .filter(Boolean)
+      : [];
 
-          headers: {
-            "accept":
-              "application/json",
 
-            "content-type":
-              "application/json",
-
-            "x-api-key":
-              key
-          },
-
-          body:
-            JSON.stringify({
-              query: `
-                query AccountBalances {
-                  accountBalances {
-                    currency
-                    amount
-                  }
-                }
-              `
-            }),
-
-          signal:
-            controller.signal
-        }
-      );
-
-    const parsed =
-      await readResponse(
-        response
-      );
-
-    const errors =
-      Array.isArray(
-        parsed.data?.errors
-      )
-        ? parsed.data.errors
-        : [];
-
-    const hasBalances =
-      Array.isArray(
-        parsed.data?.data
-          ?.accountBalances
-      );
-
-    const balances =
-      hasBalances
-        ? parsed.data.data
-            .accountBalances
-        : [];
+  if (
+    !currenciesResult.response.ok
+  ) {
 
     return {
       success:
-        response.ok &&
-        errors.length === 0 &&
-        hasBalances,
+        false,
 
       authenticated:
-        response.ok &&
-        errors.length === 0 &&
-        hasBalances,
+        false,
 
       read_only:
         true,
@@ -992,29 +1024,155 @@ async function accountTest(
         false,
 
       endpoint:
-        "ACCOUNT_BALANCES",
+        "REST_ACCOUNT_API",
+
+      step:
+        "CURRENCIES",
 
       response: {
         status:
-          response.status,
+          currenciesResult
+            .response
+            .status,
 
         elapsed_ms:
-          Date.now() -
-          started
+          currenciesResult
+            .elapsedMs
       },
 
-      balances,
+      currencies:
+        [],
 
-      graphql_errors:
-        errors,
+      balances:
+        [],
+
+      data:
+        currenciesData,
 
       raw:
-        parsed.raw
+        currenciesResult.raw
     };
-
-  } finally {
-    clearTimeout(timer);
   }
+
+
+  // ----------------------------------------------------------
+  // STEP 2 — BALANCE FOR EACH CURRENCY
+  // ----------------------------------------------------------
+
+  const balances:
+    AnyObj[] = [];
+
+  for (
+    const currency
+    of currencies
+  ) {
+
+    const balanceResult =
+      await accountRestFetch(
+        env,
+        "/currencies/" +
+        encodeURIComponent(
+          currency
+        ) +
+        "/balance"
+      );
+
+    const amount =
+      balanceResult.data
+        ?.amount ??
+      null;
+
+    balances.push({
+      currency,
+
+      success:
+        balanceResult
+          .response
+          .ok,
+
+      status:
+        balanceResult
+          .response
+          .status,
+
+      amount,
+
+      elapsed_ms:
+        balanceResult
+          .elapsedMs,
+
+      data:
+        balanceResult.data,
+
+      raw:
+        balanceResult.raw
+    });
+  }
+
+
+  const allBalancesOk =
+    balances.every(
+      item =>
+        item.success === true
+    );
+
+
+  return {
+    success:
+      currenciesResult
+        .response
+        .ok &&
+      allBalancesOk,
+
+    authenticated:
+      currenciesResult
+        .response
+        .ok,
+
+    read_only:
+      true,
+
+    betting:
+      false,
+
+    wager_sent:
+      false,
+
+    endpoint:
+      "REST_ACCOUNT_API",
+
+    currencies_request: {
+      status:
+        currenciesResult
+          .response
+          .status,
+
+      elapsed_ms:
+        currenciesResult
+          .elapsedMs
+    },
+
+    currencies,
+
+    balances,
+
+    summary: {
+      currencies_count:
+        currencies.length,
+
+      balances_ok:
+        balances.filter(
+          item =>
+            item.success === true
+        ).length,
+
+      balances_failed:
+        balances.filter(
+          item =>
+            item.success !== true
+        ).length
+    }
+  };
 }
 
 
