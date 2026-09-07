@@ -1,9 +1,9 @@
 // ============================================================
-// CLOUDBET BET WORKER V7.0.1
+// CLOUDBET BET WORKER V7.0.2
 // DRY RUN · TRACKER READY CANDIDATE
 // EXACT 1H TOTAL GOALS OVER 0.5
 //
-// V7.0.1:
+// V7.0.2:
 // - TRACKER /entries is the ONLY source for the matched Cloudbet event_id
 // - Uses Tracker V6.7+ cloudbet.entry_odds / odds_available / matcher_score
 // - NO matcher lookup inside Bet Worker
@@ -29,7 +29,7 @@ type Obj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V7.0.1";
+const VERSION = "V7.0.2";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -143,6 +143,33 @@ function numberOrNull(
   return Number.isFinite(n)
     ? n
     : null;
+}
+
+function normalizeEventId(
+  value: any
+): string | null {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return null;
+  }
+
+  const raw =
+    String(value).trim();
+
+  if (!raw) {
+    return null;
+  }
+
+  // D1 / JSON can surface integer IDs as "36120839.0".
+  // Cloudbet event IDs are integer identifiers, so canonicalize
+  // only a pure integer-with-zero-decimals representation.
+  if (/^\d+\.0+$/.test(raw)) {
+    return raw.replace(/\.0+$/, "");
+  }
+
+  return raw;
 }
 
 // ============================================================
@@ -503,10 +530,9 @@ function trackerCloudbetData(
     null;
 
   const eventId =
-    eventIdRaw === null ||
-    eventIdRaw === undefined
-      ? null
-      : safe(eventIdRaw) || null;
+    normalizeEventId(
+      eventIdRaw
+    );
 
   const entryOdds =
     numberOrNull(
@@ -621,9 +647,18 @@ async function fetchCloudbetEvent(
     );
   }
 
+  const canonicalEventId =
+    normalizeEventId(eventId);
+
+  if (!canonicalEventId) {
+    throw new Error(
+      "CLOUDBET_EVENT_ID_MISSING"
+    );
+  }
+
   const path =
     `${CLOUDBET_EVENT_PATH}${encodeURIComponent(
-      eventId
+      canonicalEventId
     )}`;
 
   const result =
@@ -681,7 +716,7 @@ function getCloudbetEventId(
     return null;
   }
 
-  return safe(value) || null;
+  return normalizeEventId(value);
 }
 
 function cloudbetHome(
@@ -742,10 +777,13 @@ function isSameEventId(
   const actualId =
     getCloudbetEventId(event);
 
+  const expected =
+    normalizeEventId(expectedId);
+
   return Boolean(
     actualId &&
-    safe(actualId) ===
-      safe(expectedId)
+    expected &&
+    actualId === expected
   );
 }
 
@@ -1625,7 +1663,9 @@ async function savePending(
     CurrentOddsResult
 ): Promise<any> {
   const cloudbetId =
-    trackerCloudbet.event_id;
+    normalizeEventId(
+      trackerCloudbet.event_id
+    );
 
   if (!cloudbetId) {
     return {
@@ -2090,7 +2130,9 @@ async function processPending(
 
   for (const row of rows) {
     const cloudbetId =
-      safe(row.cloudbet_id);
+      normalizeEventId(
+        row.cloudbet_id
+      );
 
     if (!cloudbetId) {
       const result =
