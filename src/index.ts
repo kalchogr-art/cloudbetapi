@@ -1,15 +1,19 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.9.0 — FAST LIVE
+// CLOUDBET LIVE SOCCER DETECTOR V5.9.1 — FAST LIVE + ACCOUNT TEST
 //
-// PURPOSE:
+// EXISTING PURPOSE:
 // - fast /live for matcher
 // - ONE official Cloudbet request
 // - NO market scanning in /live
 // - compact event objects only
 // - /event uses direct event endpoint
-// - /line-test keeps exact 1H O0.5 read-only lookup
+// - /line-test preserved for diagnostics
 //
-// READ ONLY — NO BET PLACEMENT
+// V5.9.1:
+// - Added /account-test
+// - Reads Cloudbet accountBalances through GraphQL
+// - READ ONLY
+// - NO BET PLACEMENT
 // ============================================================
 
 interface Env {
@@ -18,8 +22,14 @@ interface Env {
 
 type AnyObj = Record<string, any>;
 
-const VERSION = "V5.9.0 FAST LIVE";
-const API_BASE = "https://sports-api.cloudbet.com/pub/v2/odds";
+const VERSION = "V5.9.1 FAST LIVE + ACCOUNT TEST";
+
+const API_BASE =
+  "https://sports-api.cloudbet.com/pub/v2/odds";
+
+const ACCOUNT_GRAPHQL_URL =
+  "https://sports-api-graphql.cloudbet.com/graphql";
+
 const TIMEOUT_MS = 8000;
 
 const TARGET_MARKET =
@@ -33,7 +43,10 @@ const TARGET_MARKET_URL =
 // RESPONSE
 // ============================================================
 
-function json(data: any, status = 200): Response {
+function json(
+  data: any,
+  status = 200
+): Response {
   return new Response(
     JSON.stringify(data, null, 2),
     {
@@ -50,7 +63,57 @@ function json(data: any, status = 200): Response {
 
 
 // ============================================================
-// FETCH
+// HELPERS
+// ============================================================
+
+function apiKey(env: Env): string {
+  return String(
+    env.CLOUDBET_API_KEY || ""
+  ).trim();
+}
+
+async function readResponse(
+  response: Response
+): Promise<{
+  data: any;
+  raw: string | null;
+}> {
+  const text =
+    await response.text();
+
+  if (!text) {
+    return {
+      data: null,
+      raw: null
+    };
+  }
+
+  try {
+    return {
+      data: JSON.parse(text),
+      raw: null
+    };
+  } catch {
+    return {
+      data: null,
+      raw: text.slice(0, 2000)
+    };
+  }
+}
+
+function finiteNumber(
+  value: any
+): number | null {
+  const n = Number(value);
+
+  return Number.isFinite(n)
+    ? n
+    : null;
+}
+
+
+// ============================================================
+// CLOUDBET ODDS FETCH
 // ============================================================
 
 async function cloudbetFetch(
@@ -61,7 +124,6 @@ async function cloudbetFetch(
   response: Response;
   elapsedMs: number;
 }> {
-
   const started =
     Date.now();
 
@@ -70,13 +132,11 @@ async function cloudbetFetch(
 
   const timer =
     setTimeout(
-      () =>
-        controller.abort(),
+      () => controller.abort(),
       TIMEOUT_MS
     );
 
   try {
-
     const response =
       await fetch(
         API_BASE + path,
@@ -88,8 +148,7 @@ async function cloudbetFetch(
               "application/json",
 
             "x-api-key":
-              env.CLOUDBET_API_KEY ||
-              "",
+              apiKey(env),
 
             ...(init.headers || {})
           },
@@ -102,44 +161,17 @@ async function cloudbetFetch(
     return {
       response,
       elapsedMs:
-        Date.now() -
-        started
+        Date.now() - started
     };
 
   } finally {
-
-    clearTimeout(
-      timer
-    );
-  }
-}
-
-
-async function readJson(
-  response: Response
-): Promise<any> {
-
-  const text =
-    await response.text();
-
-  if (!text) {
-    return null;
-  }
-
-  try {
-    return JSON.parse(
-      text
-    );
-  } catch {
-    throw new Error(
-      "INVALID_CLOUDBET_JSON"
-    );
+    clearTimeout(timer);
   }
 }
 
 
 // ============================================================
-// EVENTS
+// EVENT EXTRACTION
 // ============================================================
 
 function extractEvents(
@@ -152,7 +184,6 @@ function extractEvents(
       data.competitions
     )
   ) {
-
     const result:
       AnyObj[] = [];
 
@@ -160,7 +191,6 @@ function extractEvents(
       const competition
       of data.competitions
     ) {
-
       if (
         !Array.isArray(
           competition?.events
@@ -173,7 +203,6 @@ function extractEvents(
         const event
         of competition.events
       ) {
-
         if (
           !event ||
           typeof event !==
@@ -216,9 +245,7 @@ function extractEvents(
   }
 
   if (
-    Array.isArray(
-      data
-    )
+    Array.isArray(data)
   ) {
     return data;
   }
@@ -250,11 +277,6 @@ function isLive(
   );
 }
 
-
-// ============================================================
-// COMPACT EVENT
-// IMPORTANT: /live deliberately does NOT inspect event.markets.
-// ============================================================
 
 function compactEvent(
   event: AnyObj
@@ -332,7 +354,6 @@ async function getFastLive(
   if (
     !result.response.ok
   ) {
-
     const body =
       await result.response
         .text();
@@ -341,21 +362,18 @@ async function getFastLive(
       "CLOUDBET_HTTP_" +
       result.response.status +
       ": " +
-      body.slice(
-        0,
-        300
-      )
+      body.slice(0, 300)
     );
   }
 
-  const data =
-    await readJson(
+  const parsed =
+    await readResponse(
       result.response
     );
 
   const events =
     extractEvents(
-      data
+      parsed.data
     );
 
   const live:
@@ -365,17 +383,11 @@ async function getFastLive(
     const event
     of events
   ) {
-
     if (
-      isLive(
-        event
-      )
+      isLive(event)
     ) {
-
       live.push(
-        compactEvent(
-          event
-        )
+        compactEvent(event)
       );
     }
   }
@@ -383,8 +395,7 @@ async function getFastLive(
   return {
     request: {
       path,
-      requests_made:
-        1,
+      requests_made: 1,
       elapsed_ms:
         result.elapsedMs,
       http_status:
@@ -412,13 +423,10 @@ function normalize(
 ): string {
 
   return String(
-    value ??
-    ""
+    value ?? ""
   )
     .toLowerCase()
-    .normalize(
-      "NFD"
-    )
+    .normalize("NFD")
     .replace(
       /[\u0300-\u036f]/g,
       ""
@@ -437,9 +445,7 @@ function searchEvents(
 ): AnyObj[] {
 
   const q =
-    normalize(
-      query
-    );
+    normalize(query);
 
   if (!q) {
     return [];
@@ -479,8 +485,7 @@ async function getEventDirect(
 ): Promise<AnyObj> {
 
   const eventId =
-    String(id)
-      .trim();
+    String(id).trim();
 
   const path =
     "/events/" +
@@ -494,10 +499,13 @@ async function getEventDirect(
       path
     );
 
-  const data =
-    await readJson(
+  const parsed =
+    await readResponse(
       result.response
     );
+
+  const data =
+    parsed.data;
 
   const event =
     data?.event &&
@@ -507,21 +515,23 @@ async function getEventDirect(
       : data &&
         typeof data ===
           "object" &&
-        !Array.isArray(
-          data
-        )
+        !Array.isArray(data)
       ? data
       : null;
 
   return {
     request: {
       path,
+
       requested_event_id:
         eventId,
+
       http_status:
         result.response.status,
+
       ok:
         result.response.ok,
+
       elapsed_ms:
         result.elapsedMs
     },
@@ -530,32 +540,17 @@ async function getEventDirect(
       result.response.ok &&
       !!event,
 
-    event
+    event,
+
+    raw:
+      parsed.raw
   };
 }
 
 
 // ============================================================
-// EXACT TARGET SELECTION
-// Supports legacy exact market and generic total_goals period=1h.
+// EXACT 1H OVER 0.5 TARGET
 // ============================================================
-
-function finiteNumber(
-  value: any
-): number | null {
-
-  const n =
-    Number(
-      value
-    );
-
-  return Number.isFinite(
-    n
-  )
-    ? n
-    : null;
-}
-
 
 function inspectSelections(
   marketKey: string,
@@ -662,9 +657,7 @@ function inspectSelections(
           "OPEN",
           "TRADING",
           "ACTIVE"
-        ].includes(
-          status
-        );
+        ].includes(status);
 
       return {
         market:
@@ -731,7 +724,6 @@ function findExactTarget(
     return null;
   }
 
-  // 1) Legacy exact market.
   const legacy =
     markets[
       "soccer.total_goals_period_first_half"
@@ -742,7 +734,6 @@ function findExactTarget(
     typeof legacy ===
       "object"
   ) {
-
     const found =
       inspectSelections(
         "soccer.total_goals_period_first_half",
@@ -755,7 +746,6 @@ function findExactTarget(
     }
   }
 
-  // 2) Generic market with explicit 1H submarket.
   const generic =
     markets[
       "soccer.total_goals"
@@ -766,7 +756,6 @@ function findExactTarget(
     typeof generic ===
       "object"
   ) {
-
     const found =
       inspectSelections(
         "soccer.total_goals",
@@ -784,7 +773,9 @@ function findExactTarget(
 
 
 // ============================================================
-// LINE TEST
+// LEGACY LINE TEST
+// Kept only so the existing endpoint is not removed.
+// Previous test showed this path returns 404 from Cloudbet.
 // ============================================================
 
 async function lineTest(
@@ -823,8 +814,7 @@ async function lineTest(
               "application/json",
 
             "x-api-key":
-              env.CLOUDBET_API_KEY ||
-              ""
+              apiKey(env)
           },
 
           body:
@@ -843,23 +833,10 @@ async function lineTest(
         }
       );
 
-    const text =
-      await response.text();
-
-    let data:
-      any = null;
-
-    try {
-      data =
-        text
-          ? JSON.parse(
-              text
-            )
-          : null;
-    } catch {
-      data =
-        null;
-    }
+    const parsed =
+      await readResponse(
+        response
+      );
 
     return {
       success:
@@ -874,22 +851,169 @@ async function lineTest(
           started
       },
 
-      data,
+      data:
+        parsed.data,
 
       raw:
-        data === null
-          ? text.slice(
-              0,
-              2000
-            )
-          : null
+        parsed.raw
     };
 
   } finally {
+    clearTimeout(timer);
+  }
+}
 
-    clearTimeout(
-      timer
+
+// ============================================================
+// ACCOUNT TEST — READ ONLY
+// ============================================================
+
+async function accountTest(
+  env: Env
+): Promise<AnyObj> {
+
+  const key =
+    apiKey(env);
+
+  if (!key) {
+    return {
+      success:
+        false,
+
+      authenticated:
+        false,
+
+      read_only:
+        true,
+
+      betting:
+        false,
+
+      wager_sent:
+        false,
+
+      error:
+        "CLOUDBET_API_KEY_MISSING"
+    };
+  }
+
+  const started =
+    Date.now();
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      TIMEOUT_MS
     );
+
+  try {
+
+    const response =
+      await fetch(
+        ACCOUNT_GRAPHQL_URL,
+        {
+          method:
+            "POST",
+
+          headers: {
+            "accept":
+              "application/json",
+
+            "content-type":
+              "application/json",
+
+            "x-api-key":
+              key
+          },
+
+          body:
+            JSON.stringify({
+              query: `
+                query AccountBalances {
+                  accountBalances {
+                    currency
+                    amount
+                  }
+                }
+              `
+            }),
+
+          signal:
+            controller.signal
+        }
+      );
+
+    const parsed =
+      await readResponse(
+        response
+      );
+
+    const errors =
+      Array.isArray(
+        parsed.data?.errors
+      )
+        ? parsed.data.errors
+        : [];
+
+    const hasBalances =
+      Array.isArray(
+        parsed.data?.data
+          ?.accountBalances
+      );
+
+    const balances =
+      hasBalances
+        ? parsed.data.data
+            .accountBalances
+        : [];
+
+    return {
+      success:
+        response.ok &&
+        errors.length === 0 &&
+        hasBalances,
+
+      authenticated:
+        response.ok &&
+        errors.length === 0 &&
+        hasBalances,
+
+      read_only:
+        true,
+
+      betting:
+        false,
+
+      wager_sent:
+        false,
+
+      endpoint:
+        "ACCOUNT_BALANCES",
+
+      response: {
+        status:
+          response.status,
+
+        elapsed_ms:
+          Date.now() -
+          started
+      },
+
+      balances,
+
+      graphql_errors:
+        errors,
+
+      raw:
+        parsed.raw
+    };
+
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -912,6 +1036,11 @@ export default {
 
     const path =
       url.pathname;
+
+
+    // ========================================================
+    // ROOT
+    // ========================================================
 
     if (
       path ===
@@ -942,14 +1071,15 @@ export default {
           "/search?q=TEAM",
           "/event?id=EVENT_ID",
           "/event-direct?id=EVENT_ID",
-          "/line-test?id=EVENT_ID"
+          "/line-test?id=EVENT_ID",
+          "/account-test"
         ]
       });
     }
 
 
     // ========================================================
-    // FAST /live
+    // FAST LIVE
     // ========================================================
 
     if (
@@ -1025,9 +1155,7 @@ export default {
             error:
               error instanceof Error
                 ? error.message
-                : String(
-                    error
-                  ),
+                : String(error),
 
             performance: {
               total_elapsed_ms:
@@ -1042,7 +1170,7 @@ export default {
 
 
     // ========================================================
-    // SEARCH — reuses same compact fast feed
+    // SEARCH
     // ========================================================
 
     if (
@@ -1052,9 +1180,7 @@ export default {
 
       const q =
         url.searchParams
-          .get(
-            "q"
-          ) ??
+          .get("q") ??
         "";
 
       try {
@@ -1081,12 +1207,10 @@ export default {
             q,
 
           events_received:
-            live
-              .events_received,
+            live.events_received,
 
           events_recognized_live:
-            live
-              .events_recognized_live,
+            live.events_recognized_live,
 
           results:
             searchEvents(
@@ -1119,9 +1243,7 @@ export default {
             error:
               error instanceof Error
                 ? error.message
-                : String(
-                    error
-                  )
+                : String(error)
           },
           500
         );
@@ -1130,7 +1252,7 @@ export default {
 
 
     // ========================================================
-    // EVENT — now DIRECT instead of downloading all live events
+    // EVENT
     // ========================================================
 
     if (
@@ -1142,9 +1264,7 @@ export default {
 
       const id =
         url.searchParams
-          .get(
-            "id"
-          );
+          .get("id");
 
       if (!id) {
         return json(
@@ -1225,9 +1345,7 @@ export default {
             error:
               error instanceof Error
                 ? error.message
-                : String(
-                    error
-                  )
+                : String(error)
           },
           500
         );
@@ -1246,9 +1364,7 @@ export default {
 
       const id =
         url.searchParams
-          .get(
-            "id"
-          );
+          .get("id");
 
       if (!id) {
         return json(
@@ -1329,18 +1445,93 @@ export default {
             action:
               "LINE_TEST",
 
+            read_only:
+              true,
+
+            betting:
+              false,
+
             error:
               error instanceof Error
                 ? error.message
-                : String(
-                    error
-                  )
+                : String(error)
           },
           500
         );
       }
     }
 
+
+    // ========================================================
+    // ACCOUNT TEST
+    // ========================================================
+
+    if (
+      path ===
+      "/account-test"
+    ) {
+
+      try {
+
+        const result =
+          await accountTest(
+            env
+          );
+
+        return json({
+          worker:
+            "cloudbet-live-soccer-detector",
+
+          version:
+            VERSION,
+
+          action:
+            "ACCOUNT_TEST",
+
+          ...result
+        });
+
+      } catch (
+        error
+      ) {
+
+        return json(
+          {
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "ACCOUNT_TEST",
+
+            read_only:
+              true,
+
+            betting:
+              false,
+
+            wager_sent:
+              false,
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(error)
+          },
+          500
+        );
+      }
+    }
+
+
+    // ========================================================
+    // NOT FOUND
+    // ========================================================
 
     return json(
       {
@@ -1354,7 +1545,9 @@ export default {
           VERSION,
 
         error:
-          "NOT_FOUND"
+          "Not found",
+
+        path
       },
       404
     );
