@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.9.2 — FAST LIVE + REST ACCOUNT TEST
+// CLOUDBET LIVE SOCCER DETECTOR V5.9.3 — TRADING PREFLIGHT
 //
 // EXISTING PURPOSE:
 // - fast /live for matcher
@@ -9,7 +9,7 @@
 // - /event uses direct event endpoint
 // - /line-test preserved for diagnostics
 //
-// V5.9.2:
+// V5.9.3:
 // - Added /account-test
 // - Uses official Cloudbet REST Account API
 // - Reads currencies and balance for each currency
@@ -23,7 +23,7 @@ interface Env {
 
 type AnyObj = Record<string, any>;
 
-const VERSION = "V5.9.2 FAST LIVE + REST ACCOUNT TEST";
+const VERSION = "V5.9.3 TRADING PREFLIGHT";
 
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
@@ -638,6 +638,11 @@ function inspectSelections(
           selection?.price
         );
 
+      const minStake =
+        finiteNumber(
+          selection?.minStake
+        );
+
       const maxStake =
         finiteNumber(
           selection?.maxStake
@@ -688,6 +693,8 @@ function inspectSelections(
         status:
           selection?.status ??
           null,
+
+        minStake,
 
         maxStake,
 
@@ -1177,6 +1184,301 @@ async function accountTest(
 
 
 // ============================================================
+// TRADING PREFLIGHT — NO WAGER IS SENT
+//
+// Checks the exact same data needed for a real single bet:
+// - authenticated USDT account + balance
+// - exact Cloudbet event
+// - exact 1H Over 0.5 selection
+// - current price
+// - selection status
+// - minStake / maxStake
+// - requested test stake = 0.10 USDT
+//
+// IMPORTANT:
+// This endpoint NEVER calls placeBet.
+// ============================================================
+
+const PREFLIGHT_CURRENCY =
+  "USDT";
+
+const PREFLIGHT_STAKE =
+  0.10;
+
+
+async function tradingPreflight(
+  env: Env,
+  eventId: string
+): Promise<AnyObj> {
+
+  const account =
+    await accountTest(
+      env
+    );
+
+  const balanceRow =
+    Array.isArray(
+      account?.balances
+    )
+      ? account.balances.find(
+          (item: AnyObj) =>
+            String(
+              item?.currency ??
+              ""
+            )
+              .trim()
+              .toUpperCase() ===
+            PREFLIGHT_CURRENCY
+        )
+      : null;
+
+  const balance =
+    finiteNumber(
+      balanceRow?.amount ??
+      balanceRow?.data?.amount
+    );
+
+  const eventResult =
+    await getEventDirect(
+      env,
+      eventId
+    );
+
+  const target =
+    eventResult.event
+      ? findExactTarget(
+          eventResult.event
+        )
+      : null;
+
+  const price =
+    finiteNumber(
+      target?.price
+    );
+
+  const minStake =
+    finiteNumber(
+      target?.minStake
+    );
+
+  const maxStake =
+    finiteNumber(
+      target?.maxStake
+    );
+
+  const marketUrl =
+    String(
+      target?.marketUrl ??
+      ""
+    ).trim();
+
+  const checks = {
+    api_authenticated:
+      account?.authenticated ===
+      true,
+
+    currency_available:
+      !!balanceRow,
+
+    balance_readable:
+      balance !== null,
+
+    sufficient_balance:
+      balance !== null &&
+      balance >=
+        PREFLIGHT_STAKE,
+
+    event_found:
+      eventResult.found ===
+      true,
+
+    exact_target_found:
+      !!target,
+
+    selection_enabled:
+      target?.enabled ===
+      true,
+
+    market_url_available:
+      marketUrl.length > 0,
+
+    price_valid:
+      price !== null &&
+      price > 1,
+
+    min_stake_ok:
+      minStake === null ||
+      PREFLIGHT_STAKE >=
+        minStake,
+
+    max_stake_ok:
+      maxStake === null ||
+      PREFLIGHT_STAKE <=
+        maxStake
+  };
+
+  const failedChecks =
+    Object.entries(
+      checks
+    )
+      .filter(
+        ([, value]) =>
+          value !== true
+      )
+      .map(
+        ([key]) =>
+          key
+      );
+
+  const ready =
+    failedChecks.length ===
+    0;
+
+  const referenceId =
+    crypto.randomUUID();
+
+  return {
+    success:
+      true,
+
+    action:
+      "TRADING_PREFLIGHT",
+
+    ready_to_place_bet:
+      ready,
+
+    wager_sent:
+      false,
+
+    place_bet_called:
+      false,
+
+    read_only:
+      true,
+
+    requested_test: {
+      currency:
+        PREFLIGHT_CURRENCY,
+
+      stake:
+        PREFLIGHT_STAKE,
+
+      event_id:
+        String(
+          eventId
+        )
+    },
+
+    account: {
+      authenticated:
+        account?.authenticated ===
+        true,
+
+      currency:
+        PREFLIGHT_CURRENCY,
+
+      balance
+    },
+
+    event: {
+      found:
+        eventResult.found ===
+        true,
+
+      event_id:
+        String(
+          eventId
+        ),
+
+      home:
+        eventResult.event
+          ?.home?.name ??
+        null,
+
+      away:
+        eventResult.event
+          ?.away?.name ??
+        null,
+
+      status:
+        eventResult.event
+          ?.status ??
+        null
+    },
+
+    selection: target
+      ? {
+          market:
+            target.market ??
+            null,
+
+          submarket:
+            target.submarket ??
+            null,
+
+          outcome:
+            target.outcome ??
+            null,
+
+          params:
+            target.params ??
+            null,
+
+          marketUrl:
+            target.marketUrl ??
+            null,
+
+          price,
+
+          status:
+            target.status ??
+            null,
+
+          minStake,
+
+          maxStake,
+
+          enabled:
+            target.enabled ===
+            true
+        }
+      : null,
+
+    checks,
+
+    failed_checks:
+      failedChecks,
+
+    would_send: ready
+      ? {
+          referenceId,
+
+          eventId:
+            String(
+              eventId
+            ),
+
+          marketUrl,
+
+          price:
+            String(price),
+
+          currency:
+            PREFLIGHT_CURRENCY,
+
+          stake:
+            PREFLIGHT_STAKE
+              .toFixed(2),
+
+          note:
+            "PREVIEW_ONLY_NOT_SENT"
+        }
+      : null
+  };
+}
+
+
+// ============================================================
 // MAIN
 // ============================================================
 
@@ -1230,7 +1532,8 @@ export default {
           "/event?id=EVENT_ID",
           "/event-direct?id=EVENT_ID",
           "/line-test?id=EVENT_ID",
-          "/account-test"
+          "/account-test",
+          "/trading-preflight?id=EVENT_ID"
         ]
       });
     }
@@ -1674,6 +1977,106 @@ export default {
               false,
 
             wager_sent:
+              false,
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(error)
+          },
+          500
+        );
+      }
+    }
+
+
+    // ========================================================
+    // TRADING PREFLIGHT — NO BET PLACEMENT
+    // ========================================================
+
+    if (
+      path ===
+      "/trading-preflight"
+    ) {
+
+      const id =
+        url.searchParams
+          .get("id");
+
+      if (!id) {
+        return json(
+          {
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "TRADING_PREFLIGHT",
+
+            ready_to_place_bet:
+              false,
+
+            wager_sent:
+              false,
+
+            place_bet_called:
+              false,
+
+            error:
+              "Missing id"
+          },
+          400
+        );
+      }
+
+      try {
+
+        const result =
+          await tradingPreflight(
+            env,
+            id
+          );
+
+        return json({
+          worker:
+            "cloudbet-live-soccer-detector",
+
+          version:
+            VERSION,
+
+          ...result
+        });
+
+      } catch (
+        error
+      ) {
+
+        return json(
+          {
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "TRADING_PREFLIGHT",
+
+            ready_to_place_bet:
+              false,
+
+            wager_sent:
+              false,
+
+            place_bet_called:
               false,
 
             error:
