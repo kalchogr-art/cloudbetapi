@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.9.6 — TRADING ACCESS TEST
+// CLOUDBET LIVE SOCCER DETECTOR V5.9.7 — ALL LIVE LINE AUDIT
 //
 // EXISTING PURPOSE:
 // - fast /live for matcher
@@ -9,7 +9,7 @@
 // - /event uses direct event endpoint
 // - /line-test preserved for diagnostics
 //
-// V5.9.6:
+// V5.9.7:
 // - Added /account-test
 // - Uses official Cloudbet REST Account API
 // - Reads currencies and balance for each currency
@@ -23,7 +23,7 @@ interface Env {
 
 type AnyObj = Record<string, any>;
 
-const VERSION = "V5.9.6 TRADING ACCESS TEST";
+const VERSION = "V5.9.7 ALL LIVE LINE AUDIT";
 
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
@@ -1898,6 +1898,298 @@ async function tradingAccessTest(
 
 
 // ============================================================
+// ALL LIVE LINE AUDIT — READ ONLY
+//
+// Fetches all current live soccer events and checks the exact
+// 1H Over 0.5 line through /v2/odds/lines for each event.
+//
+// NO WAGER IS SENT.
+// ============================================================
+
+async function allLiveLineAudit(
+  env: Env
+): Promise<AnyObj> {
+
+  const started =
+    Date.now();
+
+  const liveEvents =
+    await getLiveEvents(
+      env
+    );
+
+  const results:
+    AnyObj[] = [];
+
+  let enabledCount = 0;
+  let disabledCount = 0;
+  let missingTargetCount = 0;
+  let lineErrorCount = 0;
+
+  for (
+    const event
+    of liveEvents
+  ) {
+
+    const eventId =
+      String(
+        event?.id ??
+        event?.eventId ??
+        ""
+      ).trim();
+
+    if (!eventId) {
+      continue;
+    }
+
+    const target =
+      findExactTarget(
+        event
+      );
+
+    if (!target) {
+
+      missingTargetCount++;
+
+      results.push({
+        event_id:
+          eventId,
+
+        home:
+          event?.home?.name ??
+          event?.home ??
+          null,
+
+        away:
+          event?.away?.name ??
+          event?.away ??
+          null,
+
+        event_status:
+          event?.status ??
+          null,
+
+        period:
+          event?.period ??
+          event?.eventStatus ??
+          null,
+
+        target_found:
+          false,
+
+        line_checked:
+          false,
+
+        status:
+          "TARGET_NOT_FOUND",
+
+        price:
+          null,
+
+        minStake:
+          null,
+
+        maxStake:
+          null
+      });
+
+      continue;
+    }
+
+    const marketUrl =
+      String(
+        target?.marketUrl ??
+        TARGET_MARKET_URL
+      ).trim();
+
+    try {
+
+      const line =
+        await latestLineFetch(
+          env,
+          eventId,
+          marketUrl
+        );
+
+      const enabled =
+        line?.available ===
+        true;
+
+      if (enabled) {
+        enabledCount++;
+      } else {
+        disabledCount++;
+      }
+
+      results.push({
+        event_id:
+          eventId,
+
+        home:
+          event?.home?.name ??
+          event?.home ??
+          null,
+
+        away:
+          event?.away?.name ??
+          event?.away ??
+          null,
+
+        event_status:
+          event?.status ??
+          null,
+
+        period:
+          event?.period ??
+          event?.eventStatus ??
+          null,
+
+        target_found:
+          true,
+
+        line_checked:
+          true,
+
+        market:
+          target?.market ??
+          null,
+
+        marketUrl,
+
+        event_selection_status:
+          target?.status ??
+          null,
+
+        event_selection_price:
+          finiteNumber(
+            target?.price
+          ),
+
+        status:
+          line?.line?.status ??
+          null,
+
+        available:
+          enabled,
+
+        price:
+          finiteNumber(
+            line?.line?.price
+          ),
+
+        minStake:
+          finiteNumber(
+            line?.line?.minStake
+          ),
+
+        maxStake:
+          finiteNumber(
+            line?.line?.maxStake
+          ),
+
+        http_status:
+          line?.response?.status ??
+          null
+      });
+
+    } catch (
+      error
+    ) {
+
+      lineErrorCount++;
+
+      results.push({
+        event_id:
+          eventId,
+
+        home:
+          event?.home?.name ??
+          event?.home ??
+          null,
+
+        away:
+          event?.away?.name ??
+          event?.away ??
+          null,
+
+        event_status:
+          event?.status ??
+          null,
+
+        target_found:
+          true,
+
+        line_checked:
+          false,
+
+        marketUrl,
+
+        status:
+          "LINE_FETCH_ERROR",
+
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error)
+      });
+    }
+  }
+
+  return {
+    success:
+      true,
+
+    action:
+      "ALL_LIVE_LINE_AUDIT",
+
+    read_only:
+      true,
+
+    wager_sent:
+      false,
+
+    betting:
+      false,
+
+    summary: {
+      live_events:
+        liveEvents.length,
+
+      checked:
+        results.length,
+
+      enabled:
+        enabledCount,
+
+      disabled:
+        disabledCount,
+
+      target_not_found:
+        missingTargetCount,
+
+      line_errors:
+        lineErrorCount,
+
+      enabled_percent:
+        results.length
+          ? Math.round(
+              enabledCount /
+              results.length *
+              1000
+            ) / 10
+          : 0,
+
+      elapsed_ms:
+        Date.now() -
+        started
+    },
+
+    results
+  };
+}
+
+
+// ============================================================
 // MAIN
 // ============================================================
 
@@ -1953,7 +2245,8 @@ export default {
           "/line-test?id=EVENT_ID",
           "/account-test",
           "/trading-preflight?id=EVENT_ID",
-          "/trading-access-test"
+          "/trading-access-test",
+          "/all-live-line-audit"
         ]
       });
     }
@@ -2583,6 +2876,70 @@ export default {
               false,
 
             place_bet_called:
+              false,
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(error)
+          },
+          500
+        );
+      }
+    }
+
+
+    // ========================================================
+    // ALL LIVE LINE AUDIT — READ ONLY
+    // ========================================================
+
+    if (
+      path ===
+      "/all-live-line-audit"
+    ) {
+
+      try {
+
+        const result =
+          await allLiveLineAudit(
+            env
+          );
+
+        return json({
+          worker:
+            "cloudbet-live-soccer-detector",
+
+          version:
+            VERSION,
+
+          ...result
+        });
+
+      } catch (
+        error
+      ) {
+
+        return json(
+          {
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "ALL_LIVE_LINE_AUDIT",
+
+            read_only:
+              true,
+
+            wager_sent:
+              false,
+
+            betting:
               false,
 
             error:
