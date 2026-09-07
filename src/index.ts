@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.10 — BET PREFLIGHT CONFIG
+// CLOUDBET LIVE SOCCER DETECTOR V5.11 — AUTO PREFLIGHT
 //
 // EXISTING PURPOSE:
 // - fast /live for matcher
@@ -23,7 +23,7 @@ interface Env {
 
 type AnyObj = Record<string, any>;
 
-const VERSION = "V5.10 BET PREFLIGHT CONFIG";
+const VERSION = "V5.11 AUTO PREFLIGHT";
 
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
@@ -2943,6 +2943,269 @@ async function betPreflight(
 }
 
 
+
+// ============================================================
+// AUTO PREFLIGHT
+//
+// Automatically discovers all current live soccer events,
+// narrows them to 1H + 0:0 + configured minute window,
+// then runs the existing betPreflight() against each candidate.
+//
+// PREVIEW ONLY. NO REAL WAGER POST.
+// ============================================================
+
+async function autoPreflight(
+  env: Env
+): Promise<AnyObj> {
+
+  const started =
+    Date.now();
+
+  const livePath =
+    "/events?sport=soccer&live=true&players=false&limit=10000";
+
+  const liveResponse =
+    await cloudbetFetch(
+      env,
+      livePath
+    );
+
+  if (
+    !liveResponse.response.ok
+  ) {
+    const body =
+      await liveResponse.response
+        .text();
+
+    throw new Error(
+      "CLOUDBET_LIVE_HTTP_" +
+      liveResponse.response.status +
+      ": " +
+      body.slice(0, 300)
+    );
+  }
+
+  const parsed =
+    await readResponse(
+      liveResponse.response
+    );
+
+  const allEvents =
+    extractEvents(
+      parsed.data
+    );
+
+  const liveEvents =
+    allEvents.filter(
+      event =>
+        isLive(event)
+    );
+
+  const candidates:
+    AnyObj[] = [];
+
+  const rejected = {
+    not_first_half: 0,
+    not_zero_zero: 0,
+    minute_unknown: 0,
+    outside_minute_window: 0,
+    event_fetch_failed: 0
+  };
+
+  for (
+    const rawEvent
+    of liveEvents
+  ) {
+
+    const eventId =
+      String(
+        rawEvent?.id ??
+        rawEvent?.eventId ??
+        ""
+      ).trim();
+
+    if (!eventId) {
+      continue;
+    }
+
+    let event =
+      rawEvent;
+
+    // Use direct event data because list responses are often compact.
+    try {
+
+      const direct =
+        await getEventDirect(
+          env,
+          eventId
+        );
+
+      if (
+        direct?.found &&
+        direct?.event
+      ) {
+        event =
+          direct.event;
+      }
+
+    } catch {
+
+      rejected.event_fetch_failed++;
+      continue;
+    }
+
+    const minute =
+      preflightEventMinute(
+        event
+      );
+
+    const score =
+      preflightScore(
+        event
+      );
+
+    const firstHalf =
+      preflightFirstHalf(
+        event
+      );
+
+    if (!firstHalf) {
+      rejected.not_first_half++;
+      continue;
+    }
+
+    if (
+      score === null ||
+      score.home !== 0 ||
+      score.away !== 0
+    ) {
+      rejected.not_zero_zero++;
+      continue;
+    }
+
+    if (minute === null) {
+      rejected.minute_unknown++;
+      continue;
+    }
+
+    if (
+      minute < BET_CONFIG.MIN_MINUTE ||
+      minute > BET_CONFIG.MAX_MINUTE
+    ) {
+      rejected.outside_minute_window++;
+      continue;
+    }
+
+    const result =
+      await betPreflight(
+        env,
+        eventId
+      );
+
+    candidates.push(
+      result
+    );
+  }
+
+  candidates.sort(
+    (a, b) =>
+      Number(
+        a?.event?.minute ??
+        a?.minute ??
+        9999
+      ) -
+      Number(
+        b?.event?.minute ??
+        b?.minute ??
+        9999
+      )
+  );
+
+  const ready =
+    candidates.filter(
+      item =>
+        item?.ready_to_place_bet ===
+        true
+    );
+
+  const enabledSelections =
+    candidates.filter(
+      item =>
+        item?.checks
+          ?.selection_enabled ===
+        true
+    );
+
+  return {
+    success:
+      true,
+
+    action:
+      "AUTO_PREFLIGHT",
+
+    read_only:
+      true,
+
+    betting_enabled_setting:
+      BET_CONFIG.ENABLED,
+
+    wager_sent:
+      false,
+
+    place_bet_called:
+      false,
+
+    config:
+      BET_CONFIG,
+
+    source: {
+      live_path:
+        livePath,
+
+      live_http_status:
+        liveResponse.response
+          .status,
+
+      events_received:
+        allEvents.length,
+
+      live_events:
+        liveEvents.length
+    },
+
+    filtering: {
+      ...rejected
+    },
+
+    summary: {
+      candidates:
+        candidates.length,
+
+      selection_enabled:
+        enabledSelections.length,
+
+      ready_to_place_bet:
+        ready.length,
+
+      elapsed_ms:
+        Date.now() -
+        started
+    },
+
+    ready_candidates:
+      ready,
+
+    all_candidates:
+      candidates,
+
+    note:
+      BET_CONFIG.ENABLED
+        ? "ENABLED=true, but AUTO PREFLIGHT remains preview-only and sends no real wager."
+        : "ENABLED=false. AUTO PREFLIGHT is preview-only."
+  };
+}
+
+
 // ============================================================
 // MAIN
 // ============================================================
@@ -3001,7 +3264,8 @@ export default {
           "/trading-preflight?id=EVENT_ID",
           "/trading-access-test",
           "/all-live-line-audit",
-          "/bet-preflight?id=EVENT_ID"
+          "/bet-preflight?id=EVENT_ID",
+          "/auto-preflight"
         ]
       });
     }
@@ -3780,6 +4044,70 @@ export default {
 
             action:
               "BET_PREFLIGHT",
+
+            read_only:
+              true,
+
+            wager_sent:
+              false,
+
+            place_bet_called:
+              false,
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(error)
+          },
+          500
+        );
+      }
+    }
+
+
+    // ========================================================
+    // AUTO PREFLIGHT — PREVIEW ONLY
+    // ========================================================
+
+    if (
+      path ===
+      "/auto-preflight"
+    ) {
+
+      try {
+
+        const result =
+          await autoPreflight(
+            env
+          );
+
+        return json({
+          worker:
+            "cloudbet-live-soccer-detector",
+
+          version:
+            VERSION,
+
+          ...result
+        });
+
+      } catch (
+        error
+      ) {
+
+        return json(
+          {
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "AUTO_PREFLIGHT",
 
             read_only:
               true,
