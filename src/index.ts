@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.9.5 — LIVE LINE REFRESH
+// CLOUDBET LIVE SOCCER DETECTOR V5.9.6 — TRADING ACCESS TEST
 //
 // EXISTING PURPOSE:
 // - fast /live for matcher
@@ -9,7 +9,7 @@
 // - /event uses direct event endpoint
 // - /line-test preserved for diagnostics
 //
-// V5.9.5:
+// V5.9.6:
 // - Added /account-test
 // - Uses official Cloudbet REST Account API
 // - Reads currencies and balance for each currency
@@ -23,7 +23,7 @@ interface Env {
 
 type AnyObj = Record<string, any>;
 
-const VERSION = "V5.9.5 LIVE LINE REFRESH";
+const VERSION = "V5.9.6 TRADING ACCESS TEST";
 
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
@@ -1780,6 +1780,124 @@ async function tradingPreflight(
 
 
 // ============================================================
+// TRADING ACCESS TEST — READ ONLY
+//
+// Official current v4 tracking endpoint:
+// GET /pub/v4/bets
+//
+// Cloudbet states that a Trading API key is required for
+// /pub/v4/bets. This function DOES NOT place a bet.
+// ============================================================
+
+async function tradingAccessTest(
+  env: Env
+): Promise<AnyObj> {
+
+  const started =
+    Date.now();
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      TIMEOUT_MS
+    );
+
+  try {
+
+    const response =
+      await fetch(
+        "https://sports-api.cloudbet.com/pub/v4/bets?limit=1&offset=0",
+        {
+          method:
+            "GET",
+
+          headers: {
+            "accept":
+              "application/json",
+
+            "content-type":
+              "application/json",
+
+            "x-api-key":
+              apiKey(env)
+          },
+
+          signal:
+            controller.signal
+        }
+      );
+
+    const parsed =
+      await readResponse(
+        response
+      );
+
+    const tradingAuthenticated =
+      response.ok;
+
+    return {
+      success:
+        response.ok,
+
+      action:
+        "TRADING_ACCESS_TEST",
+
+      trading_authenticated:
+        tradingAuthenticated,
+
+      trading_api_access:
+        tradingAuthenticated,
+
+      read_only:
+        true,
+
+      betting:
+        false,
+
+      wager_sent:
+        false,
+
+      place_bet_called:
+        false,
+
+      endpoint:
+        "/pub/v4/bets",
+
+      response: {
+        status:
+          response.status,
+
+        ok:
+          response.ok,
+
+        elapsed_ms:
+          Date.now() -
+          started
+      },
+
+      interpretation:
+        response.ok
+          ? "TRADING_API_KEY_CONFIRMED"
+          : "TRADING_API_ACCESS_NOT_CONFIRMED",
+
+      data:
+        parsed.data,
+
+      raw:
+        parsed.raw
+    };
+
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+
+// ============================================================
 // MAIN
 // ============================================================
 
@@ -1834,7 +1952,8 @@ export default {
           "/event-direct?id=EVENT_ID",
           "/line-test?id=EVENT_ID",
           "/account-test",
-          "/trading-preflight?id=EVENT_ID"
+          "/trading-preflight?id=EVENT_ID",
+          "/trading-access-test"
         ]
       });
     }
@@ -2385,6 +2504,79 @@ export default {
               "TRADING_PREFLIGHT",
 
             ready_to_place_bet:
+              false,
+
+            wager_sent:
+              false,
+
+            place_bet_called:
+              false,
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(error)
+          },
+          500
+        );
+      }
+    }
+
+
+    // ========================================================
+    // TRADING ACCESS TEST — READ ONLY
+    // ========================================================
+
+    if (
+      path ===
+      "/trading-access-test"
+    ) {
+
+      try {
+
+        const result =
+          await tradingAccessTest(
+            env
+          );
+
+        return json({
+          worker:
+            "cloudbet-live-soccer-detector",
+
+          version:
+            VERSION,
+
+          ...result
+        });
+
+      } catch (
+        error
+      ) {
+
+        return json(
+          {
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "TRADING_ACCESS_TEST",
+
+            trading_authenticated:
+              false,
+
+            trading_api_access:
+              false,
+
+            read_only:
+              true,
+
+            betting:
               false,
 
             wager_sent:
