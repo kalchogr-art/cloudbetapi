@@ -35,7 +35,7 @@ interface Env {
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.3.0-FAST-HUNTER-ODDS";
+  "V7.3.1-FAST-HUNTER-ODDS-1H-00";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -3478,7 +3478,48 @@ export default {
         const matches =
           events
             .filter(
-              isCloudbetLive
+              event => {
+
+                // Only real LIVE events
+                if (
+                  !isCloudbetLive(
+                    event
+                  )
+                ) {
+                  return false;
+                }
+
+                // Only first half
+                if (
+                  String(
+                    event?.metadata
+                      ?.eventStatus ??
+                    ""
+                  )
+                    .toLowerCase()
+                    .trim() !==
+                  "1p"
+                ) {
+                  return false;
+                }
+
+                // Only exact 0:0
+                const score =
+                  cloudbetScore(
+                    event?.metadata
+                      ?.score
+                  );
+
+                if (
+                  !score ||
+                  score.home !== 0 ||
+                  score.away !== 0
+                ) {
+                  return false;
+                }
+
+                return true;
+              }
             )
             .map(
               buildCloudbetLiveRecord
