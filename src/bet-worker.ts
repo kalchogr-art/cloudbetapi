@@ -1,9 +1,9 @@
 // ============================================================
-// CLOUDBET BET WORKER V7.0.0
+// CLOUDBET BET WORKER V7.0.1
 // DRY RUN · TRACKER READY CANDIDATE
 // EXACT 1H TOTAL GOALS OVER 0.5
 //
-// V7.0.0:
+// V7.0.1:
 // - TRACKER /entries is the ONLY source for the matched Cloudbet event_id
 // - Uses Tracker V6.7+ cloudbet.entry_odds / odds_available / matcher_score
 // - NO matcher lookup inside Bet Worker
@@ -29,7 +29,7 @@ type Obj = Record<string, any>;
 // CONFIG
 // ============================================================
 
-const VERSION = "V7.0.0";
+const VERSION = "V7.0.1";
 
 const MODE = "DRY_RUN";
 const DRY_RUN = true;
@@ -586,33 +586,22 @@ function trackerCandidateDiagnostic(
     };
   }
 
-  if (!cloudbet.odds_available) {
-    return {
-      ready: false,
-      reason:
-        "TRACKER_ODDS_NOT_AVAILABLE",
-      hunter,
-      cloudbet
-    };
-  }
-
-  if (
-    cloudbet.entry_odds === null ||
-    cloudbet.entry_odds <= 1
-  ) {
-    return {
-      ready: false,
-      reason:
-        "TRACKER_ENTRY_ODDS_INVALID",
-      hunter,
-      cloudbet
-    };
-  }
+  // V7.0.1:
+  // event_id is the gate. Tracker entry odds are a snapshot,
+  // not a requirement. If odds were unavailable at Hunter ENTRY,
+  // the worker stays locked to this SAME event_id and refreshes
+  // the target market below. If still unavailable -> PENDING.
+  const hasEntryOdds =
+    cloudbet.odds_available &&
+    cloudbet.entry_odds !== null &&
+    cloudbet.entry_odds > 1;
 
   return {
     ready: true,
     reason:
-      "TRACKER_READY",
+      hasEntryOdds
+        ? "TRACKER_READY_WITH_ENTRY_ODDS"
+        : "TRACKER_READY_WAITING_FOR_ODDS",
     hunter,
     cloudbet
   };
@@ -2681,11 +2670,11 @@ async function runDiagnostic(
       tracker_endpoint:
         "/entries",
       required_tracker_fields: [
-        "cloudbet.event_id",
-        "cloudbet.entry_odds",
-        "cloudbet.odds_available"
+        "cloudbet.event_id"
       ],
       optional_tracker_fields: [
+        "cloudbet.entry_odds",
+        "cloudbet.odds_available",
         "cloudbet.max_stake",
         "cloudbet.match",
         "cloudbet.matcher_score"
