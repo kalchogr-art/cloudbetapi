@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.12 — SIGNAL DRIVEN PREFLIGHT
+// CLOUDBET LIVE SOCCER DETECTOR V5.13 — FINAL BET HANDOFF
 //
 // EXISTING PURPOSE:
 // - fast /live for matcher
@@ -24,7 +24,7 @@ interface Env {
 
 type AnyObj = Record<string, any>;
 
-const VERSION = "V5.12 SIGNAL DRIVEN PREFLIGHT";
+const VERSION = "V5.13 FINAL BET HANDOFF";
 
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
@@ -4189,6 +4189,184 @@ async function trackerSignalPreflight(
 }
 
 
+
+// ============================================================
+// FINAL BET HANDOFF
+//
+// Converts READY_TO_PLACE_BET candidates into an exact Trading API
+// request description.
+//
+// IMPORTANT:
+// - Does NOT send POST /pub/v4/bets/place/straight
+// - Does NOT expose the real API key
+// - Produces method, endpoint, header names and JSON body only
+// ============================================================
+
+async function finalBetHandoff(
+  env: Env
+): Promise<AnyObj> {
+
+  const preflight =
+    await trackerSignalPreflight(
+      env
+    );
+
+  if (
+    !preflight?.success
+  ) {
+    return {
+      success:
+        false,
+
+      action:
+        "FINAL_BET_HANDOFF",
+
+      read_only:
+        true,
+
+      wager_sent:
+        false,
+
+      place_bet_called:
+        false,
+
+      preflight
+    };
+  }
+
+  const ready =
+    Array.isArray(
+      preflight?.ready_candidates
+    )
+      ? preflight.ready_candidates
+      : [];
+
+  const requests =
+    ready
+      .filter(
+        item =>
+          item?.would_send &&
+          item?.ready_to_place_bet ===
+            true
+      )
+      .map(
+        item => ({
+          signal: {
+            id:
+              item?.signal?.id ??
+              null,
+
+            match:
+              item?.signal?.match ??
+              null,
+
+            entry_minute:
+              item?.signal?.entry_minute ??
+              null,
+
+            hunter_score:
+              item?.signal?.hunter_score ??
+              null
+          },
+
+          cloudbet: {
+            event_id:
+              item?.cloudbet?.event_id ??
+              null,
+
+            market_url:
+              item?.cloudbet?.market_url ??
+              null,
+
+            price:
+              item?.cloudbet?.price ??
+              null,
+
+            selection_status:
+              item?.cloudbet?.selection_status ??
+              null,
+
+            min_stake:
+              item?.cloudbet?.min_stake ??
+              null,
+
+            max_stake:
+              item?.cloudbet?.max_stake ??
+              null
+          },
+
+          request: {
+            method:
+              "POST",
+
+            endpoint:
+              "https://sports-api.cloudbet.com/pub/v4/bets/place/straight",
+
+            headers: {
+              "Accept":
+                "application/json",
+
+              "Content-Type":
+                "application/json",
+
+              "X-API-Key":
+                "<CLOUDBET_API_KEY>"
+            },
+
+            body:
+              item.would_send
+          }
+        })
+      );
+
+  return {
+    success:
+      true,
+
+    action:
+      "FINAL_BET_HANDOFF",
+
+    architecture:
+      "TRACKER -> EVENT_ID -> DIRECT EVENT -> LATEST LINE -> PREFLIGHT -> REQUEST HANDOFF",
+
+    read_only:
+      true,
+
+    wager_sent:
+      false,
+
+    place_bet_called:
+      false,
+
+    betting_enabled_setting:
+      BET_CONFIG.ENABLED,
+
+    config:
+      BET_CONFIG,
+
+    summary: {
+      tracker_signals_checked:
+        preflight?.summary
+          ?.checked_signals ??
+        0,
+
+      ready_to_place_bet:
+        ready.length,
+
+      handoff_requests:
+        requests.length
+    },
+
+    requests,
+
+    note:
+      requests.length
+        ? "Each request is fully prepared but has NOT been transmitted to Cloudbet."
+        : "No READY_TO_PLACE_BET candidate is available right now."
+  };
+}
+
+
 // ============================================================
 // MAIN
 // ============================================================
@@ -4249,7 +4427,8 @@ export default {
           "/all-live-line-audit",
           "/bet-preflight?id=EVENT_ID",
           "/auto-preflight",
-          "/signal-preflight"
+          "/signal-preflight",
+          "/bet-handoff"
         ]
       });
     }
@@ -5156,6 +5335,70 @@ export default {
 
             action:
               "TRACKER_SIGNAL_PREFLIGHT",
+
+            read_only:
+              true,
+
+            wager_sent:
+              false,
+
+            place_bet_called:
+              false,
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(error)
+          },
+          500
+        );
+      }
+    }
+
+
+    // ========================================================
+    // FINAL BET HANDOFF — NO WAGER TRANSMISSION
+    // ========================================================
+
+    if (
+      path ===
+      "/bet-handoff"
+    ) {
+
+      try {
+
+        const result =
+          await finalBetHandoff(
+            env
+          );
+
+        return json({
+          worker:
+            "cloudbet-live-soccer-detector",
+
+          version:
+            VERSION,
+
+          ...result
+        });
+
+      } catch (
+        error
+      ) {
+
+        return json(
+          {
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "FINAL_BET_HANDOFF",
 
             read_only:
               true,
