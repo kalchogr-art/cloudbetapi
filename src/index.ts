@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.9.7 — ALL LIVE LINE AUDIT
+// CLOUDBET LIVE SOCCER DETECTOR V5.9.8 — ALL LIVE LINE AUDIT FIX
 //
 // EXISTING PURPOSE:
 // - fast /live for matcher
@@ -9,7 +9,7 @@
 // - /event uses direct event endpoint
 // - /line-test preserved for diagnostics
 //
-// V5.9.7:
+// V5.9.8:
 // - Added /account-test
 // - Uses official Cloudbet REST Account API
 // - Reads currencies and balance for each currency
@@ -23,7 +23,7 @@ interface Env {
 
 type AnyObj = Record<string, any>;
 
-const VERSION = "V5.9.7 ALL LIVE LINE AUDIT";
+const VERSION = "V5.9.8 ALL LIVE LINE AUDIT FIX";
 
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
@@ -1913,9 +1913,48 @@ async function allLiveLineAudit(
   const started =
     Date.now();
 
+  // IMPORTANT:
+  // getFastLive() returns compact events and intentionally removes markets.
+  // For this audit we need RAW live events so findExactTarget() can inspect
+  // the actual market tree.
+  const livePath =
+    "/events?sport=soccer&live=true&players=false&limit=10000";
+
+  const liveResponse =
+    await cloudbetFetch(
+      env,
+      livePath
+    );
+
+  if (
+    !liveResponse.response.ok
+  ) {
+    const body =
+      await liveResponse.response
+        .text();
+
+    throw new Error(
+      "CLOUDBET_LIVE_HTTP_" +
+      liveResponse.response.status +
+      ": " +
+      body.slice(0, 300)
+    );
+  }
+
+  const liveParsed =
+    await readResponse(
+      liveResponse.response
+    );
+
+  const allEvents =
+    extractEvents(
+      liveParsed.data
+    );
+
   const liveEvents =
-    await getLiveEvents(
-      env
+    allEvents.filter(
+      event =>
+        isLive(event)
     );
 
   const results:
@@ -1925,16 +1964,17 @@ async function allLiveLineAudit(
   let disabledCount = 0;
   let missingTargetCount = 0;
   let lineErrorCount = 0;
+  let directEventFallbacks = 0;
 
   for (
-    const event
+    const rawEvent
     of liveEvents
   ) {
 
     const eventId =
       String(
-        event?.id ??
-        event?.eventId ??
+        rawEvent?.id ??
+        rawEvent?.eventId ??
         ""
       ).trim();
 
@@ -1942,10 +1982,56 @@ async function allLiveLineAudit(
       continue;
     }
 
-    const target =
+    let event =
+      rawEvent;
+
+    let target =
       findExactTarget(
         event
       );
+
+    // Some /events responses can be compact depending on API behavior.
+    // If the market tree is missing, fetch the SAME event directly once.
+    if (!target) {
+
+      try {
+
+        const direct =
+          await getEventDirect(
+            env,
+            eventId
+          );
+
+        if (
+          direct?.found &&
+          direct?.event
+        ) {
+          directEventFallbacks++;
+          event =
+            direct.event;
+
+          target =
+            findExactTarget(
+              event
+            );
+        }
+
+      } catch {
+        // Keep audit running. Missing target will be reported below.
+      }
+    }
+
+    const home =
+      event?.home?.name ??
+      rawEvent?.home?.name ??
+      rawEvent?.home ??
+      null;
+
+    const away =
+      event?.away?.name ??
+      rawEvent?.away?.name ??
+      rawEvent?.away ??
+      null;
 
     if (!target) {
 
@@ -1955,23 +2041,13 @@ async function allLiveLineAudit(
         event_id:
           eventId,
 
-        home:
-          event?.home?.name ??
-          event?.home ??
-          null,
+        home,
 
-        away:
-          event?.away?.name ??
-          event?.away ??
-          null,
+        away,
 
         event_status:
           event?.status ??
-          null,
-
-        period:
-          event?.period ??
-          event?.eventStatus ??
+          rawEvent?.status ??
           null,
 
         target_found:
@@ -2025,23 +2101,13 @@ async function allLiveLineAudit(
         event_id:
           eventId,
 
-        home:
-          event?.home?.name ??
-          event?.home ??
-          null,
+        home,
 
-        away:
-          event?.away?.name ??
-          event?.away ??
-          null,
+        away,
 
         event_status:
           event?.status ??
-          null,
-
-        period:
-          event?.period ??
-          event?.eventStatus ??
+          rawEvent?.status ??
           null,
 
         target_found:
@@ -2063,6 +2129,16 @@ async function allLiveLineAudit(
         event_selection_price:
           finiteNumber(
             target?.price
+          ),
+
+        event_selection_minStake:
+          finiteNumber(
+            target?.minStake
+          ),
+
+        event_selection_maxStake:
+          finiteNumber(
+            target?.maxStake
           ),
 
         status:
@@ -2102,18 +2178,13 @@ async function allLiveLineAudit(
         event_id:
           eventId,
 
-        home:
-          event?.home?.name ??
-          event?.home ??
-          null,
+        home,
 
-        away:
-          event?.away?.name ??
-          event?.away ??
-          null,
+        away,
 
         event_status:
           event?.status ??
+          rawEvent?.status ??
           null,
 
         target_found:
@@ -2135,6 +2206,10 @@ async function allLiveLineAudit(
     }
   }
 
+  const checkedLines =
+    enabledCount +
+    disabledCount;
+
   return {
     success:
       true,
@@ -2151,12 +2226,33 @@ async function allLiveLineAudit(
     betting:
       false,
 
+    source: {
+      live_path:
+        livePath,
+
+      live_http_status:
+        liveResponse.response
+          .status,
+
+      events_received:
+        allEvents.length,
+
+      live_events:
+        liveEvents.length,
+
+      direct_event_fallbacks:
+        directEventFallbacks
+    },
+
     summary: {
       live_events:
         liveEvents.length,
 
       checked:
         results.length,
+
+      lines_checked:
+        checkedLines,
 
       enabled:
         enabledCount,
@@ -2170,11 +2266,11 @@ async function allLiveLineAudit(
       line_errors:
         lineErrorCount,
 
-      enabled_percent:
-        results.length
+      enabled_percent_of_checked_lines:
+        checkedLines
           ? Math.round(
               enabledCount /
-              results.length *
+              checkedLines *
               1000
             ) / 10
           : 0,
