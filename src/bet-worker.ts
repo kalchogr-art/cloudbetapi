@@ -1,119 +1,142 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7.4.2
-// FAST HUNTER + SEPARATE EVENT DISCOVERY / ODDS LOOKUP
-// LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
-// V27 SERVICE BINDING + DIRECT CLOUDBET PUBLIC SPORTS API
-// READ ONLY
+// CLOUDBET BET WORKER V7.2.0
+// DRY RUN · TRACKER READY CANDIDATE · FINAL HANDOFF
+// EXACT 1H TOTAL GOALS OVER 0.5
 //
-// FEATURES:
-// - /live
-//   -> current Cloudbet LIVE soccer
-//   -> only 1H + 0:0
-//   -> exact 1H Over 0.5 odds
-//
-// - /match?signals=...
-//   -> FAST_HUNTER mode
-//   -> DOES NOT fetch/process V27
-//   -> discovers ALL live soccer WITHOUT market filter
-//   -> Cloudbet candidates then filtered to:
-//      LIVE + 1H + 0:0 + valid minute
-//   -> per Hunter signal: only candidates within +/-5 minutes
-//   -> then strict two-sided team matching
-//   -> aliases + fuzzy + category protection
-//   -> only CONFIDENT_MATCH => secure_match=true
-//   -> preserves event_id even when odds are unavailable
-//   -> exact 1H Over 0.5 odds queried separately AFTER match
-//
-// - /diagnostic
-//   -> light V27 + Cloudbet diagnostic
-//
-// READ ONLY:
-// - no login
-// - no auth
-// - no cookies
-// - no POST to Cloudbet
-// - no betting
-// - no orders
+// V7.2.0:
+// - BASED ON V7.0.2
+// - TRACKER /entries is the ONLY source for matched Cloudbet event_id
+// - Uses Tracker cloudbet.entry_odds / odds_available / matcher_score
+// - NO matcher lookup inside Bet Worker
+// - NO fuzzy name matching inside Bet Worker
+// - NO direct Cloudbet fallback to another event
+// - Final verification is locked to SAME Cloudbet event_id
+// - Refreshes SAME event through /event?id=EVENT_ID before READY_TO_BET
+// - Keeps entry_odds and current_odds separately
+// - Persistent pending_odds retry preserved for SAME EVENT / MARKET / LINE
+// - D1 bet_archive preserved
+// - Preserves Trading API v4 HANDOFF after READY_TO_BET
+// - Preserves same HANDOFF when PENDING becomes READY
+// - NEW: /run reads authenticated Cloudbet account snapshot via CLOUDBET /account-test
+// - NEW: account currency/balance are shown directly in /run
+// - NEW: READY_TO_BET gets balance + min/max stake preflight
+// - NEW: handoff.ready_to_send is true only when account/stake preflight passes
+// - REAL BETTING DISABLED
+// - NO POST /pub/v4/bets/place/straight is sent
 // ============================================================
 
 interface Env {
-  V27: Fetcher;
+  TRACKER: Fetcher;
+  CLOUDBET: Fetcher;
+  DB: D1Database;
 }
 
-type AnyObj = Record<string, any>;
+type Obj = Record<string, any>;
+
+// ============================================================
+// CONFIG
+// ============================================================
 
 const VERSION =
-  "V7.4.2-GENERAL-DISTINCTIVE-TOKEN-MATCH";
+  "V7.2.0 ACCOUNT PREFLIGHT";
 
-const DEFAULT_THRESHOLD =
-  0.45;
+const MODE =
+  "DRY_RUN";
 
-const STRONG_TEAM_SCORE =
-  0.78;
+const DRY_RUN =
+  true;
 
-const POSSIBLE_TEAM_SCORE =
-  0.60;
+const BETTING_ENABLED =
+  false;
 
-const POSSIBLE_TOTAL_SCORE =
-  0.72;
+// Handoff only. Does NOT transmit wager.
+const HANDOFF_ENABLED =
+  true;
 
-const CONFIDENT_TOTAL_SCORE =
-  0.80;
+const BET_CURRENCY =
+  "USDT";
 
-const REVERSED_CONFIDENT_SCORE =
-  0.90;
+const BET_STAKE =
+  "0.10";
 
-const WEAK_SIDE_LIMIT =
-  0.50;
+const TRADING_STRAIGHT_ENDPOINT =
+  "https://sports-api.cloudbet.com/pub/v4/bets/place/straight";
 
-const COMPETITION_BONUS =
-  0.05;
+// Legacy display/archive value preserved from V7.0.2.
+const BET_STAKE_EUR =
+  10;
 
-const COUNTRY_BONUS =
-  0.02;
+const BET_MARKET =
+  "1H Total Goals";
 
-const MATCH_MINUTE_TOLERANCE =
-  5;
+const BET_SELECTION =
+  "OVER 0.5";
 
-
-// ============================================================
-// CLOUDBET DIRECT ODDS READER
-// ============================================================
-
-const CLOUDBET_BASE =
-  "https://www.cloudbet.com";
-
-const SPORTS_BASE =
-  "/sports-api/c/v6/sports";
-
-const ODDS_MARKET =
+const TARGET_MARKET =
   "soccer.total_goals_period_first_half";
 
-const ODDS_SUBMARKET =
+const TARGET_SUBMARKET =
   "period=1h";
 
-const ODDS_OUTCOME =
+const TARGET_OUTCOME =
   "over";
 
-const ODDS_PARAMS =
+const TARGET_PARAMS =
   "total=0.5";
 
-const LIVE_LIMIT =
-  100;
+const TARGET_SELECTION =
+  "OVER 0.5";
 
-const CLOUDBET_TIMEOUT_MS =
-  8000;
+const CLOUDBET_EVENT_PATH =
+  "/event?id=";
 
+const SERVICE_TIMEOUT_MS =
+  10_000;
+
+const ODDS_EVENT_MAX_RETRIES =
+  20;
+
+const ODDS_EVENT_RETRY_DELAY_MS =
+  30_000;
+
+const MAX_MISSING_CHECKS =
+  3;
 
 // ============================================================
-// JSON
+// BASIC HELPERS
 // ============================================================
+
+function safe(
+  value: any
+): string {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return "";
+  }
+
+  return String(value).trim();
+}
+
+function norm(
+  value: any
+): string {
+  return safe(value)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/&/g, " and ")
+    .replace(/[’'`]/g, "")
+    .replace(/[^a-z0-9.=]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
 
 function json(
   data: any,
   status = 200
 ): Response {
-
   return new Response(
     JSON.stringify(
       data,
@@ -124,8 +147,7 @@ function json(
       status,
       headers: {
         "content-type":
-          "application/json; charset=UTF-8",
-
+          "application/json; charset=utf-8",
         "cache-control":
           "no-store"
       }
@@ -133,906 +155,289 @@ function json(
   );
 }
 
+function nowISO():
+  string {
+  return new Date()
+    .toISOString();
+}
 
-// ============================================================
-// NORMALIZATION
-// ============================================================
-
-function normalizeText(
-  value: any
+function addSecondsISO(
+  seconds: number
 ): string {
-
-  return String(
-    value ?? ""
-  )
-    .normalize("NFD")
-    .replace(
-      /[\u0300-\u036f]/g,
-      ""
-    )
-    .toLowerCase()
-    .replace(
-      /&/g,
-      " and "
-    )
-    .replace(
-      /['’`]/g,
-      ""
-    )
-    .replace(
-      /[^a-z0-9]+/g,
-      " "
-    )
-    .replace(
-      /\s+/g,
-      " "
-    )
-    .trim();
+  return new Date(
+    Date.now() +
+    seconds * 1000
+  ).toISOString();
 }
 
-
-// ============================================================
-// ALIASES
-// ============================================================
-
-const TEAM_ALIASES:
-  Record<string, string> = {
-
-  "man city":
-    "manchester city",
-
-  "man utd":
-    "manchester united",
-
-  "man united":
-    "manchester united",
-
-  "man u":
-    "manchester united",
-
-  "manchester utd":
-    "manchester united",
-
-  "psg":
-    "paris saint germain",
-
-  "paris sg":
-    "paris saint germain",
-
-  "inter":
-    "inter milan",
-
-  "inter milano":
-    "inter milan",
-
-  "internazionale":
-    "inter milan",
-
-  "fc internazionale":
-    "inter milan",
-
-  "atletico":
-    "atletico madrid",
-
-  "atletico de madrid":
-    "atletico madrid",
-
-  "sporting cp":
-    "sporting lisbon",
-
-  "sporting lisboa":
-    "sporting lisbon",
-
-  "red star":
-    "crvena zvezda",
-
-  "red star belgrade":
-    "crvena zvezda",
-
-  "psv eindhoven":
-    "psv",
-
-  "bayern munchen":
-    "bayern munich",
-
-  "utd":
-    "united",
-
-  "ath":
-    "athletic",
-
-  "dep":
-    "deportivo",
-
-  "depor":
-    "deportivo",
-
-  "oster":
-    "osters",
-
-  "osters":
-    "osters",
-
-  "osters if":
-    "osters",
-
-  "floridsdorfer ac":
-    "fac wien",
-
-  "floridsdorfer":
-    "fac wien",
-
-  "fac wien":
-    "fac wien",
-
-  "bregenz":
-    "schwarz weiss bregenz",
-
-  "sw bregenz":
-    "schwarz weiss bregenz",
-
-  "schwarz weiss bregenz":
-    "schwarz weiss bregenz",
-
-  // Bulgaria
-  "dunav ruse":
-    "dunav 2010",
-
-  "dunav 2010":
-    "dunav 2010",
-
-  "fc dunav 2010":
-    "dunav 2010",
-
-  "fc dunav ruse":
-    "dunav 2010",
-
-  "slavia sofia":
-    "slavia sofia",
-
-  "pfc slavia sofia":
-    "slavia sofia"
-};
-
-
-const GENERIC_WORDS =
-  new Set([
-    "fc",
-    "pfc",
-    "cf",
-    "sc",
-    "ac",
-    "afc",
-    "ca",
-    "cd",
-    "sd",
-    "ss",
-    "as",
-    "us",
-    "ud",
-    "aa",
-    "ad",
-    "rc",
-    "fk",
-    "sk",
-    "ks",
-    "sv",
-    "vfb",
-    "vfl",
-    "club",
-    "calcio",
-    "spa",
-    "srl",
-    "football",
-    "soccer"
-  ]);
-
-
-const WEAK_TEAM_TOKENS =
-  new Set([
-    "city",
-    "united",
-    "athletic",
-    "sporting",
-    "racing",
-    "real",
-    "deportivo",
-    "olympic",
-    "olympique"
-  ]);
-
-
-// ============================================================
-// TEAM NORMALIZATION
-// ============================================================
-
-function applyAlias(
-  value: string
-): string {
-
-  return (
-    TEAM_ALIASES[value] ??
-    value
-  );
-}
-
-
-function normalizeTeam(
+function numberOrNull(
   value: any
-): string {
-
-  let s =
-    normalizeText(
-      value
-    );
-
-  if (!s) {
-    return "";
-  }
-
-  s =
-    applyAlias(
-      s
-    );
-
-  const tokens =
-    s
-      .split(" ")
-      .filter(Boolean)
-      .map(
-        token =>
-          TEAM_ALIASES[token] ??
-          token
-      )
-      .filter(
-        token =>
-          !GENERIC_WORDS.has(
-            token
-          )
-      );
-
-  s =
-    tokens.join(" ");
-
-  s =
-    applyAlias(
-      s
-    );
-
-  return s;
-}
-
-
-function teamTokens(
-  value: any
-): string[] {
-
-  return normalizeTeam(
-    value
-  )
-    .split(" ")
-    .filter(Boolean);
-}
-
-
-// ============================================================
-// CATEGORY PROTECTION
-// ============================================================
-
-function teamCategory(
-  value: any
-): string {
-
-  const s =
-    normalizeText(
-      value
-    );
-
-  if (
-    /\bu\s*\d{2}\b/.test(
-      s
-    )
-  ) {
-    return (
-      s.match(
-        /\bu\s*(\d{2})\b/
-      )?.[1] ??
-      ""
-    )
-      ? "U" +
-        (
-          s.match(
-            /\bu\s*(\d{2})\b/
-          )?.[1] ??
-          ""
-        )
-      : "";
-  }
-
-  if (
-    /\bwomen\b|\bw\b/.test(
-      s
-    )
-  ) {
-    return "WOMEN";
-  }
-
-  if (
-    /\breserve\b|\breserves\b|\bii\b|\b2\b/.test(
-      s
-    )
-  ) {
-    return "RESERVE";
-  }
-
-  return "SENIOR";
-}
-
-
-function categoryCompatible(
-  a: any,
-  b: any
-): boolean {
-
-  const ca =
-    teamCategory(
-      a
-    );
-
-  const cb =
-    teamCategory(
-      b
-    );
-
-  if (
-    ca === "SENIOR" ||
-    cb === "SENIOR"
-  ) {
-    return true;
-  }
-
-  return ca === cb;
-}
-
-
-// ============================================================
-// LEVENSHTEIN
-// ============================================================
-
-function levenshtein(
-  a: string,
-  b: string
-): number {
-
-  if (a === b) {
-    return 0;
-  }
-
-  if (!a.length) {
-    return b.length;
-  }
-
-  if (!b.length) {
-    return a.length;
-  }
-
-  const prev =
-    new Array(
-      b.length + 1
-    );
-
-  const curr =
-    new Array(
-      b.length + 1
-    );
-
-  for (
-    let j = 0;
-    j <= b.length;
-    j++
-  ) {
-    prev[j] = j;
-  }
-
-  for (
-    let i = 1;
-    i <= a.length;
-    i++
-  ) {
-
-    curr[0] = i;
-
-    for (
-      let j = 1;
-      j <= b.length;
-      j++
-    ) {
-
-      const cost =
-        a[i - 1] ===
-        b[j - 1]
-          ? 0
-          : 1;
-
-      curr[j] =
-        Math.min(
-          prev[j] + 1,
-          curr[j - 1] + 1,
-          prev[j - 1] + cost
-        );
-    }
-
-    for (
-      let j = 0;
-      j <= b.length;
-      j++
-    ) {
-      prev[j] =
-        curr[j];
-    }
-  }
-
-  return prev[b.length];
-}
-
-
-function tokenSimilarity(
-  a: string,
-  b: string
-): number {
-
-  if (
-    !a ||
-    !b
-  ) {
-    return 0;
-  }
-
-  if (
-    a === b
-  ) {
-    return 1;
-  }
-
-  if (
-    a.length >= 4 &&
-    b.length >= 4 &&
-    (
-      a.includes(b) ||
-      b.includes(a)
-    )
-  ) {
-
-    return (
-      Math.min(
-        a.length,
-        b.length
-      ) /
-      Math.max(
-        a.length,
-        b.length
-      )
-    );
-  }
-
-  const distance =
-    levenshtein(
-      a,
-      b
-    );
-
-  return Math.max(
-    0,
-    1 -
-      distance /
-      Math.max(
-        a.length,
-        b.length
-      )
-  );
-}
-
-
-// ============================================================
-// DISTINCTIVE TOKEN BRIDGE
-// ============================================================
-//
-// General abbreviation protection.
-//
-// Examples that may receive the bridge:
-//   Atletico Colina <-> AC Colina
-//   SC Freiburg     <-> Freiburg
-//   CD Example      <-> Example
-//
-// The bridge is intentionally NOT allowed for weak/common tokens
-// such as city, united, sporting, real, deportivo, etc.
-//
-// It does not by itself create a match. classifyMatch() still
-// requires a strong TWO-SIDED match and all existing live/category/
-// minute protections remain active.
-// ============================================================
-
-function distinctiveSingleTokenBridge(
-  aTokens: string[],
-  bTokens: string[]
 ): number | null {
-
-  const shorter =
-    aTokens.length <= bTokens.length
-      ? aTokens
-      : bTokens;
-
-  const longer =
-    aTokens.length <= bTokens.length
-      ? bTokens
-      : aTokens;
-
   if (
-    shorter.length !== 1 ||
-    longer.length < 2
+    value === null ||
+    value === undefined ||
+    value === ""
   ) {
     return null;
   }
 
-  const token =
-    shorter[0];
+  const n =
+    Number(value);
 
-  if (
-    !token ||
-    token.length < 4 ||
-    WEAK_TEAM_TOKENS.has(token)
-  ) {
-    return null;
-  }
-
-  if (
-    !longer.includes(token)
-  ) {
-    return null;
-  }
-
-  // A unique, exact, meaningful token is a strong abbreviation bridge,
-  // but deliberately below an exact full-name match.
-  return 0.88;
+  return Number.isFinite(n)
+    ? n
+    : null;
 }
 
+function normalizeEventId(
+  value: any
+): string | null {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return null;
+  }
 
-// ============================================================
-// TEAM SCORE
-// ============================================================
+  const raw =
+    String(value).trim();
 
-function teamScore(
-  a: any,
-  b: any
-): number {
+  if (!raw) {
+    return null;
+  }
 
-  const A =
-    normalizeTeam(
-      a
+  if (/^\d+\.0+$/.test(raw)) {
+    return raw.replace(
+      /\.0+$/,
+      ""
     );
-
-  const B =
-    normalizeTeam(
-      b
-    );
-
-  if (
-    !A ||
-    !B
-  ) {
-    return 0;
   }
 
-  if (
-    A === B
-  ) {
-    return 1;
-  }
-
-  if (
-    !categoryCompatible(
-      a,
-      b
-    )
-  ) {
-    return 0;
-  }
-
-  const aTokens =
-    A.split(" ")
-      .filter(Boolean);
-
-  const bTokens =
-    B.split(" ")
-      .filter(Boolean);
-
-  if (
-    !aTokens.length ||
-    !bTokens.length
-  ) {
-    return 0;
-  }
-
-  const distinctiveBridge =
-    distinctiveSingleTokenBridge(
-      aTokens,
-      bTokens
-    );
-
-  const shorter =
-    aTokens.length <=
-    bTokens.length
-      ? aTokens
-      : bTokens;
-
-  const longer =
-    aTokens.length <=
-    bTokens.length
-      ? bTokens
-      : aTokens;
-
-  const shorterAllExact =
-    shorter.every(
-      token =>
-        longer.includes(
-          token
-        )
-    );
-
-  if (
-    shorterAllExact &&
-    shorter.length >= 2
-  ) {
-
-    const extraTokens =
-      longer.filter(
-        token =>
-          !shorter.includes(
-            token
-          )
-      );
-
-    const meaningfulExtra =
-      extraTokens.filter(
-        token =>
-          !/^u\d{2}$/.test(
-            token
-          ) &&
-          token !==
-            "reserve" &&
-          token !==
-            "women" &&
-          !/^team[234]$/.test(
-            token
-          )
-      );
-
-    if (
-      !meaningfulExtra.length
-    ) {
-      return 0.97;
-    }
-  }
-
-  let fuzzy = 0;
-  let exact = 0;
-
-  for (
-    const aToken
-    of aTokens
-  ) {
-
-    let best = 0;
-
-    for (
-      const bToken
-      of bTokens
-    ) {
-
-      if (
-        aToken ===
-        bToken
-      ) {
-        best = 1;
-        break;
-      }
-
-      const sim =
-        tokenSimilarity(
-          aToken,
-          bToken
-        );
-
-      if (
-        sim > best
-      ) {
-        best = sim;
-      }
-    }
-
-    if (
-      best >= 0.90
-    ) {
-      fuzzy += best;
-    }
-    else if (
-      best >= 0.75
-    ) {
-      fuzzy +=
-        best * 0.65;
-    }
-  }
-
-  for (
-    const token
-    of aTokens
-  ) {
-
-    if (
-      bTokens.includes(
-        token
-      )
-    ) {
-      exact++;
-    }
-  }
-
-  const minTokens =
-    Math.min(
-      aTokens.length,
-      bTokens.length
-    );
-
-  const precision =
-    fuzzy /
-    Math.max(
-      1,
-      aTokens.length
-    );
-
-  const recall =
-    fuzzy /
-    Math.max(
-      1,
-      bTokens.length
-    );
-
-  const overlap =
-    exact /
-    Math.max(
-      1,
-      minTokens
-    );
-
-  let score =
-    precision * 0.40 +
-    recall * 0.25 +
-    overlap * 0.35;
-
-  if (
-    aTokens.length === 1 &&
-    bTokens.length === 1
-  ) {
-
-    const sim =
-      tokenSimilarity(
-        aTokens[0],
-        bTokens[0]
-      );
-
-    if (
-      sim >= 0.90
-    ) {
-      score =
-        Math.max(
-          score,
-          sim
-        );
-    }
-  }
-
-  if (
-    minTokens === 1 &&
-    bTokens.length >= 3 &&
-    overlap === 0
-  ) {
-    score *= 0.50;
-  }
-
-  if (
-    minTokens === 1 &&
-    WEAK_TEAM_TOKENS.has(
-      aTokens[0]
-    )
-  ) {
-    score *= 0.35;
-  }
-
-  const exactMeaningful =
-    aTokens.filter(
-      token =>
-        bTokens.includes(
-          token
-        ) &&
-        !WEAK_TEAM_TOKENS.has(
-          token
-        )
-    ).length;
-
-  if (
-    exactMeaningful === 0 &&
-    overlap > 0
-  ) {
-
-    score =
-      Math.min(
-        score,
-        0.58
-      );
-  }
-
-  if (
-    distinctiveBridge !== null
-  ) {
-    score =
-      Math.max(
-        score,
-        distinctiveBridge
-      );
-  }
-
-  return Math.min(
-    1,
-    score
-  );
+  return raw;
 }
 
+// ============================================================
+// SERVICE FETCH
+// ============================================================
+
+interface ServiceResponse {
+  ok: boolean;
+  status: number;
+  latency_ms: number;
+  data: any;
+  error?: string;
+}
+
+async function fetchServiceJSON(
+  service: Fetcher,
+  path: string,
+  timeoutMs =
+    SERVICE_TIMEOUT_MS
+): Promise<ServiceResponse> {
+  const started =
+    Date.now();
+
+  const controller =
+    new AbortController();
+
+  const timeout =
+    setTimeout(
+      () =>
+        controller.abort(),
+      timeoutMs
+    );
+
+  try {
+    const response =
+      await service.fetch(
+        new Request(
+          `https://internal${path}`,
+          {
+            method:
+              "GET",
+            signal:
+              controller.signal
+          }
+        )
+      );
+
+    const latency =
+      Date.now() -
+      started;
+
+    const text =
+      await response.text();
+
+    let data: any =
+      null;
+
+    try {
+      data =
+        text
+          ? JSON.parse(text)
+          : null;
+    } catch {
+      return {
+        ok:
+          false,
+        status:
+          response.status,
+        latency_ms:
+          latency,
+        data:
+          null,
+        error:
+          "INVALID_JSON_RESPONSE"
+      };
+    }
+
+    if (!response.ok) {
+      return {
+        ok:
+          false,
+        status:
+          response.status,
+        latency_ms:
+          latency,
+        data,
+        error:
+          data?.error ||
+          data?.message ||
+          `HTTP_${response.status}`
+      };
+    }
+
+    return {
+      ok:
+        true,
+      status:
+        response.status,
+      latency_ms:
+        latency,
+      data
+    };
+  } catch (
+    error
+  ) {
+    return {
+      ok:
+        false,
+      status:
+        0,
+      latency_ms:
+        Date.now() -
+        started,
+      data:
+        null,
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error)
+    };
+  } finally {
+    clearTimeout(
+      timeout
+    );
+  }
+}
 
 // ============================================================
-// HOME / AWAY
+// TRACKER NORMALIZATION
 // ============================================================
 
-function splitMatchName(
+function trackerEntries(
+  data: any
+): any[] {
+  if (!data) {
+    return [];
+  }
+
+  if (
+    Array.isArray(
+      data.entries
+    )
+  ) {
+    return data.entries;
+  }
+
+  if (
+    Array.isArray(
+      data.results
+    )
+  ) {
+    return data.results;
+  }
+
+  if (
+    Array.isArray(
+      data.signals
+    )
+  ) {
+    return data.signals;
+  }
+
+  if (
+    Array.isArray(
+      data.data?.entries
+    )
+  ) {
+    return data.data.entries;
+  }
+
+  if (
+    Array.isArray(
+      data.data?.signals
+    )
+  ) {
+    return data.data.signals;
+  }
+
+  return [];
+}
+
+function splitMatch(
   value: any
 ): {
-  home: string | null;
-  away: string | null;
+  home: string;
+  away: string;
 } {
-
   const text =
-    String(
-      value ?? ""
-    ).trim();
+    safe(value);
 
   if (!text) {
     return {
-      home: null,
-      away: null
+      home:
+        "",
+      away:
+        ""
     };
   }
 
   const separators = [
     " - ",
-    " v ",
     " vs ",
-    " VS ",
-    " @ "
+    " v ",
+    " @ ",
+    " — ",
+    " – ",
+    " : "
   ];
 
   for (
     const separator
     of separators
   ) {
-
     const index =
-      text.indexOf(
-        separator
-      );
+      text
+        .toLowerCase()
+        .indexOf(
+          separator
+            .toLowerCase()
+        );
 
     if (
       index >= 0
     ) {
-
       return {
         home:
           text
@@ -1041,7 +446,6 @@ function splitMatchName(
               index
             )
             .trim(),
-
         away:
           text
             .slice(
@@ -1054,1370 +458,421 @@ function splitMatchName(
   }
 
   return {
-    home: null,
-    away: null
+    home:
+      "",
+    away:
+      ""
   };
 }
 
-
-function extractHome(
-  match: AnyObj
-): string | null {
-
-  if (
-    typeof match?.home ===
-    "string"
-  ) {
-    return match.home;
-  }
-
-  if (
-    typeof match?.homeTeam ===
-    "string"
-  ) {
-    return match.homeTeam;
-  }
-
-  if (
-    typeof match?.home_name ===
-    "string"
-  ) {
-    return match.home_name;
-  }
-
-  if (
-    typeof match?.home?.name ===
-    "string"
-  ) {
-    return match.home.name;
-  }
-
-  return splitMatchName(
-    match?.match ??
-    match?.name ??
+function signalMatch(
+  signal: any
+): string {
+  return safe(
+    signal?.match_name ||
+    signal?.match ||
+    signal?.name ||
+    signal?.event_name ||
     ""
+  );
+}
+
+function signalHome(
+  signal: any
+): string {
+  const direct =
+    safe(
+      signal?.home ||
+      signal?.home_team ||
+      signal?.home_name ||
+      ""
+    );
+
+  if (direct) {
+    return direct;
+  }
+
+  return splitMatch(
+    signalMatch(
+      signal
+    )
   ).home;
 }
 
+function signalAway(
+  signal: any
+): string {
+  const direct =
+    safe(
+      signal?.away ||
+      signal?.away_team ||
+      signal?.away_name ||
+      ""
+    );
 
-function extractAway(
-  match: AnyObj
-): string | null {
-
-  if (
-    typeof match?.away ===
-    "string"
-  ) {
-    return match.away;
+  if (direct) {
+    return direct;
   }
 
-  if (
-    typeof match?.awayTeam ===
-    "string"
-  ) {
-    return match.awayTeam;
-  }
-
-  if (
-    typeof match?.away_name ===
-    "string"
-  ) {
-    return match.away_name;
-  }
-
-  if (
-    typeof match?.away?.name ===
-    "string"
-  ) {
-    return match.away.name;
-  }
-
-  return splitMatchName(
-    match?.match ??
-    match?.name ??
-    ""
+  return splitMatch(
+    signalMatch(
+      signal
+    )
   ).away;
 }
 
-
-// ============================================================
-// COMPETITION / COUNTRY
-// ============================================================
-
-function competitionText(
-  match: AnyObj
-): string {
-
-  const competition =
-    match?.competition;
-
-  if (
-    typeof competition ===
-    "string"
-  ) {
-    return normalizeText(
-      competition
-    );
-  }
-
-  if (
-    typeof competition?.name ===
-    "string"
-  ) {
-    return normalizeText(
-      competition.name
-    );
-  }
-
-  if (
-    typeof competition?.key ===
-    "string"
-  ) {
-    return normalizeText(
-      competition.key
-    );
-  }
-
-  const league =
-    match?.league;
-
-  if (
-    typeof league ===
-    "string"
-  ) {
-    return normalizeText(
-      league
-    );
-  }
-
-  if (
-    typeof league?.name ===
-    "string"
-  ) {
-    return normalizeText(
-      league.name
-    );
-  }
-
-  return "";
-}
-
-
-function countryText(
-  match: AnyObj
-): string {
-
-  const fields = [
-    match?.country,
-    match?.country_name,
-    match?.competition?.country,
-    match?.league?.country
-  ];
-
-  for (
-    const value
-    of fields
-  ) {
-
-    if (
-      typeof value ===
-        "string" &&
-      value.trim()
-    ) {
-
-      return normalizeText(
-        value
-      );
-    }
-  }
-
-  return "";
-}
-
-
-function competitionSimilarity(
-  a: AnyObj,
-  b: AnyObj
-): number {
-
-  const A =
-    competitionText(
-      a
-    );
-
-  const B =
-    competitionText(
-      b
-    );
-
-  if (
-    !A ||
-    !B
-  ) {
-    return 0;
-  }
-
-  if (
-    A === B
-  ) {
-    return 1;
-  }
-
-  const aWords =
-    new Set(
-      A.split(" ")
-        .filter(Boolean)
-    );
-
-  const bWords =
-    new Set(
-      B.split(" ")
-        .filter(Boolean)
-    );
-
-  let overlap = 0;
-
-  for (
-    const word
-    of aWords
-  ) {
-    if (
-      bWords.has(
-        word
-      )
-    ) {
-      overlap++;
-    }
-  }
-
-  return (
-    overlap /
-    Math.max(
-      1,
-      Math.min(
-        aWords.size,
-        bWords.size
-      )
-    )
-  );
-}
-
-
-function countrySimilarity(
-  a: AnyObj,
-  b: AnyObj
-): number {
-
-  const A =
-    countryText(
-      a
-    );
-
-  const B =
-    countryText(
-      b
-    );
-
-  if (
-    !A ||
-    !B
-  ) {
-    return 0;
-  }
-
-  return A === B
-    ? 1
-    : 0;
-}
-
-
-// ============================================================
-// SCORE
-// ============================================================
-
-function detailedMatchScore(
-  v27: AnyObj,
-  cb: AnyObj
-): AnyObj {
-
-  const vHome =
-    extractHome(
-      v27
-    );
-
-  const vAway =
-    extractAway(
-      v27
-    );
-
-  const cHome =
-    extractHome(
-      cb
-    );
-
-  const cAway =
-    extractAway(
-      cb
-    );
-
-  if (
-    !vHome ||
-    !vAway ||
-    !cHome ||
-    !cAway
-  ) {
-
+function hunterFilterDiagnostic(
+  signal: any
+): any {
+  if (!signal) {
     return {
-      total: 0,
-      baseScore: 0,
-      homeScore: 0,
-      awayScore: 0,
-      reverseHomeScore: 0,
-      reverseAwayScore: 0,
-      direction: "NONE",
-      competitionScore: 0,
-      countryScore: 0
-    };
-  }
-
-  const homeScore =
-    teamScore(
-      vHome,
-      cHome
-    );
-
-  const awayScore =
-    teamScore(
-      vAway,
-      cAway
-    );
-
-  const reverseHomeScore =
-    teamScore(
-      vHome,
-      cAway
-    );
-
-  const reverseAwayScore =
-    teamScore(
-      vAway,
-      cHome
-    );
-
-  const normal =
-    (
-      homeScore +
-      awayScore
-    ) / 2;
-
-  const reversed =
-    (
-      reverseHomeScore +
-      reverseAwayScore
-    ) / 2;
-
-  let direction =
-    "NORMAL";
-
-  let baseScore =
-    normal;
-
-  if (
-    reversed > normal &&
-    reverseHomeScore >=
-      REVERSED_CONFIDENT_SCORE &&
-    reverseAwayScore >=
-      REVERSED_CONFIDENT_SCORE
-  ) {
-
-    direction =
-      "REVERSED";
-
-    baseScore =
-      reversed;
-  }
-
-  const competitionScore =
-    competitionSimilarity(
-      v27,
-      cb
-    );
-
-  const countryScore =
-    countrySimilarity(
-      v27,
-      cb
-    );
-
-  let total =
-    baseScore;
-
-  if (
-    competitionScore >=
-      0.80
-  ) {
-    total +=
-      COMPETITION_BONUS;
-  }
-
-  if (
-    countryScore === 1
-  ) {
-    total +=
-      COUNTRY_BONUS;
-  }
-
-  return {
-    total:
-      Math.min(
-        1,
-        total
-      ),
-
-    baseScore,
-    homeScore,
-    awayScore,
-    reverseHomeScore,
-    reverseAwayScore,
-    direction,
-    competitionScore,
-    countryScore
-  };
-}
-
-
-// ============================================================
-// CLASSIFY
-// ============================================================
-
-function classifyMatch(
-  detail: AnyObj,
-  threshold: number
-): AnyObj {
-
-  const home =
-    detail.homeScore;
-
-  const away =
-    detail.awayScore;
-
-  const total =
-    detail.total;
-
-  if (
-    detail.direction ===
-      "REVERSED"
-  ) {
-
-    if (
-      detail.reverseHomeScore >=
-        REVERSED_CONFIDENT_SCORE &&
-      detail.reverseAwayScore >=
-        REVERSED_CONFIDENT_SCORE
-    ) {
-
-      return {
-        classification:
-          "CONFIDENT_MATCH",
-
-        reason:
-          "STRONG_REVERSED_TWO_SIDED_MATCH"
-      };
-    }
-
-    return {
-      classification:
-        "REVERSED_CANDIDATE",
-
+      accepted:
+        false,
       reason:
-        "HOME_AWAY_DIRECTION_REVERSED"
+        "SIGNAL_NULL"
     };
   }
-
-  if (
-    home >=
-      STRONG_TEAM_SCORE &&
-    away >=
-      STRONG_TEAM_SCORE &&
-    total >=
-      Math.max(
-        threshold,
-        CONFIDENT_TOTAL_SCORE
-      )
-  ) {
-
-    return {
-      classification:
-        "CONFIDENT_MATCH",
-
-      reason:
-        "STRONG_TWO_SIDED_MATCH"
-    };
-  }
-
-  if (
-    home >=
-      POSSIBLE_TEAM_SCORE &&
-    away >=
-      POSSIBLE_TEAM_SCORE &&
-    total >=
-      POSSIBLE_TOTAL_SCORE
-  ) {
-
-    return {
-      classification:
-        "POSSIBLE_MATCH",
-
-      reason:
-        "BOTH_TEAMS_HAVE_REASONABLE_SIMILARITY"
-    };
-  }
-
-  if (
-    (
-      home >= 0.80 &&
-      away <
-        WEAK_SIDE_LIMIT
-    ) ||
-    (
-      away >= 0.80 &&
-      home <
-        WEAK_SIDE_LIMIT
-    )
-  ) {
-
-    return {
-      classification:
-        "FALSE_POSITIVE_RISK",
-
-      reason:
-        "ONLY_ONE_TEAM_MATCHES"
-    };
-  }
-
-  if (
-    total >=
-      Math.max(
-        0,
-        threshold - 0.10
-      )
-  ) {
-
-    return {
-      classification:
-        "CLOSE_BELOW_THRESHOLD",
-
-      reason:
-        "BOTH_SIDES_NOT_STRONG_ENOUGH"
-    };
-  }
-
-  return {
-    classification:
-      "TRUE_UNMATCHED",
-
-    reason:
-      "WEAK_TWO_SIDED_SIMILARITY"
-  };
-}
-
-
-// ============================================================
-// PREPARED
-// ============================================================
-
-interface PreparedMatch {
-  raw: AnyObj;
-  id: string;
-  home: string;
-  away: string;
-  normalizedHome: string;
-  normalizedAway: string;
-  homeTokens: string[];
-  awayTokens: string[];
-}
-
-
-function prepareMatch(
-  match: AnyObj
-): PreparedMatch {
-
-  const home =
-    extractHome(
-      match
-    ) ?? "";
-
-  const away =
-    extractAway(
-      match
-    ) ?? "";
-
-  return {
-    raw:
-      match,
-
-    id:
-      String(
-        match?.id ??
-        match?.event_id ??
-        match?.key ??
-        ""
-      ),
-
-    home,
-    away,
-
-    normalizedHome:
-      normalizeTeam(
-        home
-      ),
-
-    normalizedAway:
-      normalizeTeam(
-        away
-      ),
-
-    homeTokens:
-      teamTokens(
-        home
-      ),
-
-    awayTokens:
-      teamTokens(
-        away
-      )
-  };
-}
-
-
-// ============================================================
-// CLOUDBET LIVE DETECTION
-// ============================================================
-
-function isCloudbetLive(
-  match: AnyObj
-): boolean {
 
   const status =
     String(
-      match?.status ??
+      signal.status ||
+      signal.state ||
       ""
-    )
-      .trim()
-      .toUpperCase();
-
-  if (
-    status ===
-      "TRADING_LIVE" ||
-    status ===
-      "LIVE" ||
-    status.includes(
-      "LIVE"
-    )
-  ) {
-    return true;
-  }
-
-  if (
-    match?.live === true
-  ) {
-    return true;
-  }
-
-  return false;
-}
-
-
-// ============================================================
-// NUMBER
-// ============================================================
-
-function numericOrNull(
-  value: any
-): number | null {
-
-  if (
-    typeof value ===
-      "number" &&
-    Number.isFinite(
-      value
-    )
-  ) {
-    return value;
-  }
-
-  if (
-    typeof value ===
-      "string" &&
-    value.trim() !==
-      ""
-  ) {
-
-    const number =
-      Number(
-        value
-      );
-
-    if (
-      Number.isFinite(
-        number
-      )
-    ) {
-      return number;
-    }
-  }
-
-  return null;
-}
-
-
-// ============================================================
-// HUNTER LIVE STATE FILTER
-// LIVE + 1H + 0:0 + CLOSE MINUTE
-// ============================================================
-
-function parseMatchMinute(
-  value: any
-): number | null {
-
-  if (
-    typeof value ===
-      "number" &&
-    Number.isFinite(
-      value
-    )
-  ) {
-    return Math.floor(
-      value
-    );
-  }
-
-  const text =
-    String(
-      value ?? ""
-    ).trim();
-
-  if (!text) {
-    return null;
-  }
-
-  const match =
-    text.match(
-      /^(\d{1,3})/
-    );
-
-  if (!match) {
-    return null;
-  }
+    ).toUpperCase();
 
   const minute =
     Number(
-      match[1]
+      signal.entry_minute ??
+      signal.minute ??
+      signal.elapsed ??
+      0
     );
 
-  return Number.isFinite(
-    minute
-  )
-    ? minute
-    : null;
-}
+  const statusValid =
+    !status ||
+    [
+      "ENTRY",
+      "SIGNAL",
+      "TRACKING",
+      "ACTIVE",
+      "HUNTER"
+    ].includes(status);
 
+  const teamsValid =
+    Boolean(
+      signalHome(
+        signal
+      ) &&
+      signalAway(
+        signal
+      )
+    );
 
-function cloudbetMinute(
-  event: AnyObj
-): number | null {
+  const minuteValid =
+    !(
+      Number.isFinite(
+        minute
+      ) &&
+      minute > 45
+    );
 
-  return parseMatchMinute(
-    event?.metadata
-      ?.eventTimeExtended ??
-    event?.metadata
-      ?.eventTime ??
-    event?.minute_extended ??
-    event?.minute ??
-    null
-  );
-}
+  let reason =
+    "ACCEPTED";
 
-
-function hunterReferenceMinute(
-  signal: AnyObj
-): number | null {
-
-  return parseMatchMinute(
-    signal?.current_minute ??
-    signal?.minute ??
-    signal?.entry_minute ??
-    null
-  );
-}
-
-
-function isCloudbetFirstHalf(
-  event: AnyObj
-): boolean {
-
-  const status =
-    String(
-      event?.metadata
-        ?.eventStatus ??
-      event?.event_status ??
-      ""
-    )
-      .trim()
-      .toLowerCase();
-
-  return (
-    status === "1p" ||
-    status === "1h" ||
-    status === "first_half" ||
-    status === "first half"
-  );
-}
-
-
-// ============================================================
-// CLOUD BET SCORE
-// ============================================================
-
-function cloudbetScore(
-  score: any
-): AnyObj | null {
-
-  if (
-    !Array.isArray(
-      score
-    ) ||
-    score.length < 2
+  if (!statusValid) {
+    reason =
+      "INVALID_STATUS";
+  } else if (
+    !teamsValid
   ) {
-    return null;
+    reason =
+      "TEAMS_MISSING";
+  } else if (
+    !minuteValid
+  ) {
+    reason =
+      "MINUTE_OVER_45";
   }
 
   return {
-    home:
-      numericOrNull(
-        score[0]
+    accepted:
+      statusValid &&
+      teamsValid &&
+      minuteValid,
+    reason,
+    status,
+    match_id:
+      signal?.match_id ??
+      signal?.id ??
+      null,
+    match:
+      signalMatch(
+        signal
       ),
-
+    home:
+      signalHome(
+        signal
+      ),
     away:
-      numericOrNull(
-        score[1]
-      )
+      signalAway(
+        signal
+      ),
+    entry_minute:
+      signal?.entry_minute ??
+      null,
+    hunter_score:
+      signal?.hunter_score ??
+      signal?.score ??
+      null
   };
 }
 
-
-function isCloudbetZeroZero(
-  event: AnyObj
+function isHunterEntry(
+  signal: any
 ): boolean {
+  return hunterFilterDiagnostic(
+    signal
+  ).accepted;
+}
 
-  const score =
-    cloudbetScore(
-      event?.metadata
-        ?.score
+// ============================================================
+// TRACKER CLOUDBET READY DATA
+// ============================================================
+
+interface TrackerCloudbetData {
+  event_id: string | null;
+  match: string | null;
+  entry_odds: number | null;
+  max_stake: number | null;
+  odds_available: boolean;
+  matcher_score: number | null;
+}
+
+function trackerCloudbetData(
+  signal: any
+): TrackerCloudbetData {
+  const cb =
+    signal?.cloudbet ||
+    signal?.cloudbet_data ||
+    {};
+
+  const eventIdRaw =
+    cb?.event_id ??
+    cb?.id ??
+    signal?.cloudbet_event_id ??
+    null;
+
+  const eventId =
+    normalizeEventId(
+      eventIdRaw
     );
 
-  return (
-    score !== null &&
-    score.home === 0 &&
-    score.away === 0
-  );
+  const entryOdds =
+    numberOrNull(
+      cb?.entry_odds ??
+      signal?.entry_odds ??
+      null
+    );
+
+  const maxStake =
+    numberOrNull(
+      cb?.max_stake ??
+      signal?.cloudbet_max_stake ??
+      null
+    );
+
+  const matcherScore =
+    numberOrNull(
+      cb?.matcher_score ??
+      signal?.matcher_score ??
+      null
+    );
+
+  const explicitAvailable =
+    cb?.odds_available ??
+    signal?.odds_available ??
+    null;
+
+  const oddsAvailable =
+    explicitAvailable ===
+      true ||
+    Number(
+      explicitAvailable
+    ) === 1 ||
+    (
+      explicitAvailable ===
+        null &&
+      entryOdds !== null &&
+      entryOdds > 1
+    );
+
+  return {
+    event_id:
+      eventId,
+    match:
+      safe(
+        cb?.match ??
+        signal?.cloudbet_match ??
+        ""
+      ) || null,
+    entry_odds:
+      entryOdds,
+    max_stake:
+      maxStake,
+    odds_available:
+      oddsAvailable,
+    matcher_score:
+      matcherScore
+  };
 }
 
-
-function isHunterEligibleCloudbetEvent(
-  event: AnyObj
-): boolean {
-
-  if (
-    !isCloudbetLive(
-      event
-    )
-  ) {
-    return false;
-  }
-
-  if (
-    !isCloudbetFirstHalf(
-      event
-    )
-  ) {
-    return false;
-  }
-
-  if (
-    !isCloudbetZeroZero(
-      event
-    )
-  ) {
-    return false;
-  }
-
-  if (
-    cloudbetMinute(
-      event
-    ) === null
-  ) {
-    return false;
-  }
-
-  return true;
-}
-
-
-function minuteDifference(
-  signal: AnyObj,
-  event: AnyObj
-): number | null {
-
-  const hunterMinute =
-    hunterReferenceMinute(
+function trackerCandidateDiagnostic(
+  signal: any
+): any {
+  const hunter =
+    hunterFilterDiagnostic(
       signal
     );
 
-  const cbMinute =
-    cloudbetMinute(
-      event
-    );
-
   if (
-    hunterMinute === null ||
-    cbMinute === null
+    !hunter.accepted
   ) {
-    return null;
-  }
-
-  return Math.abs(
-    hunterMinute -
-    cbMinute
-  );
-}
-
-
-function minuteCompatible(
-  signal: AnyObj,
-  event: AnyObj
-): boolean {
-
-  const difference =
-    minuteDifference(
-      signal,
-      event
-    );
-
-  if (
-    difference === null
-  ) {
-    return false;
-  }
-
-  return (
-    difference <=
-    MATCH_MINUTE_TOLERANCE
-  );
-}
-
-
-// ============================================================
-// CLOUDBET HTTP GET
-// ============================================================
-
-async function fetchCloudbetJson(
-  url: string
-): Promise<any> {
-
-  const controller =
-    new AbortController();
-
-  const timeout =
-    setTimeout(
-      () =>
-        controller.abort(),
-      CLOUDBET_TIMEOUT_MS
-    );
-
-  try {
-
-    const response =
-      await fetch(
-        url,
-        {
-          method:
-            "GET",
-
-          signal:
-            controller.signal,
-
-          headers: {
-            accept:
-              "application/json"
-          }
-        }
-      );
-
-    if (!response.ok) {
-
-      return {
-        ok: false,
-
-        status:
-          response.status,
-
-        error:
-          `HTTP_${response.status}`,
-
-        data:
-          null
-      };
-    }
-
-    const data =
-      await response.json();
-
     return {
-      ok: true,
-
-      status:
-        response.status,
-
-      error:
-        null,
-
-      data
-    };
-
-  } catch (
-    error: any
-  ) {
-
-    return {
-      ok: false,
-
-      status:
-        0,
-
-      error:
-        error?.name ===
-          "AbortError"
-          ? "TIMEOUT"
-          : error?.message ||
-            String(error),
-
-      data:
+      ready:
+        false,
+      reason:
+        hunter.reason,
+      hunter,
+      cloudbet:
         null
     };
-
-  } finally {
-
-    clearTimeout(
-      timeout
-    );
   }
-}
 
-
-// ============================================================
-// DIRECT CLOUDBET LIVE EVENTS
-// sports[].competitions[].events[]
-// ============================================================
-
-async function getDirectCloudbetLive(
-  includeOddsMarket = false
-): Promise<AnyObj[]> {
-
-  const url =
-    new URL(
-      SPORTS_BASE +
-      "/events",
-      CLOUDBET_BASE
+  const cloudbet =
+    trackerCloudbetData(
+      signal
     );
 
-  url.searchParams.set(
-    "sports",
-    "soccer"
-  );
-
-  // V7.4.1:
-  // Event discovery MUST NOT depend on odds/market availability.
-  // Only the separate odds lookup uses markets=ODDS_MARKET.
   if (
-    includeOddsMarket
+    !cloudbet.event_id
   ) {
-    url.searchParams.set(
-      "markets",
-      ODDS_MARKET
-    );
+    return {
+      ready:
+        false,
+      reason:
+        "TRACKER_CLOUDBET_EVENT_ID_MISSING",
+      hunter,
+      cloudbet
+    };
   }
 
-  url.searchParams.set(
-    "live",
-    "true"
-  );
-
-  url.searchParams.set(
-    "limit",
-    String(
-      LIVE_LIMIT
-    )
-  );
-
-  url.searchParams.set(
-    "locale",
-    "en"
-  );
-
-  const result =
-    await fetchCloudbetJson(
-      url.toString()
-    );
-
-  if (!result.ok) {
-
-    throw new Error(
-      result.error ||
-      `CLOUDBET_HTTP_${result.status}`
-    );
-  }
-
-  const events:
-    AnyObj[] = [];
-
-  const sports =
-    Array.isArray(
-      result.data?.sports
-    )
-      ? result.data.sports
-      : [];
-
-  for (
-    const sport
-    of sports
-  ) {
-
-    const competitions =
-      Array.isArray(
-        sport?.competitions
-      )
-        ? sport.competitions
-        : [];
-
-    for (
-      const competition
-      of competitions
-    ) {
-
-      const competitionEvents =
-        Array.isArray(
-          competition?.events
-        )
-          ? competition.events
-          : [];
-
-      for (
-        const event
-        of competitionEvents
-      ) {
-
-        events.push({
-          ...event,
-
-          sport:
-            event?.sport ??
-            {
-              name:
-                sport?.name ??
-                null,
-
-              key:
-                sport?.key ??
-                null
-            },
-
-          competition:
-            event?.competition ??
-            {
-              name:
-                competition?.name ??
-                null,
-
-              key:
-                competition?.key ??
-                null
-            }
-        });
-      }
-    }
-  }
-
-  return events;
-}
-
-
-// ============================================================
-// EXACT:
-// markets[ODDS_MARKET]
-// -> submarkets["period=1h"]
-// -> selections[]
-// -> over + total=0.5
-// ============================================================
-
-function extractOver05(
-  event: AnyObj
-): AnyObj | null {
-
-  const market =
-    event?.markets?.[
-      ODDS_MARKET
-    ];
-
-  if (!market) {
-    return null;
-  }
-
-  const submarket =
-    market?.submarkets?.[
-      ODDS_SUBMARKET
-    ];
-
-  if (!submarket) {
-    return null;
-  }
-
-  const selections =
-    Array.isArray(
-      submarket?.selections
-    )
-      ? submarket.selections
-      : [];
-
-  const selection =
-    selections.find(
-      (
-        item: AnyObj
-      ) =>
-        String(
-          item?.outcome ??
-          ""
-        )
-          .toLowerCase()
-          .trim() ===
-          ODDS_OUTCOME &&
-        String(
-          item?.params ??
-          ""
-        )
-          .toLowerCase()
-          .replace(
-            /\s+/g,
-            ""
-          )
-          .trim() ===
-          ODDS_PARAMS
-    );
-
-  if (!selection) {
-    return null;
-  }
-
-  const price =
-    numericOrNull(
-      selection?.price
-    );
-
-  const status =
-    selection?.status ??
-    null;
+  const hasEntryOdds =
+    cloudbet
+      .odds_available &&
+    cloudbet
+      .entry_odds !==
+      null &&
+    cloudbet
+      .entry_odds >
+      1;
 
   return {
-    market:
-      ODDS_MARKET,
-
-    submarket:
-      ODDS_SUBMARKET,
-
-    outcome:
-      selection?.outcome ??
-      null,
-
-    params:
-      selection?.params ??
-      null,
-
-    price,
-
-    raw_price:
-      numericOrNull(
-        selection?.rawPrice ??
-        selection?.raw_price ??
-        selection?.price
-      ),
-
-    status,
-
-    min_stake:
-      numericOrNull(
-        selection?.minStake
-      ),
-
-    max_stake:
-      numericOrNull(
-        selection?.maxStake
-      ),
-
-    probability:
-      numericOrNull(
-        selection?.probability
-      ),
-
-    market_url:
-      selection?.marketUrl ??
-      null,
-
-    available:
-      status ===
-        "SELECTION_ENABLED" &&
-      price !== null &&
-      price > 1
+    ready:
+      true,
+    reason:
+      hasEntryOdds
+        ? "TRACKER_READY_WITH_ENTRY_ODDS"
+        : "TRACKER_READY_WAITING_FOR_ODDS",
+    hunter,
+    cloudbet
   };
 }
 
-
 // ============================================================
-// EVENT NAME
+// CLOUDBET EVENT FETCH
 // ============================================================
 
-function matchDisplayName(
-  match: AnyObj
-): string {
+async function fetchCloudbetEvent(
+  env: Env,
+  eventId: string
+): Promise<Obj> {
+  if (!eventId) {
+    throw new Error(
+      "CLOUDBET_EVENT_ID_MISSING"
+    );
+  }
 
-  const home =
-    extractHome(
-      match
+  const canonicalEventId =
+    normalizeEventId(
+      eventId
     );
 
-  const away =
-    extractAway(
-      match
+  if (
+    !canonicalEventId
+  ) {
+    throw new Error(
+      "CLOUDBET_EVENT_ID_MISSING"
+    );
+  }
+
+  const path =
+    `${CLOUDBET_EVENT_PATH}${encodeURIComponent(
+      canonicalEventId
+    )}`;
+
+  const result =
+    await fetchServiceJSON(
+      env.CLOUDBET,
+      path,
+      SERVICE_TIMEOUT_MS
     );
 
-  return (
-    match?.match ??
-    match?.name ??
-    `${home ?? ""} - ${away ?? ""}`
-  );
+  if (!result.ok) {
+    throw new Error(
+      result.error ||
+      "CLOUDBET_EVENT_FAILED"
+    );
+  }
+
+  let data =
+    result.data;
+
+  if (
+    data &&
+    typeof data ===
+      "object" &&
+    data.data &&
+    typeof data.data ===
+      "object"
+  ) {
+    data =
+      data.data;
+  }
+
+  if (
+    data &&
+    typeof data ===
+      "object" &&
+    data.event &&
+    typeof data.event ===
+      "object"
+  ) {
+    data =
+      data.event;
+  }
+
+  return data || {};
 }
 
-
-// ============================================================
-// CLOUDBET EVENT ID
-// ============================================================
-
-function cloudbetEventId(
-  event: AnyObj
+function getCloudbetEventId(
+  event: any
 ): string | null {
-
   const value =
     event?.event_id ??
+    event?.eventId ??
     event?.id ??
+    event?.cloudbet_id ??
+    event?.cloudbetId ??
     null;
 
   if (
@@ -2427,2182 +882,3038 @@ function cloudbetEventId(
     return null;
   }
 
-  const id =
-    String(
-      value
-    ).trim();
-
-  return id || null;
+  return normalizeEventId(
+    value
+  );
 }
 
-
-function buildOddsEventMap(
-  events: AnyObj[]
-): Map<string, AnyObj> {
-
-  const map =
-    new Map<
-      string,
-      AnyObj
-    >();
-
-  for (
-    const event
-    of events
-  ) {
-
-    const id =
-      cloudbetEventId(
-        event
-      );
-
-    if (!id) {
-      continue;
-    }
-
-    map.set(
-      id,
-      event
-    );
-  }
-
-  return map;
+function cloudbetHome(
+  event: any
+): string {
+  return safe(
+    event?.home ||
+    event?.home_team ||
+    event?.homeTeam ||
+    event?.home_name ||
+    event?.metadata?.homeTeam ||
+    ""
+  );
 }
 
-
-// ============================================================
-// LIVE DISPLAY RECORD
-// ============================================================
-
-function buildCloudbetLiveRecord(
-  event: AnyObj,
-  oddsEvent: AnyObj | null = null
-): AnyObj {
-
-  const odds =
-    extractOver05(
-      oddsEvent ??
-      event
-    );
-
-  return {
-    event_id:
-      String(
-        event?.id ??
-        event?.event_id ??
-        ""
-      ),
-
-    match:
-      matchDisplayName(
-        event
-      ),
-
-    home:
-      extractHome(
-        event
-      ),
-
-    away:
-      extractAway(
-        event
-      ),
-
-    competition:
-      event?.competition ??
-      null,
-
-    status:
-      event?.status ??
-      null,
-
-    event_status:
-      event?.metadata
-        ?.eventStatus ??
-      null,
-
-    minute:
-      event?.metadata
-        ?.eventTime ??
-      null,
-
-    minute_extended:
-      event?.metadata
-        ?.eventTimeExtended ??
-      null,
-
-    parsed_minute:
-      cloudbetMinute(
-        event
-      ),
-
-    score:
-      cloudbetScore(
-        event?.metadata
-          ?.score
-      ),
-
-    odds:
-      odds
-        ? {
-            market:
-              ODDS_MARKET,
-
-            selection:
-              "OVER 0.5",
-
-            period:
-              "1H",
-
-            price:
-              odds.price,
-
-            raw_price:
-              odds.raw_price,
-
-            available:
-              odds.available,
-
-            selection_status:
-              odds.status,
-
-            min_stake:
-              odds.min_stake,
-
-            max_stake:
-              odds.max_stake,
-
-            probability:
-              odds.probability,
-
-            market_url:
-              odds.market_url
-          }
-        : null
-  };
+function cloudbetAway(
+  event: any
+): string {
+  return safe(
+    event?.away ||
+    event?.away_team ||
+    event?.awayTeam ||
+    event?.away_name ||
+    event?.metadata?.awayTeam ||
+    ""
+  );
 }
 
-
-// ============================================================
-// V27 SERVICE FETCH
-// ============================================================
-
-async function fetchServiceJSON(
-  service: Fetcher,
-  path: string
-): Promise<any> {
-
-  const response =
-    await service.fetch(
-      new Request(
-        `https://service${path}`,
-        {
-          method:
-            "GET",
-
-          headers: {
-            "accept":
-              "application/json"
-          }
-        }
-      )
-    );
-
-  const text =
-    await response.text();
-
-  if (
-    !response.ok
-  ) {
-
-    throw new Error(
-      `HTTP ${response.status}: ${text.slice(
-        0,
-        400
-      )}`
-    );
-  }
-
-  try {
-    return JSON.parse(
-      text
-    );
-  }
-  catch {
-    throw new Error(
-      `Invalid JSON from ${path}`
-    );
-  }
-}
-
-
-// ============================================================
-// SIGNAL NORMALIZATION
-// ============================================================
-
-function normalizeHunterSignal(
-  item: AnyObj
-): AnyObj | null {
-
-  const signal =
-    item?.signal &&
-    typeof item.signal ===
-      "object" &&
-    !Array.isArray(
-      item.signal
-    )
-      ? item.signal
-      : item;
-
-  if (
-    !signal ||
-    typeof signal !==
-      "object"
-  ) {
-    return null;
-  }
-
-  const split =
-    splitMatchName(
-      signal?.match ??
-      signal?.match_name ??
-      signal?.name ??
-      ""
-    );
-
+function displayCloudbetMatch(
+  event: any
+): string {
   const home =
-    String(
-      signal?.home ??
-      signal?.homeTeam ??
-      signal?.home_name ??
-      split.home ??
-      ""
-    ).trim();
+    cloudbetHome(
+      event
+    );
 
   const away =
-    String(
-      signal?.away ??
-      signal?.awayTeam ??
-      signal?.away_name ??
-      split.away ??
-      ""
-    ).trim();
+    cloudbetAway(
+      event
+    );
 
   if (
-    !home ||
-    !away
+    home &&
+    away
   ) {
-    return null;
+    return `${home} - ${away}`;
   }
 
-  return {
-    ...signal,
-
-    type:
-      signal?.type ??
-      signal?.signal ??
-      "HUNTER_ENTRY",
-
-    match:
-      signal?.match ??
-      signal?.match_name ??
-      `${home} - ${away}`,
-
-    match_id:
-      signal?.match_id ??
-      signal?.id ??
-      null,
-
-    home,
-    away,
-
-    entry_minute:
-      signal?.entry_minute ??
-      null,
-
-    current_minute:
-      signal?.current_minute ??
-      null,
-
-    period:
-      signal?.period ??
-      null,
-
-    hunter_score:
-      signal?.hunter_score ??
-      null
-  };
+  return safe(
+    event?.name ||
+    event?.match ||
+    event?.event_name ||
+    ""
+  );
 }
 
+// ============================================================
+// SAME EVENT VERIFICATION
+// ============================================================
 
-function parseSignalsParam(
-  request: Request
+function isSameEventId(
+  expectedId: string,
+  event: any
+): boolean {
+  const actualId =
+    getCloudbetEventId(
+      event
+    );
+
+  const expected =
+    normalizeEventId(
+      expectedId
+    );
+
+  return Boolean(
+    actualId &&
+    expected &&
+    actualId ===
+      expected
+  );
+}
+
+function cloudbetScore(
+  event: any
 ): {
-  rawPresent: boolean;
-  signals: AnyObj[];
+  home: number | null;
+  away: number | null;
+  known: boolean;
 } {
-
-  const url =
-    new URL(
-      request.url
-    );
-
-  const value =
-    url.searchParams.get(
-      "signals"
-    );
+  const raw =
+    event?.metadata?.score ??
+    event?.score ??
+    event?.result ??
+    event?.match_score ??
+    null;
 
   if (
-    value === null
+    raw &&
+    typeof raw ===
+      "object"
   ) {
+    const home =
+      numberOrNull(
+        raw.home ??
+        raw.homeScore ??
+        raw.home_score ??
+        raw[0]
+      );
+
+    const away =
+      numberOrNull(
+        raw.away ??
+        raw.awayScore ??
+        raw.away_score ??
+        raw[1]
+      );
+
     return {
-      rawPresent:
-        false,
-      signals:
-        []
+      home,
+      away,
+      known:
+        home !== null &&
+        away !== null
     };
   }
 
-  try {
+  const text =
+    safe(raw);
 
-    const parsed =
-      JSON.parse(
-        value
+  if (text) {
+    const match =
+      text.match(
+        /(\d+)\s*[:\-]\s*(\d+)/
       );
 
-    if (
-      !Array.isArray(
-        parsed
-      )
-    ) {
-
+    if (match) {
       return {
-        rawPresent:
-          true,
-        signals:
-          []
+        home:
+          Number(
+            match[1]
+          ),
+        away:
+          Number(
+            match[2]
+          ),
+        known:
+          true
       };
     }
-
-    return {
-      rawPresent:
-        true,
-
-      signals:
-        parsed
-          .map(
-            normalizeHunterSignal
-          )
-          .filter(
-            Boolean
-          ) as AnyObj[]
-    };
   }
-  catch {
-
-    return {
-      rawPresent:
-        true,
-      signals:
-        []
-    };
-  }
-}
-
-
-// ============================================================
-// FAST CANDIDATE INDEX
-// ============================================================
-
-function buildTokenIndex(
-  cloudbet: PreparedMatch[]
-): Map<string, number[]> {
-
-  const index =
-    new Map<
-      string,
-      number[]
-    >();
-
-  for (
-    let i = 0;
-    i <
-      cloudbet.length;
-    i++
-  ) {
-
-    const tokens =
-      new Set([
-        ...cloudbet[i]
-          .homeTokens,
-        ...cloudbet[i]
-          .awayTokens
-      ]);
-
-    for (
-      const token
-      of tokens
-    ) {
-
-      if (
-        !token ||
-        token.length < 3
-      ) {
-        continue;
-      }
-
-      const list =
-        index.get(
-          token
-        );
-
-      if (list) {
-        list.push(i);
-      }
-      else {
-        index.set(
-          token,
-          [i]
-        );
-      }
-    }
-  }
-
-  return index;
-}
-
-
-function candidateIndexesForSignal(
-  signal: PreparedMatch,
-  tokenIndex:
-    Map<string, number[]>,
-  cloudbetCount: number
-): number[] {
-
-  const set =
-    new Set<number>();
-
-  const tokens =
-    new Set([
-      ...signal.homeTokens,
-      ...signal.awayTokens
-    ]);
-
-  for (
-    const token
-    of tokens
-  ) {
-
-    if (
-      !token ||
-      token.length < 3
-    ) {
-      continue;
-    }
-
-    const rows =
-      tokenIndex.get(
-        token
-      );
-
-    if (!rows) {
-      continue;
-    }
-
-    for (
-      const index
-      of rows
-    ) {
-      set.add(index);
-    }
-  }
-
-  // Important:
-  // If name tokens fail because names are very different,
-  // evaluate the already-small LIVE+1H+0:0 list.
-  if (
-    set.size === 0
-  ) {
-
-    for (
-      let i = 0;
-      i <
-        cloudbetCount;
-      i++
-    ) {
-      set.add(i);
-    }
-  }
-
-  return [
-    ...set
-  ];
-}
-
-
-// ============================================================
-// HUNTER MATCH
-// ============================================================
-
-function scoringRecord(
-  detail: AnyObj
-): AnyObj {
 
   return {
-    total:
-      Number(
-        detail.total
-          .toFixed(3)
-      ),
-
-    base_score:
-      Number(
-        detail.baseScore
-          .toFixed(3)
-      ),
-
-    home_score:
-      Number(
-        detail.homeScore
-          .toFixed(3)
-      ),
-
-    away_score:
-      Number(
-        detail.awayScore
-          .toFixed(3)
-      ),
-
-    reverse_home_score:
-      Number(
-        detail.reverseHomeScore
-          .toFixed(3)
-      ),
-
-    reverse_away_score:
-      Number(
-        detail.reverseAwayScore
-          .toFixed(3)
-      ),
-
-    direction:
-      detail.direction,
-
-    competition_score:
-      Number(
-        detail.competitionScore
-          .toFixed(3)
-      ),
-
-    country_score:
-      Number(
-        detail.countryScore
-          .toFixed(3)
-      )
+    home:
+      null,
+    away:
+      null,
+    known:
+      false
   };
 }
 
+function cloudbetPeriod(
+  event: any
+): string {
+  return safe(
+    event?.metadata?.eventStatus ??
+    event?.eventStatus ??
+    event?.period ??
+    event?.phase ??
+    event?.period_type ??
+    ""
+  ).toLowerCase();
+}
 
-function findHunterTargetMatch(
-  signal: AnyObj,
-  cloudbet:
-    PreparedMatch[],
-  tokenIndex:
-    Map<string, number[]>,
-  threshold: number
-): AnyObj {
-
-  const target =
-    prepareMatch({
-      id:
-        signal?.match_id ??
-        "",
-
-      home:
-        signal?.home ??
-        "",
-
-      away:
-        signal?.away ??
-        "",
-
-      match:
-        signal?.match ??
-        `${signal?.home ?? ""} - ${signal?.away ?? ""}`,
-
-      competition:
-        signal?.competition ??
-        signal?.league ??
-        null,
-
-      country:
-        signal?.country ??
-        null
-    });
-
-  if (
-    !target.home ||
-    !target.away
-  ) {
-
-    return {
-      found:
-        false,
-
-      best:
-        null,
-
-      detail:
-        null,
-
-      classification:
-        "TRUE_UNMATCHED",
-
-      reason:
-        "HUNTER_SIGNAL_MISSING_HOME_OR_AWAY",
-
-      candidateEvaluations:
-        0,
-
-      candidates:
-        0,
-
-      minuteCandidates:
-        0,
-
-      targetMinute:
-        hunterReferenceMinute(
-          signal
-        ),
-
-      bestMinute:
-        null,
-
-      bestMinuteDifference:
-        null
-    };
-  }
-
-  const targetMinute =
-    hunterReferenceMinute(
-      signal
-    );
-
-  if (
-    targetMinute === null
-  ) {
-
-    return {
-      found:
-        false,
-
-      best:
-        null,
-
-      detail:
-        null,
-
-      classification:
-        "TRUE_UNMATCHED",
-
-      reason:
-        "HUNTER_SIGNAL_MINUTE_MISSING",
-
-      candidateEvaluations:
-        0,
-
-      candidates:
-        0,
-
-      minuteCandidates:
-        0,
-
-      targetMinute:
-        null,
-
-      bestMinute:
-        null,
-
-      bestMinuteDifference:
-        null
-    };
-  }
-
-  const candidates =
-    candidateIndexesForSignal(
-      target,
-      tokenIndex,
-      cloudbet.length
-    );
-
-  let best:
-    PreparedMatch | null =
-    null;
-
-  let bestDetail:
-    AnyObj | null =
-    null;
-
-  let bestScore =
-    -1;
-
-  let candidateEvaluations =
-    0;
-
-  let minuteCandidates =
-    0;
-
-  let bestMinute:
-    number | null =
-    null;
-
-  let bestMinuteDifference:
-    number | null =
-    null;
+function cloudbetMinute(
+  event: any
+): number | null {
+  const candidates = [
+    event?.minute,
+    event?.clock,
+    event?.elapsed,
+    event?.match_minute,
+    event?.metadata?.minute,
+    event?.metadata?.elapsed
+  ];
 
   for (
-    const index
+    const value
     of candidates
   ) {
-
-    const cb =
-      cloudbet[index];
-
-    if (!cb) {
-      continue;
-    }
-
-    // HARD FILTER:
-    // candidate must be within +/-5 minutes
-    // of the Hunter current/entry minute.
     if (
-      !minuteCompatible(
-        signal,
-        cb.raw
-      )
+      value === null ||
+      value === undefined ||
+      value === ""
     ) {
       continue;
     }
 
-    minuteCandidates++;
-    candidateEvaluations++;
+    if (
+      typeof value ===
+      "number"
+    ) {
+      if (
+        Number.isFinite(
+          value
+        )
+      ) {
+        return value;
+      }
+    }
 
-    const detail =
-      detailedMatchScore(
-        target.raw,
-        cb.raw
+    const text =
+      safe(value);
+
+    const match =
+      text.match(
+        /\d+/
       );
 
-    if (
-      detail.total >
-      bestScore
-    ) {
-
-      best =
-        cb;
-
-      bestDetail =
-        detail;
-
-      bestScore =
-        detail.total;
-
-      bestMinute =
-        cloudbetMinute(
-          cb.raw
+    if (match) {
+      const minute =
+        Number(
+          match[0]
         );
 
-      bestMinuteDifference =
-        minuteDifference(
-          signal,
-          cb.raw
-        );
+      if (
+        Number.isFinite(
+          minute
+        )
+      ) {
+        return minute;
+      }
     }
   }
 
+  return null;
+}
+
+function eventStillValidForTarget(
+  event: any
+): {
+  valid: boolean;
+  reason: string;
+  score: any;
+  period: string;
+  minute: number | null;
+} {
+  const score =
+    cloudbetScore(
+      event
+    );
+
   if (
-    !best ||
-    !bestDetail
+    score.known &&
+    !(
+      score.home === 0 &&
+      score.away === 0
+    )
   ) {
-
     return {
-      found:
+      valid:
         false,
-
-      best:
-        null,
-
-      detail:
-        null,
-
-      classification:
-        "TRUE_UNMATCHED",
-
       reason:
-        minuteCandidates === 0
-          ? "NO_CLOUDBET_CANDIDATE_WITHIN_MINUTE_WINDOW"
-          : "NO_VALID_CLOUDBET_CANDIDATE",
-
-      candidateEvaluations,
-
-      candidates:
-        candidates.length,
-
-      minuteCandidates,
-
-      targetMinute,
-
-      bestMinute:
-        null,
-
-      bestMinuteDifference:
-        null
+        "SCORE_NOT_0_0",
+      score,
+      period:
+        cloudbetPeriod(
+          event
+        ),
+      minute:
+        cloudbetMinute(
+          event
+        )
     };
   }
 
-  const classification =
-    classifyMatch(
-      bestDetail,
-      threshold
+  const period =
+    cloudbetPeriod(
+      event
     );
 
+  const secondHalfHints = [
+    "2p",
+    "2h",
+    "second",
+    "second_half",
+    "second half"
+  ];
+
+  if (
+    secondHalfHints.some(
+      hint =>
+        period.includes(
+          hint
+        )
+    )
+  ) {
+    return {
+      valid:
+        false,
+      reason:
+        "NOT_FIRST_HALF",
+      score,
+      period,
+      minute:
+        cloudbetMinute(
+          event
+        )
+    };
+  }
+
+  const terminalHints = [
+    "finished",
+    "ended",
+    "settled",
+    "closed"
+  ];
+
+  if (
+    terminalHints.some(
+      hint =>
+        period.includes(
+          hint
+        )
+    )
+  ) {
+    return {
+      valid:
+        false,
+      reason:
+        "EVENT_FINISHED",
+      score,
+      period,
+      minute:
+        cloudbetMinute(
+          event
+        )
+    };
+  }
+
+  const minute =
+    cloudbetMinute(
+      event
+    );
+
+  if (
+    minute !== null &&
+    minute > 45
+  ) {
+    return {
+      valid:
+        false,
+      reason:
+        "MINUTE_OVER_45",
+      score,
+      period,
+      minute
+    };
+  }
+
   return {
-    found:
-      classification
-        .classification ===
-      "CONFIDENT_MATCH",
-
-    best,
-
-    detail:
-      bestDetail,
-
-    classification:
-      classification
-        .classification,
-
+    valid:
+      true,
     reason:
-      classification.reason,
-
-    candidateEvaluations,
-
-    candidates:
-      candidates.length,
-
-    minuteCandidates,
-
-    targetMinute,
-
-    bestMinute,
-
-    bestMinuteDifference
+      "EVENT_VALID",
+    score,
+    period,
+    minute
   };
 }
 
-
 // ============================================================
-// FAST HUNTER MODE
-// ============================================================
-
-async function runFastHunter(
-  env: Env,
-  request: Request,
-  signals: AnyObj[],
-  threshold: number
-): Promise<Response> {
-
-  const started =
-    Date.now();
-
-  // ==========================================================
-  // STEP 1 — DISCOVER EVENTS
-  // IMPORTANT:
-  // NO markets= filter here.
-  // A missing/disabled O0.5 market must NEVER hide the match.
-  // ==========================================================
-
-  const discoveryStarted =
-    Date.now();
-
-  const rawCloudbet =
-    await getDirectCloudbetLive(
-      false
-    );
-
-  const cloudbetDiscoveryMs =
-    Date.now() -
-    discoveryStarted;
-
-  // HARD PRE-FILTER:
-  // LIVE + FIRST HALF + 0:0 + valid minute.
-  const cloudbetLive =
-    rawCloudbet.filter(
-      isHunterEligibleCloudbetEvent
-    );
-
-  const prepareStarted =
-    Date.now();
-
-  const preparedCloudbet =
-    cloudbetLive.map(
-      prepareMatch
-    );
-
-  const tokenIndex =
-    buildTokenIndex(
-      preparedCloudbet
-    );
-
-  const prepareMs =
-    Date.now() -
-    prepareStarted;
-
-
-  // ==========================================================
-  // STEP 2 — MATCH HUNTER SIGNALS TO EVENTS
-  // Still NO odds dependency.
-  // ==========================================================
-
-  const matchStarted =
-    Date.now();
-
-  const matchedRows:
-    {
-      signal: AnyObj;
-      result: AnyObj;
-    }[] = [];
-
-  let totalCandidateEvaluations =
-    0;
-
-  for (
-    const signal
-    of signals
-  ) {
-
-    const result =
-      findHunterTargetMatch(
-        signal,
-        preparedCloudbet,
-        tokenIndex,
-        threshold
-      );
-
-    totalCandidateEvaluations +=
-      result.candidateEvaluations;
-
-    matchedRows.push({
-      signal,
-      result
-    });
-  }
-
-  const matchingMs =
-    Date.now() -
-    matchStarted;
-
-
-  // ==========================================================
-  // STEP 3 — SEPARATE ODDS LOOKUP
-  //
-  // Only now, after the match/event_id was found, query the
-  // exact 1H O0.5 market feed.
-  //
-  // If the event is absent from this odds feed:
-  // - MATCH remains valid
-  // - event_id remains valid
-  // - odds.available = false
-  //
-  // This is the critical V7.4.1 behavior.
-  // ==========================================================
-
-  const hasSecureMatch =
-    matchedRows.some(
-      row =>
-        row.result?.found ===
-        true
-    );
-
-  let oddsEvents:
-    AnyObj[] = [];
-
-  let oddsFetchMs =
-    0;
-
-  if (
-    hasSecureMatch
-  ) {
-
-    const oddsStarted =
-      Date.now();
-
-    try {
-
-      oddsEvents =
-        await getDirectCloudbetLive(
-          true
-        );
-
-    } catch {
-
-      // Odds failure must NOT destroy a secure event match.
-      oddsEvents = [];
-    }
-
-    oddsFetchMs =
-      Date.now() -
-      oddsStarted;
-  }
-
-  const oddsByEventId =
-    buildOddsEventMap(
-      oddsEvents
-    );
-
-
-  // ==========================================================
-  // STEP 4 — BUILD RESPONSE
-  // ==========================================================
-
-  const hunterResults:
-    AnyObj[] = [];
-
-  for (
-    const row
-    of matchedRows
-  ) {
-
-    const signal =
-      row.signal;
-
-    const result =
-      row.result;
-
-    const detail =
-      result.detail;
-
-    const cb =
-      result.best;
-
-    const matchedEventId =
-      cb
-        ? cloudbetEventId(
-            cb.raw
-          )
-        : null;
-
-    const oddsEvent =
-      matchedEventId
-        ? oddsByEventId.get(
-            matchedEventId
-          ) ??
-          null
-        : null;
-
-    const odds =
-      result.found &&
-      oddsEvent
-        ? extractOver05(
-            oddsEvent
-          )
-        : null;
-
-    hunterResults.push({
-
-      status:
-        result.found
-          ? "MATCH"
-          : "NO_MATCH",
-
-      signal: {
-        type:
-          signal?.type ??
-          "HUNTER_ENTRY",
-
-        match:
-          signal?.match ??
-          null,
-
-        match_id:
-          signal?.match_id ??
-          null,
-
-        home:
-          signal?.home ??
-          null,
-
-        away:
-          signal?.away ??
-          null,
-
-        entry_minute:
-          signal?.entry_minute ??
-          null,
-
-        current_minute:
-          signal?.current_minute ??
-          null,
-
-        period:
-          signal?.period ??
-          null,
-
-        hunter_score:
-          signal?.hunter_score ??
-          null
-      },
-
-      cloudbet:
-        cb
-          ? {
-              id:
-                cb.raw?.id ??
-                cb.raw?.event_id ??
-                null,
-
-              event_id:
-                cb.raw?.event_id ??
-                cb.raw?.id ??
-                null,
-
-              key:
-                cb.raw?.key ??
-                null,
-
-              match:
-                matchDisplayName(
-                  cb.raw
-                ),
-
-              home:
-                extractHome(
-                  cb.raw
-                ),
-
-              away:
-                extractAway(
-                  cb.raw
-                ),
-
-              normalized_home:
-                cb.normalizedHome,
-
-              normalized_away:
-                cb.normalizedAway,
-
-              status:
-                cb.raw?.status ??
-                null,
-
-              event_status:
-                cb.raw?.metadata
-                  ?.eventStatus ??
-                null,
-
-              minute:
-                cb.raw?.metadata
-                  ?.eventTime ??
-                null,
-
-              minute_extended:
-                cb.raw?.metadata
-                  ?.eventTimeExtended ??
-                null,
-
-              parsed_minute:
-                cloudbetMinute(
-                  cb.raw
-                ),
-
-              score:
-                cloudbetScore(
-                  cb.raw?.metadata
-                    ?.score
-                ),
-
-              competition:
-                cb.raw?.competition ??
-                null
-            }
-          : null,
-
-      odds:
-        odds
-          ? {
-              market:
-                ODDS_MARKET,
-
-              selection:
-                "OVER 0.5",
-
-              period:
-                "1H",
-
-              price:
-                odds.price,
-
-              raw_price:
-                odds.raw_price,
-
-              available:
-                odds.available,
-
-              selection_status:
-                odds.status,
-
-              min_stake:
-                odds.min_stake,
-
-              max_stake:
-                odds.max_stake,
-
-              probability:
-                odds.probability,
-
-              market_url:
-                odds.market_url
-            }
-          : {
-              market:
-                ODDS_MARKET,
-
-              selection:
-                "OVER 0.5",
-
-              period:
-                "1H",
-
-              price:
-                null,
-
-              raw_price:
-                null,
-
-              available:
-                false,
-
-              selection_status:
-                null,
-
-              min_stake:
-                null,
-
-              max_stake:
-                null,
-
-              probability:
-                null,
-
-              market_url:
-                null
-            },
-
-      matcher_scoring:
-        detail
-          ? scoringRecord(
-              detail
-            )
-          : {
-              total: 0,
-              base_score: 0,
-              home_score: 0,
-              away_score: 0,
-              reverse_home_score: 0,
-              reverse_away_score: 0,
-              direction:
-                "NONE",
-              competition_score: 0,
-              country_score: 0
-            },
-
-      classification:
-        result.classification,
-
-      reason:
-        result.reason,
-
-      security: {
-        secure_match:
-          result.found === true,
-
-        match_method:
-          result.found
-            ? "FAST_HUNTER_LIVE_00_CLOSE_MINUTE_TWO_SIDED"
-            : null,
-
-        score_only_match:
-          false,
-
-        exact_id_alone:
-          false,
-
-        provider_id_match_used:
-          false,
-
-        required_classification:
-          "CONFIDENT_MATCH",
-
-        candidate_discovery:
-          "ALL_LIVE_SOCCER_THEN_1H_00_MINUTE_THEN_NAME_MATCH"
-      },
-
-      diagnostics: {
-        candidate_evaluations:
-          result.candidateEvaluations,
-
-        candidates:
-          result.candidates,
-
-        minute_candidates:
-          result.minuteCandidates ??
-          0,
-
-        target_minute:
-          result.targetMinute ??
-          null,
-
-        cloudbet_minute:
-          result.bestMinute ??
-          null,
-
-        minute_difference:
-          result.bestMinuteDifference ??
-          null,
-
-        minute_tolerance:
-          MATCH_MINUTE_TOLERANCE,
-
-        live_filter:
-          "LIVE + 1H + 0:0 + CLOSE_MINUTE",
-
-        event_discovery:
-          "ALL_LIVE_SOCCER_WITHOUT_MARKET_FILTER",
-
-        odds_lookup:
-          "SEPARATE_AFTER_SECURE_MATCH",
-
-        odds_event_found:
-          oddsEvent !==
-          null,
-
-        target_normalized_home:
-          normalizeTeam(
-            signal?.home
-          ),
-
-        target_normalized_away:
-          normalizeTeam(
-            signal?.away
-          )
-      }
-    });
-  }
-
-
-  return json({
-    success:
-      true,
-
-    worker:
-      "cloudbet-match-matcher",
-
-    version:
-      VERSION,
-
-    mode:
-      "READ ONLY",
-
-    execution_mode:
-      "FAST_HUNTER",
-
-    source: {
-      v27:
-        "SKIPPED_IN_FAST_HUNTER",
-
-      cloudbet:
-        "DIRECT CLOUDBET PUBLIC SPORTS API",
-
-      event_discovery:
-        "ALL LIVE SOCCER — NO MARKET FILTER",
-
-      odds:
-        "SEPARATE EXACT 1H OVER 0.5 LOOKUP AFTER MATCH"
-    },
-
-    settings: {
-      match_threshold:
-        threshold,
-
-      strong_team_score:
-        STRONG_TEAM_SCORE,
-
-      possible_team_score:
-        POSSIBLE_TEAM_SCORE,
-
-      possible_total_score:
-        POSSIBLE_TOTAL_SCORE,
-
-      confident_total_score:
-        CONFIDENT_TOTAL_SCORE,
-
-      reversed_confident_score:
-        REVERSED_CONFIDENT_SCORE,
-
-      minute_tolerance:
-        MATCH_MINUTE_TOLERANCE,
-
-      prefilter:
-        "LIVE + 1H + 0:0 + VALID MINUTE",
-
-      discovery_market_filter:
-        false,
-
-      odds_lookup_after_match:
-        true,
-
-      preserve_event_id_without_odds:
-        true,
-
-      matcher:
-        "STRICT TWO-SIDED TEAM NORMALIZATION + ALIAS + TOKEN FUZZY + CATEGORY PROTECTION",
-
-      hunter_security:
-        "ONLY CONFIDENT_MATCH IS ACCEPTED",
-
-      fast_hunter:
-        true,
-
-      direct_odds:
-        true,
-
-      odds_market:
-        ODDS_MARKET,
-
-      odds_selection:
-        "1H OVER 0.5"
-    },
-
-    stats: {
-      hunter_signals:
-        signals.length,
-
-      cloudbet_raw_matches:
-        rawCloudbet.length,
-
-      cloudbet_live_1h_00_matches:
-        cloudbetLive.length,
-
-      cloudbet_odds_feed_matches:
-        oddsEvents.length,
-
-      hunter_secure_matches:
-        hunterResults.filter(
-          x =>
-            x?.security
-              ?.secure_match ===
-            true
-        ).length,
-
-      hunter_no_matches:
-        hunterResults.filter(
-          x =>
-            x?.security
-              ?.secure_match !==
-            true
-        ).length,
-
-      hunter_odds_found:
-        hunterResults.filter(
-          x =>
-            x?.odds
-              ?.price !==
-            null
-        ).length,
-
-      hunter_odds_available:
-        hunterResults.filter(
-          x =>
-            x?.odds
-              ?.available ===
-            true
-        ).length,
-
-      hunter_candidate_evaluations:
-        totalCandidateEvaluations,
-
-      cloudbet_discovery_ms:
-        cloudbetDiscoveryMs,
-
-      odds_fetch_ms:
-        oddsFetchMs,
-
-      prepare_ms:
-        prepareMs,
-
-      matching_ms:
-        matchingMs,
-
-      processing_ms:
-        Date.now() -
-        started
-    },
-
-    hunter_results:
-      hunterResults,
-
-    timestamp:
-      new Date()
-        .toISOString()
-  });
-}
-
-
-// ============================================================
-// LIGHT DIAGNOSTIC MODE
+// TARGET MARKET / SELECTION
 // ============================================================
 
-async function runLightDiagnostic(
-  env: Env
-): Promise<Response> {
-
-  const started =
-    Date.now();
-
-  const [
-    v27Data,
-    cloudbetEvents
-  ] =
-    await Promise.all([
-      fetchServiceJSON(
-        env.V27,
-        "/"
-      ),
-
-      getDirectCloudbetLive(
-        false
-      )
-    ]);
-
-  const v27Matches =
-    Array.isArray(
-      v27Data?.matches
-    )
-      ? v27Data.matches
-      : Array.isArray(
-          v27Data?.live_matches
-        )
-      ? v27Data.live_matches
-      : Array.isArray(
-          v27Data?.events
-        )
-      ? v27Data.events
-      : [];
-
-  const live =
-    cloudbetEvents.filter(
-      isCloudbetLive
-    );
-
-  const live1h00 =
-    cloudbetEvents.filter(
-      isHunterEligibleCloudbetEvent
-    );
-
-  let oddsEvents:
-    AnyObj[] = [];
-
-  try {
-
-    oddsEvents =
-      await getDirectCloudbetLive(
-        true
-      );
-
-  } catch {
-
-    oddsEvents = [];
-  }
-
-  const withOdds =
-    oddsEvents.filter(
-      event =>
-        extractOver05(
-          event
-        ) !== null
-    );
-
-  return json({
-    success:
-      true,
-
-    worker:
-      "cloudbet-match-matcher",
-
-    version:
-      VERSION,
-
-    mode:
-      "READ ONLY",
-
-    execution_mode:
-      "LIGHT_DIAGNOSTIC",
-
-    source: {
-      v27:
-        "V27 SERVICE BINDING",
-
-      cloudbet:
-        "DIRECT CLOUDBET PUBLIC SPORTS API",
-
-      event_discovery:
-        "ALL LIVE SOCCER — NO MARKET FILTER",
-
-      odds:
-        "SEPARATE MARKET QUERY"
-    },
-
-    note:
-      "Event discovery is independent from odds availability. Full all-vs-all diagnostic matching is disabled to avoid CPU limit.",
-
-    settings: {
-      prefilter:
-        "LIVE + 1H + 0:0 + VALID MINUTE",
-
-      minute_tolerance:
-        MATCH_MINUTE_TOLERANCE,
-
-      discovery_market_filter:
-        false
-    },
-
-    stats: {
-      v27_matches:
-        v27Matches.length,
-
-      cloudbet_raw_matches:
-        cloudbetEvents.length,
-
-      cloudbet_live_matches:
-        live.length,
-
-      cloudbet_live_1h_00_matches:
-        live1h00.length,
-
-      cloudbet_odds_feed_matches:
-        oddsEvents.length,
-
-      cloudbet_over_05_found:
-        withOdds.length,
-
-      cloudbet_over_05_enabled:
-        withOdds.filter(
-          event =>
-            extractOver05(
-              event
-            )?.available ===
-            true
-        ).length,
-
-      processing_ms:
-        Date.now() -
-        started
-    },
-
-    hunter_results:
-      [],
-
-    timestamp:
-      new Date()
-        .toISOString()
-  });
-}
-
-
-// ============================================================
-// THRESHOLD
-// ============================================================
-
-function getThreshold(
-  request: Request
-): number {
-
-  const url =
-    new URL(
-      request.url
-    );
-
-  let threshold =
-    Number(
-      url.searchParams.get(
-        "threshold"
-      ) ??
-      String(
-        DEFAULT_THRESHOLD
-      )
-    );
-
-  if (
-    !Number.isFinite(
-      threshold
-    )
-  ) {
-    threshold =
-      DEFAULT_THRESHOLD;
-  }
-
-  return Math.max(
-    0.30,
-    Math.min(
-      1,
-      threshold
+function isTargetMarket(
+  value: any
+): boolean {
+  return (
+    norm(value) ===
+    norm(
+      TARGET_MARKET
     )
   );
 }
 
+function isTargetSubmarket(
+  value: any
+): boolean {
+  return (
+    safe(value)
+      .toLowerCase()
+      .trim() ===
+    TARGET_SUBMARKET
+  );
+}
+
+function isTargetSelection(
+  selection: any
+): boolean {
+  if (!selection) {
+    return false;
+  }
+
+  const outcome =
+    safe(
+      selection.outcome
+    ).toLowerCase();
+
+  const params =
+    safe(
+      selection.params
+    ).toLowerCase();
+
+  return (
+    outcome ===
+      TARGET_OUTCOME &&
+    params ===
+      TARGET_PARAMS
+  );
+}
+
+function extractPrice(
+  selection: any
+): number | null {
+  const raw =
+    selection?.price ??
+    selection?.odds ??
+    selection?.decimal_odds ??
+    selection?.raw_price ??
+    null;
+
+  const price =
+    Number(raw);
+
+  if (
+    !Number.isFinite(
+      price
+    ) ||
+    price <= 1
+  ) {
+    return null;
+  }
+
+  return price;
+}
+
+function selectionEnabled(
+  selection: any
+): boolean {
+  const status =
+    String(
+      selection?.status ||
+      selection?.state ||
+      ""
+    ).toUpperCase();
+
+  if (
+    status.includes(
+      "DISABLED"
+    ) ||
+    status.includes(
+      "SUSPENDED"
+    ) ||
+    status.includes(
+      "CLOSED"
+    ) ||
+    status.includes(
+      "SETTLED"
+    )
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+function selectionMaxStake(
+  selection: any
+): number | null {
+  return numberOrNull(
+    selection?.maxStake ??
+    selection?.max_stake ??
+    selection?.limits?.maxStake ??
+    selection?.limits?.max_stake ??
+    null
+  );
+}
+
+function selectionMinStake(
+  selection: any
+): number | null {
+  return numberOrNull(
+    selection?.minStake ??
+    selection?.min_stake ??
+    selection?.limits?.minStake ??
+    selection?.limits?.min_stake ??
+    null
+  );
+}
+
+function searchTargetRecursive(
+  value: any,
+  marketContext:
+    string | null,
+  submarketContext:
+    string | null
+): any | null {
+  if (
+    value === null ||
+    value === undefined
+  ) {
+    return null;
+  }
+
+  if (
+    Array.isArray(
+      value
+    )
+  ) {
+    for (
+      const item
+      of value
+    ) {
+      const found =
+        searchTargetRecursive(
+          item,
+          marketContext,
+          submarketContext
+        );
+
+      if (found) {
+        return found;
+      }
+    }
+
+    return null;
+  }
+
+  if (
+    typeof value !==
+    "object"
+  ) {
+    return null;
+  }
+
+  const currentMarket =
+    value.market_key ||
+    value.marketKey ||
+    value.market_name ||
+    value.market ||
+    value.key ||
+    marketContext;
+
+  const currentSubmarket =
+    value.submarket_key ||
+    value.submarketKey ||
+    value.submarket_name ||
+    value.submarket ||
+    value.period ||
+    submarketContext;
+
+  const marketMatches =
+    isTargetMarket(
+      currentMarket
+    ) ||
+    safe(
+      currentMarket
+    ) ===
+      TARGET_MARKET;
+
+  const submarketMatches =
+    isTargetSubmarket(
+      currentSubmarket
+    );
+
+  if (
+    marketMatches &&
+    submarketMatches &&
+    isTargetSelection(
+      value
+    ) &&
+    selectionEnabled(
+      value
+    )
+  ) {
+    const price =
+      extractPrice(
+        value
+      );
+
+    if (
+      price !== null
+    ) {
+      return {
+        ...value,
+        price,
+        market:
+          TARGET_MARKET,
+        submarket:
+          TARGET_SUBMARKET
+      };
+    }
+  }
+
+  if (
+    Array.isArray(
+      value.selections
+    )
+  ) {
+    for (
+      const selection
+      of value.selections
+    ) {
+      const selectionMarket =
+        selection.market ||
+        selection.market_key ||
+        currentMarket;
+
+      const selectionSubmarket =
+        selection.submarket ||
+        selection.submarket_key ||
+        selection.period ||
+        currentSubmarket;
+
+      if (
+        !(
+          isTargetMarket(
+            selectionMarket
+          ) ||
+          safe(
+            selectionMarket
+          ) ===
+            TARGET_MARKET
+        )
+      ) {
+        continue;
+      }
+
+      if (
+        !isTargetSubmarket(
+          selectionSubmarket
+        )
+      ) {
+        continue;
+      }
+
+      if (
+        !isTargetSelection(
+          selection
+        )
+      ) {
+        continue;
+      }
+
+      if (
+        !selectionEnabled(
+          selection
+        )
+      ) {
+        continue;
+      }
+
+      const price =
+        extractPrice(
+          selection
+        );
+
+      if (
+        price === null
+      ) {
+        continue;
+      }
+
+      return {
+        ...selection,
+        price,
+        market:
+          TARGET_MARKET,
+        submarket:
+          TARGET_SUBMARKET
+      };
+    }
+  }
+
+  const containers = [
+    "markets",
+    "odds",
+    "lines",
+    "market",
+    "submarkets",
+    "data"
+  ];
+
+  for (
+    const key
+    of containers
+  ) {
+    const child =
+      value[key];
+
+    if (
+      child ===
+        undefined ||
+      child ===
+        null
+    ) {
+      continue;
+    }
+
+    const found =
+      searchTargetRecursive(
+        child,
+        currentMarket
+          ? String(
+              currentMarket
+            )
+          : marketContext,
+        currentSubmarket
+          ? String(
+              currentSubmarket
+            )
+          : submarketContext
+      );
+
+    if (found) {
+      return found;
+    }
+  }
+
+  return null;
+}
+
+function findTargetSelection(
+  event: any
+): any | null {
+  return searchTargetRecursive(
+    event,
+    null,
+    null
+  );
+}
 
 // ============================================================
-// MAIN
+// FINAL EVENT CHECK
+// ============================================================
+
+interface CurrentOddsResult {
+  success: boolean;
+  event_id: string | null;
+  current_odds: number | null;
+  max_stake: number | null;
+  min_stake: number | null;
+  selection_status: string | null;
+  market_url: string | null;
+  event: Obj | null;
+  validation: any;
+  error?: string;
+}
+
+async function verifySameEventAndOdds(
+  env: Env,
+  expectedEventId: string
+): Promise<CurrentOddsResult> {
+  try {
+    const event =
+      await fetchCloudbetEvent(
+        env,
+        expectedEventId
+      );
+
+    if (
+      !isSameEventId(
+        expectedEventId,
+        event
+      )
+    ) {
+      return {
+        success:
+          false,
+        event_id:
+          getCloudbetEventId(
+            event
+          ),
+        current_odds:
+          null,
+        max_stake:
+          null,
+        min_stake:
+          null,
+        selection_status:
+          null,
+        market_url:
+          null,
+        event,
+        validation: {
+          valid:
+            false,
+          reason:
+            "CLOUDBET_EVENT_ID_CHANGED"
+        },
+        error:
+          "CLOUDBET_EVENT_ID_CHANGED"
+      };
+    }
+
+    const validation =
+      eventStillValidForTarget(
+        event
+      );
+
+    if (
+      !validation.valid
+    ) {
+      return {
+        success:
+          false,
+        event_id:
+          expectedEventId,
+        current_odds:
+          null,
+        max_stake:
+          null,
+        min_stake:
+          null,
+        selection_status:
+          null,
+        market_url:
+          null,
+        event,
+        validation,
+        error:
+          validation.reason
+      };
+    }
+
+    const selection =
+      findTargetSelection(
+        event
+      );
+
+    if (
+      !selection
+    ) {
+      return {
+        success:
+          false,
+        event_id:
+          expectedEventId,
+        current_odds:
+          null,
+        max_stake:
+          null,
+        min_stake:
+          null,
+        selection_status:
+          null,
+        market_url:
+          null,
+        event,
+        validation,
+        error:
+          "TARGET_SELECTION_NOT_AVAILABLE"
+      };
+    }
+
+    const currentOdds =
+      extractPrice(
+        selection
+      );
+
+    if (
+      currentOdds ===
+      null
+    ) {
+      return {
+        success:
+          false,
+        event_id:
+          expectedEventId,
+        current_odds:
+          null,
+        max_stake:
+          selectionMaxStake(
+            selection
+          ),
+        min_stake:
+          selectionMinStake(
+            selection
+          ),
+        selection_status:
+          safe(
+            selection?.status ||
+            selection?.state ||
+            ""
+          ) || null,
+        market_url:
+          safe(
+            selection?.marketUrl ||
+            selection?.market_url ||
+            ""
+          ) || null,
+        event,
+        validation,
+        error:
+          "TARGET_ODDS_NOT_AVAILABLE"
+      };
+    }
+
+    return {
+      success:
+        true,
+      event_id:
+        expectedEventId,
+      current_odds:
+        currentOdds,
+      max_stake:
+        selectionMaxStake(
+          selection
+        ),
+      min_stake:
+        selectionMinStake(
+          selection
+        ),
+      selection_status:
+        safe(
+          selection?.status ||
+          selection?.state ||
+          ""
+        ) || null,
+      market_url:
+        safe(
+          selection?.marketUrl ||
+          selection?.market_url ||
+          ""
+        ) || null,
+      event,
+      validation
+    };
+  } catch (
+    error
+  ) {
+    return {
+      success:
+        false,
+      event_id:
+        expectedEventId,
+      current_odds:
+        null,
+      max_stake:
+        null,
+      min_stake:
+        null,
+      selection_status:
+        null,
+      market_url:
+        null,
+      event:
+        null,
+      validation:
+        null,
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error)
+    };
+  }
+}
+
+// ============================================================
+// BET BUILDER
+// ============================================================
+
+function buildReadyBet(
+  signal: any,
+  trackerCloudbet:
+    TrackerCloudbetData,
+  current:
+    CurrentOddsResult
+): any {
+  const entryOdds =
+    trackerCloudbet
+      .entry_odds;
+
+  const currentOdds =
+    current
+      .current_odds;
+
+  const movement =
+    entryOdds !== null &&
+    currentOdds !== null
+      ? Number(
+          (
+            currentOdds -
+            entryOdds
+          ).toFixed(4)
+        )
+      : null;
+
+  return {
+    execution_id:
+      crypto.randomUUID(),
+    timestamp:
+      nowISO(),
+    mode:
+      MODE,
+    dry_run:
+      DRY_RUN,
+    betting_enabled:
+      BETTING_ENABLED,
+    action:
+      "READY_TO_BET",
+    stake_eur:
+      BET_STAKE_EUR,
+
+    signal: {
+      match_id:
+        signal?.match_id ??
+        signal?.id ??
+        null,
+      match:
+        signalMatch(
+          signal
+        ),
+      home:
+        signalHome(
+          signal
+        ),
+      away:
+        signalAway(
+          signal
+        ),
+      entry_minute:
+        signal?.entry_minute ??
+        signal?.minute ??
+        null,
+      hunter_score:
+        signal?.hunter_score ??
+        signal?.score ??
+        null
+    },
+
+    cloudbet: {
+      event_id:
+        trackerCloudbet
+          .event_id,
+      tracker_match:
+        trackerCloudbet
+          .match,
+      current_match:
+        current.event
+          ? displayCloudbetMatch(
+              current.event
+            )
+          : null,
+      matcher_score:
+        trackerCloudbet
+          .matcher_score,
+      entry_max_stake:
+        trackerCloudbet
+          .max_stake,
+      current_max_stake:
+        current
+          .max_stake,
+      current_min_stake:
+        current
+          .min_stake,
+      selection_status:
+        current
+          .selection_status,
+      market_url:
+        current
+          .market_url
+    },
+
+    target: {
+      market:
+        BET_MARKET,
+      selection:
+        TARGET_SELECTION,
+      market_key:
+        TARGET_MARKET,
+      submarket_key:
+        TARGET_SUBMARKET,
+      outcome:
+        TARGET_OUTCOME,
+      params:
+        TARGET_PARAMS
+    },
+
+    odds: {
+      entry_odds:
+        entryOdds,
+      current_odds:
+        currentOdds,
+      movement,
+      changed:
+        movement !== null
+          ? movement !== 0
+          : null
+    },
+
+    validation:
+      current.validation
+  };
+}
+
+// ============================================================
+// ACCOUNT SNAPSHOT + PREFLIGHT
+// ============================================================
+
+interface AccountSnapshot {
+  success: boolean;
+  authenticated: boolean;
+  currency: string;
+  currency_enabled: boolean;
+  balance: number | null;
+  endpoint: string;
+  status: number;
+  latency_ms: number;
+  error: string | null;
+}
+
+async function fetchAccountSnapshot(
+  env: Env
+): Promise<AccountSnapshot> {
+  const result =
+    await fetchServiceJSON(
+      env.CLOUDBET,
+      "/account-test",
+      SERVICE_TIMEOUT_MS
+    );
+
+  if (!result.ok) {
+    return {
+      success: false,
+      authenticated: false,
+      currency: BET_CURRENCY,
+      currency_enabled: false,
+      balance: null,
+      endpoint: "/account-test",
+      status: result.status,
+      latency_ms: result.latency_ms,
+      error: result.error || "ACCOUNT_TEST_FAILED"
+    };
+  }
+
+  const data = result.data || {};
+  const currencies = Array.isArray(data?.currencies)
+    ? data.currencies.map((v: any) => safe(v).toUpperCase())
+    : [];
+
+  const balanceRow = Array.isArray(data?.balances)
+    ? data.balances.find(
+        (row: any) =>
+          safe(row?.currency).toUpperCase() ===
+          BET_CURRENCY.toUpperCase()
+      )
+    : null;
+
+  const balance = numberOrNull(
+    balanceRow?.amount ??
+    balanceRow?.data?.amount ??
+    data?.balance?.amount ??
+    data?.amount ??
+    null
+  );
+
+  const authenticated =
+    data?.authenticated === true ||
+    balanceRow?.success === true;
+
+  const currencyEnabled =
+    currencies.includes(BET_CURRENCY.toUpperCase()) ||
+    safe(balanceRow?.currency).toUpperCase() ===
+      BET_CURRENCY.toUpperCase();
+
+  return {
+    success:
+      authenticated &&
+      currencyEnabled &&
+      balance !== null,
+    authenticated,
+    currency: BET_CURRENCY,
+    currency_enabled: currencyEnabled,
+    balance,
+    endpoint: "/account-test",
+    status: result.status,
+    latency_ms: result.latency_ms,
+    error:
+      authenticated && currencyEnabled && balance !== null
+        ? null
+        : "ACCOUNT_SNAPSHOT_INCOMPLETE"
+  };
+}
+
+function buildAccountPreflight(
+  account: AccountSnapshot,
+  current: CurrentOddsResult
+): any {
+  const stake = numberOrNull(BET_STAKE);
+  const minStake = numberOrNull(current?.min_stake);
+  const maxStake = numberOrNull(current?.max_stake);
+  const balance = numberOrNull(account?.balance);
+
+  const accountOk =
+    account.success === true &&
+    account.authenticated === true &&
+    account.currency_enabled === true &&
+    balance !== null;
+
+  const selectionEnabled =
+    current.success === true &&
+    current.selection_status === "SELECTION_ENABLED" &&
+    numberOrNull(current.current_odds) !== null &&
+    Number(current.current_odds) > 1;
+
+  const aboveMin =
+    stake !== null &&
+    (minStake === null || stake >= minStake);
+
+  const belowMax =
+    stake !== null &&
+    (maxStake === null || stake <= maxStake);
+
+  const balanceSufficient =
+    stake !== null &&
+    balance !== null &&
+    stake <= balance;
+
+  const stakeAllowed =
+    aboveMin && belowMax;
+
+  let blockReason: string | null = null;
+
+  if (!accountOk) {
+    blockReason = "ACCOUNT_NOT_READY";
+  } else if (!selectionEnabled) {
+    blockReason = "SELECTION_NOT_ENABLED";
+  } else if (!aboveMin) {
+    blockReason = "STAKE_BELOW_MIN";
+  } else if (!belowMax) {
+    blockReason = "STAKE_ABOVE_MAX";
+  } else if (!balanceSufficient) {
+    blockReason = "INSUFFICIENT_BALANCE";
+  }
+
+  return {
+    account_ok: accountOk,
+    authenticated: account.authenticated,
+    currency: BET_CURRENCY,
+    currency_enabled: account.currency_enabled,
+    balance,
+    stake,
+    min_stake: minStake,
+    max_stake: maxStake,
+    selection_enabled: selectionEnabled,
+    stake_above_min: aboveMin,
+    stake_below_max: belowMax,
+    stake_allowed: stakeAllowed,
+    balance_sufficient: balanceSufficient,
+    ready_to_send: blockReason === null,
+    block_reason: blockReason
+  };
+}
+
+// ============================================================
+// FINAL TRADING HANDOFF
+// ============================================================
+
+function buildTradingHandoff(
+  bet: any,
+  current:
+    CurrentOddsResult,
+  account: AccountSnapshot
+): any | null {
+  if (
+    !HANDOFF_ENABLED
+  ) {
+    return null;
+  }
+
+  const eventId =
+    normalizeEventId(
+      bet?.cloudbet
+        ?.event_id ??
+      current?.event_id ??
+      null
+    );
+
+  const marketUrl =
+    safe(
+      current?.market_url ??
+      bet?.cloudbet
+        ?.market_url ??
+      ""
+    );
+
+  const price =
+    numberOrNull(
+      current
+        ?.current_odds ??
+      bet?.odds
+        ?.current_odds ??
+      null
+    );
+
+  if (
+    !eventId ||
+    !marketUrl ||
+    price === null ||
+    price <= 1
+  ) {
+    return null;
+  }
+
+  const preflight =
+    buildAccountPreflight(
+      account,
+      current
+    );
+
+  return {
+    ready_to_send:
+      preflight.ready_to_send,
+    sent:
+      false,
+    block_reason:
+      preflight.block_reason,
+    preflight,
+
+    method:
+      "POST",
+
+    endpoint:
+      TRADING_STRAIGHT_ENDPOINT,
+
+    headers: {
+      "Accept":
+        "application/json",
+      "Content-Type":
+        "application/json",
+      "X-API-Key":
+        "<CLOUDBET_API_KEY>"
+    },
+
+    body: {
+      referenceId:
+        crypto.randomUUID(),
+
+      currency:
+        BET_CURRENCY,
+
+      stake:
+        BET_STAKE,
+
+      acceptPartialStake:
+        true,
+
+      priceChange: {
+        value:
+          "BETTER"
+      },
+
+      selection: {
+        eventId,
+        marketUrl,
+        price:
+          String(price)
+      }
+    }
+  };
+}
+
+// ============================================================
+// D1 — PENDING ODDS
+// ============================================================
+
+interface PendingRow {
+  id?: number;
+  execution_id: string;
+  cloudbet_id: string;
+  payload_json: string;
+  retry_count?: number;
+  missing_count?: number;
+  next_check_at?: string;
+}
+
+interface PendingPayload {
+  signal?: any;
+  tracker_cloudbet?:
+    TrackerCloudbetData;
+  last_check?: any;
+}
+
+async function savePending(
+  env: Env,
+  executionId: string,
+  signal: any,
+  trackerCloudbet:
+    TrackerCloudbetData,
+  current:
+    CurrentOddsResult
+): Promise<any> {
+  const cloudbetId =
+    normalizeEventId(
+      trackerCloudbet
+        .event_id
+    );
+
+  if (!cloudbetId) {
+    return {
+      success:
+        false,
+      error:
+        "CLOUDBET_EVENT_ID_MISSING_FOR_PENDING"
+    };
+  }
+
+  const payload:
+    PendingPayload = {
+    signal,
+    tracker_cloudbet:
+      trackerCloudbet,
+    last_check:
+      current
+  };
+
+  const payloadJson =
+    JSON.stringify(
+      payload
+    );
+
+  const existing =
+    await env.DB
+      .prepare(`
+        SELECT *
+        FROM pending_odds
+        WHERE cloudbet_id = ?
+        LIMIT 1
+      `)
+      .bind(
+        cloudbetId
+      )
+      .first<PendingRow>();
+
+  const nextCheck =
+    addSecondsISO(
+      ODDS_EVENT_RETRY_DELAY_MS /
+      1000
+    );
+
+  if (existing) {
+    await env.DB
+      .prepare(`
+        UPDATE pending_odds
+        SET
+          execution_id = ?,
+          payload_json = ?,
+          updated_at = ?,
+          next_check_at = ?
+        WHERE cloudbet_id = ?
+      `)
+      .bind(
+        executionId,
+        payloadJson,
+        nowISO(),
+        nextCheck,
+        cloudbetId
+      )
+      .run();
+
+    return {
+      success:
+        true,
+      action:
+        "UPDATED_PENDING",
+      cloudbet_id:
+        cloudbetId,
+      retry_count:
+        Number(
+          existing
+            .retry_count ||
+          0
+        ),
+      next_check_at:
+        nextCheck
+    };
+  }
+
+  const archiveKey =
+    `${cloudbetId}:${TARGET_MARKET}:${TARGET_OUTCOME}:${TARGET_PARAMS}`;
+
+  await env.DB
+    .prepare(`
+      INSERT INTO pending_odds (
+        archive_key,
+        execution_id,
+        signal_match_id,
+        cloudbet_id,
+        match,
+        home,
+        away,
+        entry_minute,
+        market,
+        selection,
+        stake_eur,
+        mode,
+        status,
+        retry_count,
+        missing_count,
+        payload_json,
+        created_at,
+        updated_at,
+        next_check_at
+      )
+      VALUES (
+        ?, ?, ?, ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, 'PENDING_ODDS',
+        0, 0, ?, ?, ?, ?
+      )
+    `)
+    .bind(
+      archiveKey,
+      executionId,
+      signal?.match_id ??
+        signal?.id ??
+        null,
+      cloudbetId,
+      signalMatch(
+        signal
+      ),
+      signalHome(
+        signal
+      ),
+      signalAway(
+        signal
+      ),
+      signal?.entry_minute ??
+        signal?.minute ??
+        null,
+      BET_MARKET,
+      BET_SELECTION,
+      BET_STAKE_EUR,
+      MODE,
+      payloadJson,
+      nowISO(),
+      nowISO(),
+      nextCheck
+    )
+    .run();
+
+  return {
+    success:
+      true,
+    action:
+      "CREATED_PENDING",
+    archive_key:
+      archiveKey,
+    cloudbet_id:
+      cloudbetId,
+    retry_count:
+      0,
+    next_check_at:
+      nextCheck
+  };
+}
+
+async function loadPending(
+  env: Env
+): Promise<PendingRow[]> {
+  const result =
+    await env.DB
+      .prepare(`
+        SELECT *
+        FROM pending_odds
+        WHERE
+          next_check_at IS NULL
+          OR next_check_at <= datetime('now')
+        ORDER BY id ASC
+        LIMIT 100
+      `)
+      .all<PendingRow>();
+
+  return (
+    result.results ||
+    []
+  );
+}
+
+async function incrementPendingRetry(
+  env: Env,
+  row: PendingRow,
+  error: string
+): Promise<any> {
+  const nextRetry =
+    Number(
+      row.retry_count ||
+      0
+    ) + 1;
+
+  if (
+    nextRetry >=
+    ODDS_EVENT_MAX_RETRIES
+  ) {
+    await env.DB
+      .prepare(`
+        DELETE FROM pending_odds
+        WHERE id = ?
+      `)
+      .bind(
+        row.id
+      )
+      .run();
+
+    return {
+      action:
+        "EXPIRED",
+      retry_count:
+        nextRetry,
+      max_retries:
+        ODDS_EVENT_MAX_RETRIES,
+      error
+    };
+  }
+
+  const nextCheck =
+    addSecondsISO(
+      ODDS_EVENT_RETRY_DELAY_MS /
+      1000
+    );
+
+  await env.DB
+    .prepare(`
+      UPDATE pending_odds
+      SET
+        retry_count = ?,
+        updated_at = ?,
+        next_check_at = ?
+      WHERE id = ?
+    `)
+    .bind(
+      nextRetry,
+      nowISO(),
+      nextCheck,
+      row.id
+    )
+    .run();
+
+  return {
+    action:
+      "RESCHEDULED",
+    retry_count:
+      nextRetry,
+    max_retries:
+      ODDS_EVENT_MAX_RETRIES,
+    next_check_at:
+      nextCheck,
+    error
+  };
+}
+
+async function incrementPendingMissing(
+  env: Env,
+  row: PendingRow,
+  error: string
+): Promise<any> {
+  const nextMissing =
+    Number(
+      row.missing_count ||
+      0
+    ) + 1;
+
+  if (
+    nextMissing >=
+    MAX_MISSING_CHECKS
+  ) {
+    await env.DB
+      .prepare(`
+        DELETE FROM pending_odds
+        WHERE id = ?
+      `)
+      .bind(
+        row.id
+      )
+      .run();
+
+    return {
+      action:
+        "REMOVED_MISSING",
+      missing_count:
+        nextMissing,
+      max_missing_checks:
+        MAX_MISSING_CHECKS,
+      error
+    };
+  }
+
+  const nextCheck =
+    addSecondsISO(
+      ODDS_EVENT_RETRY_DELAY_MS /
+      1000
+    );
+
+  await env.DB
+    .prepare(`
+      UPDATE pending_odds
+      SET
+        missing_count = ?,
+        updated_at = ?,
+        next_check_at = ?
+      WHERE id = ?
+    `)
+    .bind(
+      nextMissing,
+      nowISO(),
+      nextCheck,
+      row.id
+    )
+    .run();
+
+  return {
+    action:
+      "RESCHEDULED_MISSING",
+    missing_count:
+      nextMissing,
+    max_missing_checks:
+      MAX_MISSING_CHECKS,
+    next_check_at:
+      nextCheck,
+    error
+  };
+}
+
+// ============================================================
+// ARCHIVE
+// ============================================================
+
+async function alreadyArchived(
+  env: Env,
+  cloudbetId: string
+): Promise<boolean> {
+  const row =
+    await env.DB
+      .prepare(`
+        SELECT execution_id
+        FROM bet_archive
+        WHERE
+          cloudbet_id = ?
+          AND market = ?
+          AND selection = ?
+        LIMIT 1
+      `)
+      .bind(
+        cloudbetId,
+        BET_MARKET,
+        BET_SELECTION
+      )
+      .first();
+
+  return !!row;
+}
+
+async function archiveBet(
+  env: Env,
+  bet: any,
+  signal: any,
+  current:
+    CurrentOddsResult
+): Promise<any> {
+  const cloudbetId =
+    safe(
+      bet?.cloudbet?.event_id ||
+      current?.event_id ||
+      ""
+    );
+
+  if (!cloudbetId) {
+    return {
+      success:
+        false,
+      error:
+        "ARCHIVE_CLOUDBET_ID_MISSING"
+    };
+  }
+
+  if (
+    await alreadyArchived(
+      env,
+      cloudbetId
+    )
+  ) {
+    return {
+      success:
+        true,
+      duplicate:
+        true,
+      action:
+        "ALREADY_ARCHIVED",
+      cloudbet_id:
+        cloudbetId
+    };
+  }
+
+  const currentOdds =
+    numberOrNull(
+      bet?.odds
+        ?.current_odds
+    );
+
+  try {
+    await env.DB
+      .prepare(`
+        INSERT INTO bet_archive (
+          execution_id,
+          timestamp,
+          cloudbet_id,
+          home,
+          away,
+          odds,
+          stake_eur,
+          market,
+          selection,
+          payload_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `)
+      .bind(
+        bet.execution_id,
+        nowISO(),
+        cloudbetId,
+        signalHome(
+          signal
+        ),
+        signalAway(
+          signal
+        ),
+        currentOdds,
+        BET_STAKE_EUR,
+        BET_MARKET,
+        BET_SELECTION,
+        JSON.stringify({
+          bet,
+          signal,
+          current_check:
+            current
+        })
+      )
+      .run();
+
+    return {
+      success:
+        true,
+      duplicate:
+        false,
+      action:
+        "ARCHIVED",
+      execution_id:
+        bet.execution_id,
+      cloudbet_id:
+        cloudbetId,
+      entry_odds:
+        bet?.odds
+          ?.entry_odds ??
+        null,
+      current_odds:
+        currentOdds
+    };
+  } catch (
+    error
+  ) {
+    return {
+      success:
+        false,
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error)
+    };
+  }
+}
+
+// ============================================================
+// PENDING RETRY
+// ============================================================
+
+async function processPending(
+  env: Env,
+  account: AccountSnapshot
+): Promise<any> {
+  const rows =
+    await loadPending(
+      env
+    );
+
+  if (
+    !rows.length
+  ) {
+    return {
+      success:
+        true,
+      pending_found:
+        0,
+      processed:
+        0,
+      completed:
+        0,
+      rescheduled:
+        0,
+      expired:
+        0,
+      missing:
+        0,
+      results:
+        []
+    };
+  }
+
+  let completed =
+    0;
+
+  let rescheduled =
+    0;
+
+  let expired =
+    0;
+
+  let missing =
+    0;
+
+  const results:
+    any[] = [];
+
+  for (
+    const row
+    of rows
+  ) {
+    const cloudbetId =
+      normalizeEventId(
+        row.cloudbet_id
+      );
+
+    if (
+      !cloudbetId
+    ) {
+      const result =
+        await incrementPendingRetry(
+          env,
+          row,
+          "CLOUDBET_EVENT_ID_MISSING"
+        );
+
+      results.push({
+        pending_id:
+          row.id,
+        ...result
+      });
+
+      if (
+        result.action ===
+        "EXPIRED"
+      ) {
+        expired++;
+      } else {
+        rescheduled++;
+      }
+
+      continue;
+    }
+
+    let payload:
+      PendingPayload = {};
+
+    try {
+      payload =
+        JSON.parse(
+          row.payload_json ||
+          "{}"
+        );
+    } catch {
+      payload = {};
+    }
+
+    const current =
+      await verifySameEventAndOdds(
+        env,
+        cloudbetId
+      );
+
+    if (
+      !current.success
+    ) {
+      const invalidEventReasons =
+        new Set([
+          "CLOUDBET_EVENT_ID_CHANGED",
+          "SCORE_NOT_0_0",
+          "NOT_FIRST_HALF",
+          "EVENT_FINISHED",
+          "MINUTE_OVER_45"
+        ]);
+
+      const result =
+        invalidEventReasons.has(
+          current.error ||
+          ""
+        )
+          ? await incrementPendingMissing(
+              env,
+              row,
+              current.error ||
+              "EVENT_NO_LONGER_VALID"
+            )
+          : await incrementPendingRetry(
+              env,
+              row,
+              current.error ||
+              "TARGET_ODDS_STILL_UNAVAILABLE"
+            );
+
+      results.push({
+        pending_id:
+          row.id,
+        cloudbet_id:
+          cloudbetId,
+        current,
+        ...result
+      });
+
+      if (
+        result.action ===
+          "EXPIRED" ||
+        result.action ===
+          "REMOVED_MISSING"
+      ) {
+        expired++;
+      } else {
+        rescheduled++;
+      }
+
+      if (
+        result.action ===
+        "RESCHEDULED_MISSING"
+      ) {
+        missing++;
+      }
+
+      continue;
+    }
+
+    const signal =
+      payload.signal ||
+      {};
+
+    const trackerCloudbet =
+      payload
+        .tracker_cloudbet ||
+      {
+        event_id:
+          cloudbetId,
+        match:
+          null,
+        entry_odds:
+          null,
+        max_stake:
+          null,
+        odds_available:
+          true,
+        matcher_score:
+          null
+      };
+
+    const bet =
+      buildReadyBet(
+        signal,
+        trackerCloudbet,
+        current
+      );
+
+    const archive =
+      await archiveBet(
+        env,
+        bet,
+        signal,
+        current
+      );
+
+    if (
+      !archive.success
+    ) {
+      const result =
+        await incrementPendingRetry(
+          env,
+          row,
+          archive.error ||
+          "ARCHIVE_FAILED"
+        );
+
+      results.push({
+        pending_id:
+          row.id,
+        cloudbet_id:
+          cloudbetId,
+        current,
+        archive,
+        ...result
+      });
+
+      if (
+        result.action ===
+        "EXPIRED"
+      ) {
+        expired++;
+      } else {
+        rescheduled++;
+      }
+
+      continue;
+    }
+
+    const handoff =
+      buildTradingHandoff(
+        bet,
+        current,
+        account
+      );
+
+    await env.DB
+      .prepare(`
+        DELETE FROM pending_odds
+        WHERE id = ?
+      `)
+      .bind(
+        row.id
+      )
+      .run();
+
+    completed++;
+
+    results.push({
+      pending_id:
+        row.id,
+      cloudbet_id:
+        cloudbetId,
+      action:
+        "READY_TO_BET",
+      bet,
+      handoff,
+      archive
+    });
+  }
+
+  return {
+    success:
+      true,
+    pending_found:
+      rows.length,
+    processed:
+      rows.length,
+    completed,
+    rescheduled,
+    expired,
+    missing,
+    results
+  };
+}
+
+// ============================================================
+// MAIN WORKER
+// ============================================================
+
+async function runWorker(
+  env: Env
+): Promise<any> {
+  const started =
+    Date.now();
+
+  const executionId =
+    crypto.randomUUID();
+
+  const account =
+    await fetchAccountSnapshot(
+      env
+    );
+
+  let pendingResult:
+    any;
+
+  try {
+    pendingResult =
+      await processPending(
+        env,
+        account
+      );
+  } catch (
+    error
+  ) {
+    pendingResult = {
+      success:
+        false,
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error)
+    };
+  }
+
+  const trackerResult =
+    await fetchServiceJSON(
+      env.TRACKER,
+      "/entries",
+      SERVICE_TIMEOUT_MS
+    );
+
+  if (
+    !trackerResult.ok
+  ) {
+    return {
+      success:
+        false,
+      worker:
+        "cloudbet-bet-worker",
+      version:
+        VERSION,
+      mode:
+        MODE,
+      betting_enabled:
+        BETTING_ENABLED,
+      action:
+        "RUN",
+      execution_id:
+        executionId,
+      error:
+        "TRACKER_FAILED",
+      tracker:
+        trackerResult,
+      account,
+      pending_retry:
+        pendingResult,
+      processing_ms:
+        Date.now() -
+        started
+    };
+  }
+
+  const trackerSignals =
+    trackerEntries(
+      trackerResult.data
+    );
+
+  const hunterSignals =
+    trackerSignals.filter(
+      isHunterEntry
+    );
+
+  const ready:
+    any[] = [];
+
+  const pending:
+    any[] = [];
+
+  const skipped:
+    any[] = [];
+
+  const errors:
+    any[] = [];
+
+  let trackerReady =
+    0;
+
+  let refreshedReady =
+    0;
+
+  let targetPending =
+    0;
+
+  for (
+    const signal
+    of hunterSignals
+  ) {
+    try {
+      const diagnostic =
+        trackerCandidateDiagnostic(
+          signal
+        );
+
+      if (
+        !diagnostic.ready
+      ) {
+        skipped.push({
+          reason:
+            diagnostic.reason,
+          signal,
+          diagnostic
+        });
+
+        continue;
+      }
+
+      trackerReady++;
+
+      const trackerCloudbet:
+        TrackerCloudbetData =
+        diagnostic.cloudbet;
+
+      const cloudbetId =
+        trackerCloudbet
+          .event_id!;
+
+      const current =
+        await verifySameEventAndOdds(
+          env,
+          cloudbetId
+        );
+
+      if (
+        !current.success
+      ) {
+        const pendingExecutionId =
+          crypto.randomUUID();
+
+        const saved =
+          await savePending(
+            env,
+            pendingExecutionId,
+            signal,
+            trackerCloudbet,
+            current
+          );
+
+        if (
+          !saved.success
+        ) {
+          errors.push({
+            type:
+              "PENDING_SAVE_FAILED",
+            signal,
+            cloudbet_id:
+              cloudbetId,
+            current,
+            error:
+              saved.error
+          });
+
+          continue;
+        }
+
+        targetPending++;
+
+        pending.push({
+          execution_id:
+            pendingExecutionId,
+          cloudbet_id:
+            cloudbetId,
+          match:
+            signalMatch(
+              signal
+            ),
+          entry_odds:
+            trackerCloudbet
+              .entry_odds,
+          current_odds:
+            current
+              .current_odds,
+          reason:
+            current.error,
+          pending:
+            saved
+        });
+
+        continue;
+      }
+
+      const bet =
+        buildReadyBet(
+          signal,
+          trackerCloudbet,
+          current
+        );
+
+      const archive =
+        await archiveBet(
+          env,
+          bet,
+          signal,
+          current
+        );
+
+      if (
+        !archive.success
+      ) {
+        errors.push({
+          type:
+            "ARCHIVE_FAILED",
+          signal,
+          cloudbet_id:
+            cloudbetId,
+          bet,
+          error:
+            archive.error
+        });
+
+        continue;
+      }
+
+      const handoff =
+        buildTradingHandoff(
+          bet,
+          current,
+          account
+        );
+
+      refreshedReady++;
+
+      ready.push({
+        execution_id:
+          bet.execution_id,
+        action:
+          "READY_TO_BET",
+        cloudbet_id:
+          cloudbetId,
+        match:
+          signalMatch(
+            signal
+          ),
+        home:
+          signalHome(
+            signal
+          ),
+        away:
+          signalAway(
+            signal
+          ),
+        entry_minute:
+          signal?.entry_minute ??
+          null,
+        hunter_score:
+          signal?.hunter_score ??
+          signal?.score ??
+          null,
+        matcher_score:
+          trackerCloudbet
+            .matcher_score,
+        entry_odds:
+          trackerCloudbet
+            .entry_odds,
+        current_odds:
+          current
+            .current_odds,
+        odds_movement:
+          bet.odds
+            .movement,
+        current_max_stake:
+          current
+            .max_stake,
+        market_url:
+          current
+            .market_url,
+        target:
+          bet.target,
+        account_preflight:
+          buildAccountPreflight(
+            account,
+            current
+          ),
+        handoff,
+        archive
+      });
+    } catch (
+      error
+    ) {
+      errors.push({
+        type:
+          "SIGNAL_PROCESSING_ERROR",
+        signal,
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error)
+      });
+    }
+  }
+
+  return {
+    success:
+      true,
+    worker:
+      "cloudbet-bet-worker",
+    version:
+      VERSION,
+    mode:
+      MODE,
+    dry_run:
+      DRY_RUN,
+    betting_enabled:
+      BETTING_ENABLED,
+    handoff_enabled:
+      HANDOFF_ENABLED,
+    action:
+      "RUN",
+    execution_id:
+      executionId,
+
+    config: {
+      stake_eur:
+        BET_STAKE_EUR,
+      handoff_currency:
+        BET_CURRENCY,
+      handoff_stake:
+        BET_STAKE,
+      trading_endpoint:
+        TRADING_STRAIGHT_ENDPOINT,
+      market:
+        BET_MARKET,
+      selection:
+        BET_SELECTION,
+      target_market:
+        TARGET_MARKET,
+      target_submarket:
+        TARGET_SUBMARKET,
+      target_outcome:
+        TARGET_OUTCOME,
+      target_params:
+        TARGET_PARAMS,
+      tracker_is_match_source:
+        true,
+      matcher_lookup:
+        false,
+      fuzzy_fallback:
+        false,
+      direct_cloudbet_match_fallback:
+        false,
+      final_same_event_check:
+        true,
+      current_odds_refresh:
+        true,
+      persistent_pending_retry:
+        true,
+      odds_event_max_retries:
+        ODDS_EVENT_MAX_RETRIES,
+      odds_event_retry_delay_ms:
+        ODDS_EVENT_RETRY_DELAY_MS,
+      retry_same_event:
+        true,
+      retry_same_market:
+        true,
+      retry_same_line:
+        true,
+      account_preflight:
+        true,
+      account_endpoint:
+        "/account-test",
+      handoff_only:
+        true,
+      real_bet_post:
+        false
+    },
+
+    source: {
+      tracker:
+        "/entries",
+      cloudbet_event:
+        "/event?id=CLOUDBET_EVENT_ID"
+    },
+
+    stats: {
+      tracker_signals:
+        trackerSignals.length,
+      hunter_signals:
+        hunterSignals.length,
+      tracker_ready:
+        trackerReady,
+      ready_to_bet:
+        refreshedReady,
+      pending:
+        targetPending,
+      skipped:
+        skipped.length,
+      errors:
+        errors.length
+    },
+
+    account,
+    pending_retry:
+      pendingResult,
+    ready,
+    pending,
+    skipped,
+    errors,
+
+    processing_ms:
+      Date.now() -
+      started
+  };
+}
+
+// ============================================================
+// DIAGNOSTIC
+// ============================================================
+
+async function runDiagnostic(
+  env: Env
+): Promise<any> {
+  const started =
+    Date.now();
+
+  const tracker =
+    await fetchServiceJSON(
+      env.TRACKER,
+      "/entries",
+      SERVICE_TIMEOUT_MS
+    );
+
+  const trackerSignals =
+    tracker.ok
+      ? trackerEntries(
+          tracker.data
+        )
+      : [];
+
+  const diagnostics =
+    trackerSignals.map(
+      signal => ({
+        hunter:
+          hunterFilterDiagnostic(
+            signal
+          ),
+        candidate:
+          trackerCandidateDiagnostic(
+            signal
+          )
+      })
+    );
+
+  return {
+    success:
+      tracker.ok,
+    worker:
+      "cloudbet-bet-worker",
+    version:
+      VERSION,
+    mode:
+      MODE,
+    betting_enabled:
+      BETTING_ENABLED,
+    handoff_enabled:
+      HANDOFF_ENABLED,
+    action:
+      "DIAGNOSTIC",
+
+    architecture: {
+      match_source:
+        "TRACKER V6.7+",
+      tracker_endpoint:
+        "/entries",
+      required_tracker_fields: [
+        "cloudbet.event_id"
+      ],
+      optional_tracker_fields: [
+        "cloudbet.entry_odds",
+        "cloudbet.odds_available",
+        "cloudbet.max_stake",
+        "cloudbet.match",
+        "cloudbet.matcher_score"
+      ],
+      matcher_lookup:
+        false,
+      name_matching:
+        false,
+      fallback_to_other_event:
+        false,
+      final_verification:
+        "/event?id=SAME_CLOUDBET_EVENT_ID",
+      final_handoff:
+        true,
+      real_bet_post:
+        false
+    },
+
+    target: {
+      market:
+        TARGET_MARKET,
+      submarket:
+        TARGET_SUBMARKET,
+      outcome:
+        TARGET_OUTCOME,
+      params:
+        TARGET_PARAMS
+    },
+
+    handoff: {
+      enabled:
+        HANDOFF_ENABLED,
+      currency:
+        BET_CURRENCY,
+      stake:
+        BET_STAKE,
+      endpoint:
+        TRADING_STRAIGHT_ENDPOINT,
+      sent:
+        false
+    },
+
+    tracker: {
+      ok:
+        tracker.ok,
+      status:
+        tracker.status,
+      latency_ms:
+        tracker.latency_ms,
+      signals:
+        trackerSignals.length,
+      raw:
+        tracker.data,
+      error:
+        tracker.error ||
+        null
+    },
+
+    diagnostics,
+
+    processing_ms:
+      Date.now() -
+      started
+  };
+}
+
+// ============================================================
+// PUBLIC TRACKER PROXY
+// ============================================================
+
+async function runEntriesProxy(
+  env: Env
+): Promise<any> {
+  const result =
+    await fetchServiceJSON(
+      env.TRACKER,
+      "/entries",
+      SERVICE_TIMEOUT_MS
+    );
+
+  return {
+    success:
+      result.ok,
+    worker:
+      "cloudbet-bet-worker",
+    version:
+      VERSION,
+    proxy:
+      "TRACKER",
+    endpoint:
+      "/entries",
+    status:
+      result.status,
+    latency_ms:
+      result.latency_ms,
+    data:
+      result.data,
+    error:
+      result.error ||
+      null
+  };
+}
+
+// ============================================================
+// HEALTH
+// ============================================================
+
+function healthResponse():
+  Response {
+  return json({
+    success:
+      true,
+    worker:
+      "cloudbet-bet-worker",
+    version:
+      VERSION,
+    mode:
+      MODE,
+    dry_run:
+      DRY_RUN,
+    betting_enabled:
+      BETTING_ENABLED,
+    handoff_enabled:
+      HANDOFF_ENABLED,
+    status:
+      "OK",
+
+    target: {
+      market:
+        BET_MARKET,
+      selection:
+        TARGET_SELECTION,
+      market_key:
+        TARGET_MARKET,
+      submarket_key:
+        TARGET_SUBMARKET,
+      outcome:
+        TARGET_OUTCOME,
+      params:
+        TARGET_PARAMS
+    },
+
+    architecture: {
+      tracker_match_source:
+        true,
+      matcher_lookup:
+        false,
+      fuzzy_matching:
+        false,
+      cloudbet_fallback:
+        false,
+      exact_event_lock:
+        true,
+      final_event_refresh:
+        true,
+      final_handoff:
+        true,
+      real_bet_post:
+        false
+    },
+
+    cloudbet: {
+      event_endpoint:
+        "/event?id=CLOUDBET_EVENT_ID",
+      persistent_retry:
+        true,
+      max_retries:
+        ODDS_EVENT_MAX_RETRIES,
+      retry_delay_ms:
+        ODDS_EVENT_RETRY_DELAY_MS,
+      retry_same_event:
+        true,
+      retry_same_market:
+        true,
+      retry_same_line:
+        true,
+      trading_endpoint:
+        TRADING_STRAIGHT_ENDPOINT,
+      handoff_only:
+        true
+    },
+
+    endpoints: [
+      "/",
+      "/health",
+      "/run",
+      "/diagnostic",
+      "/entries"
+    ]
+  });
+}
+
+// ============================================================
+// FETCH ROUTER
 // ============================================================
 
 export default {
-
   async fetch(
     request: Request,
     env: Env
   ): Promise<Response> {
-
-    const started =
-      Date.now();
-
     const url =
       new URL(
         request.url
       );
 
-    const pathname =
+    const path =
       url.pathname;
 
-
-    // ========================================================
-    // ROOT
-    // ========================================================
-
-    if (
-      pathname ===
-      "/"
-    ) {
-
-      return json({
-        success:
-          true,
-
-        worker:
-          "cloudbet-match-matcher",
-
-        version:
-          VERSION,
-
-        mode:
-          "READ ONLY",
-
-        fast_hunter:
-          true,
-
-        direct_cloudbet:
-          true,
-
-        filter:
-          "ALL LIVE SOCCER -> 1H + 0:0 + +/-5 MINUTES -> NAME MATCH",
-
-        discovery_market_filter:
-          false,
-
-        odds:
-          "SEPARATE 1H OVER 0.5 LOOKUP AFTER MATCH",
-
-        routes: [
-          "/live",
-          "/match?signals=[...]",
-          "/diagnostic"
-        ]
-      });
-    }
-
-
-    // ========================================================
-    // LIVE + ODDS
-    // ========================================================
-
-    if (
-      pathname ===
-      "/live"
-    ) {
-
-      try {
-
-        const liveStarted =
-          Date.now();
-
-        const events =
-          await getDirectCloudbetLive(
-            false
-          );
-
-        let oddsEvents:
-          AnyObj[] = [];
-
-        try {
-
-          oddsEvents =
-            await getDirectCloudbetLive(
-              true
-            );
-
-        } catch {
-
-          oddsEvents = [];
-        }
-
-        const oddsByEventId =
-          buildOddsEventMap(
-            oddsEvents
-          );
-
-        const matches =
-          events
-            .filter(
-              isHunterEligibleCloudbetEvent
-            )
-            .map(
-              event => {
-
-                const id =
-                  cloudbetEventId(
-                    event
-                  );
-
-                const oddsEvent =
-                  id
-                    ? oddsByEventId.get(
-                        id
-                      ) ??
-                      null
-                    : null;
-
-                return buildCloudbetLiveRecord(
-                  event,
-                  oddsEvent
-                );
-              }
-            );
-
-        const withOdds =
-          matches.filter(
-            x =>
-              x?.odds !==
-              null
-          );
-
+    try {
+      if (
+        path === "/" ||
+        path === ""
+      ) {
         return json({
           success:
             true,
-
           worker:
-            "cloudbet-match-matcher",
-
+            "cloudbet-bet-worker",
           version:
             VERSION,
-
           mode:
-            "READ ONLY",
+            MODE,
+          dry_run:
+            DRY_RUN,
+          betting_enabled:
+            BETTING_ENABLED,
+          handoff_enabled:
+            HANDOFF_ENABLED,
+          status:
+            "ONLINE",
 
-          execution_mode:
-            "LIVE_ODDS",
-
-          source:
-            "DIRECT CLOUDBET PUBLIC SPORTS API",
-
-          event_discovery:
-            "ALL LIVE SOCCER — NO MARKET FILTER",
-
-          odds_lookup:
-            "SEPARATE MARKET QUERY",
+          flow: [
+            "TRACKER /entries",
+            "READ cloudbet.event_id + entry_odds",
+            "LOCK SAME EVENT ID",
+            "CLOUDBET /event?id=EVENT_ID",
+            "VERIFY 1H + 0:0 + OVER 0.5 ENABLED",
+            "REFRESH current_odds",
+            "IF UNAVAILABLE -> PENDING_ODDS",
+            "RETRY SAME EVENT / MARKET / LINE",
+            "READY_TO_BET",
+            "D1 ARCHIVE",
+            "ACCOUNT SNAPSHOT /account-test",
+            "BALANCE + MIN/MAX STAKE PREFLIGHT",
+            "BUILD TRADING API HANDOFF",
+            "STOP — NO REAL POST"
+          ],
 
           target: {
-            sport:
-              "soccer",
-
-            live:
-              true,
-
-            period:
-              "1H",
-
-            score:
-              "0:0",
-
             market:
-              ODDS_MARKET,
-
+              TARGET_MARKET,
             submarket:
-              ODDS_SUBMARKET,
-
-            selection:
-              "OVER 0.5"
+              TARGET_SUBMARKET,
+            outcome:
+              TARGET_OUTCOME,
+            params:
+              TARGET_PARAMS
           },
 
-          summary: {
-            live_1h_00_matches:
-              matches.length,
-
-            odds_found:
-              withOdds.length,
-
-            odds_enabled:
-              withOdds.filter(
-                x =>
-                  x?.odds
-                    ?.available ===
-                  true
-              ).length
+          handoff: {
+            currency:
+              BET_CURRENCY,
+            stake:
+              BET_STAKE,
+            endpoint:
+              TRADING_STRAIGHT_ENDPOINT,
+            enabled:
+              HANDOFF_ENABLED,
+            real_post:
+              false
           },
 
-          matches,
+          safety: {
+            matcher_inside_bet_worker:
+              false,
+            fuzzy_name_matching:
+              false,
+            alternative_event_fallback:
+              false,
+            same_event_only:
+              true,
+            real_betting:
+              false
+          },
 
-          processing_ms:
-            Date.now() -
-            liveStarted,
-
-          timestamp:
-            new Date()
-              .toISOString()
+          endpoints: [
+            "/",
+            "/health",
+            "/run",
+            "/diagnostic",
+            "/entries"
+          ]
         });
+      }
 
-      } catch (
-        error
+      if (
+        path ===
+        "/health"
       ) {
+        return healthResponse();
+      }
 
+      if (
+        path ===
+        "/entries"
+      ) {
         return json(
-          {
-            success:
-              false,
-
-            worker:
-              "cloudbet-match-matcher",
-
-            version:
-              VERSION,
-
-            action:
-              "LIVE",
-
-            error:
-              error instanceof Error
-                ? error.message
-                : String(
-                    error
-                  ),
-
-            processing_ms:
-              Date.now() -
-              started
-          },
-          500
+          await runEntriesProxy(
+            env
+          )
         );
       }
-    }
 
+      if (
+        path ===
+        "/diagnostic"
+      ) {
+        return json(
+          await runDiagnostic(
+            env
+          )
+        );
+      }
 
-    // ========================================================
-    // MATCH
-    // ========================================================
+      if (
+        path ===
+        "/run"
+      ) {
+        return json(
+          await runWorker(
+            env
+          )
+        );
+      }
 
-    if (
-      pathname ===
-      "/match"
+      return json(
+        {
+          success:
+            false,
+          worker:
+            "cloudbet-bet-worker",
+          version:
+            VERSION,
+          error:
+            "Not found",
+          path
+        },
+        404
+      );
+    } catch (
+      error
     ) {
-
-      try {
-
-        const threshold =
-          getThreshold(
-            request
-          );
-
-        const parsed =
-          parseSignalsParam(
-            request
-          );
-
-        if (
-          parsed.rawPresent
-        ) {
-
-          if (
-            parsed.signals.length ===
-            0
-          ) {
-
-            return json({
-              success:
-                true,
-
-              worker:
-                "cloudbet-match-matcher",
-
-              version:
-                VERSION,
-
-              mode:
-                "READ ONLY",
-
-              execution_mode:
-                "FAST_HUNTER",
-
-              stats: {
-                hunter_signals:
-                  0,
-
-                hunter_secure_matches:
-                  0,
-
-                hunter_no_matches:
-                  0,
-
-                hunter_odds_found:
-                  0,
-
-                hunter_odds_available:
-                  0,
-
-                hunter_candidate_evaluations:
-                  0,
-
-                processing_ms:
-                  Date.now() -
-                  started
-              },
-
-              hunter_results:
-                [],
-
-              warning:
-                "signals parameter was present but contained no valid Hunter signals"
-            });
-          }
-
-          return await runFastHunter(
-            env,
-            request,
-            parsed.signals,
-            threshold
-          );
-        }
-
-        return await runLightDiagnostic(
-          env
-        );
-
-      } catch (
-        error
-      ) {
-
-        return json(
-          {
-            success:
-              false,
-
-            worker:
-              "cloudbet-match-matcher",
-
-            version:
-              VERSION,
-
-            action:
-              "MATCH",
-
-            error:
-              error instanceof Error
-                ? error.message
-                : String(
-                    error
-                  ),
-
-            processing_ms:
-              Date.now() -
-              started
-          },
-          500
-        );
-      }
+      return json(
+        {
+          success:
+            false,
+          worker:
+            "cloudbet-bet-worker",
+          version:
+            VERSION,
+          error:
+            error instanceof Error
+              ? error.message
+              : String(error),
+          path
+        },
+        500
+      );
     }
-
-
-    // ========================================================
-    // DIAGNOSTIC
-    // ========================================================
-
-    if (
-      pathname ===
-      "/diagnostic"
-    ) {
-
-      try {
-
-        return await runLightDiagnostic(
-          env
-        );
-
-      } catch (
-        error
-      ) {
-
-        return json(
-          {
-            success:
-              false,
-
-            worker:
-              "cloudbet-match-matcher",
-
-            version:
-              VERSION,
-
-            action:
-              "DIAGNOSTIC",
-
-            error:
-              error instanceof Error
-                ? error.message
-                : String(
-                    error
-                  )
-          },
-          500
-        );
-      }
-    }
-
-
-    // ========================================================
-    // NOT FOUND
-    // ========================================================
-
-    return json(
-      {
-        success:
-          false,
-
-        worker:
-          "cloudbet-match-matcher",
-
-        version:
-          VERSION,
-
-        error:
-          "NOT_FOUND"
-      },
-      404
-    );
   }
 };
