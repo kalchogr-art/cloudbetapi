@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.11 — AUTO PREFLIGHT
+// CLOUDBET LIVE SOCCER DETECTOR V5.11.1 — AUTO PREFLIGHT PERIOD FIX
 //
 // EXISTING PURPOSE:
 // - fast /live for matcher
@@ -23,7 +23,7 @@ interface Env {
 
 type AnyObj = Record<string, any>;
 
-const VERSION = "V5.11 AUTO PREFLIGHT";
+const VERSION = "V5.11.1 AUTO PREFLIGHT PERIOD FIX";
 
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
@@ -50,10 +50,10 @@ const TIMEOUT_MS = 8000;
 // ============================================================
 
 const BET_CONFIG = {
-  ENABLED: false,
+  ENABLED: enable,
   AMOUNT: 0.10,
-  MIN_MINUTE: 10,
-  MAX_MINUTE: 20
+  MIN_MINUTE: 5,
+  MAX_MINUTE: 40
 };
 
 
@@ -2501,24 +2501,127 @@ function preflightScore(
 }
 
 
+function preflightPeriodDebug(
+  event: AnyObj
+): AnyObj {
+
+  return {
+    metadata_eventStatus:
+      event?.metadata?.eventStatus ??
+      null,
+
+    metadata_period:
+      event?.metadata?.period ??
+      null,
+
+    event_status:
+      event?.event_status ??
+      null,
+
+    eventStatus:
+      event?.eventStatus ??
+      null,
+
+    period:
+      event?.period ??
+      null,
+
+    phase:
+      event?.phase ??
+      null,
+
+    status:
+      event?.status ??
+      null
+  };
+}
+
+
 function preflightFirstHalf(
   event: AnyObj
 ): boolean {
 
-  const period =
-    String(
-      event?.metadata?.eventStatus ??
-      event?.event_status ??
-      ""
-    )
-      .trim()
-      .toLowerCase();
+  const values =
+    [
+      event?.metadata?.eventStatus,
+      event?.metadata?.period,
+      event?.event_status,
+      event?.eventStatus,
+      event?.period,
+      event?.phase
+    ]
+      .filter(
+        value =>
+          value !== null &&
+          value !== undefined
+      )
+      .map(
+        value =>
+          String(value)
+            .trim()
+            .toLowerCase()
+      );
+
+  const explicitFirstHalf =
+    values.some(
+      period =>
+        [
+          "1p",
+          "1h",
+          "1",
+          "first_half",
+          "first half",
+          "firsthalf",
+          "period_1",
+          "period1",
+          "1st_half",
+          "1st half"
+        ].includes(period)
+    );
+
+  if (explicitFirstHalf) {
+    return true;
+  }
+
+  const explicitSecondHalf =
+    values.some(
+      period =>
+        [
+          "2p",
+          "2h",
+          "2",
+          "second_half",
+          "second half",
+          "secondhalf",
+          "period_2",
+          "period2",
+          "2nd_half",
+          "2nd half"
+        ].includes(period)
+    );
+
+  if (explicitSecondHalf) {
+    return false;
+  }
+
+  // Cloudbet direct event responses can omit a dedicated period field.
+  // For our configured betting window this is a safe fallback:
+  // a live soccer event at minute <=45 is treated as first half.
+  const minute =
+    preflightEventMinute(
+      event
+    );
+
+  const live =
+    isLive(
+      event
+    );
 
   return (
-    period === "1p" ||
-    period === "1h" ||
-    period === "first_half" ||
-    period === "first half"
+    live &&
+    minute !== null &&
+    minute >= 0 &&
+    minute <= 45
   );
 }
 
@@ -2867,7 +2970,12 @@ async function betPreflight(
 
       minute,
 
-      score
+      score,
+
+      period_debug:
+        preflightPeriodDebug(
+          event
+        )
     },
 
     selection: {
@@ -3012,6 +3120,9 @@ async function autoPreflight(
     event_fetch_failed: 0
   };
 
+  const periodDebugSamples:
+    AnyObj[] = [];
+
   for (
     const rawEvent
     of liveEvents
@@ -3071,6 +3182,33 @@ async function autoPreflight(
 
     if (!firstHalf) {
       rejected.not_first_half++;
+
+      if (
+        periodDebugSamples.length < 10
+      ) {
+        periodDebugSamples.push({
+          event_id:
+            eventId,
+
+          home:
+            event?.home?.name ??
+            event?.home ??
+            null,
+
+          away:
+            event?.away?.name ??
+            event?.away ??
+            null,
+
+          minute,
+
+          period_debug:
+            preflightPeriodDebug(
+              event
+            )
+        });
+      }
+
       continue;
     }
 
@@ -3176,6 +3314,9 @@ async function autoPreflight(
     filtering: {
       ...rejected
     },
+
+    period_debug_samples:
+      periodDebugSamples,
 
     summary: {
       candidates:
