@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.11.1 — AUTO PREFLIGHT PERIOD FIX
+// CLOUDBET LIVE SOCCER DETECTOR V5.12 — SIGNAL DRIVEN PREFLIGHT
 //
 // EXISTING PURPOSE:
 // - fast /live for matcher
@@ -19,11 +19,12 @@
 
 interface Env {
   CLOUDBET_API_KEY?: string;
+  TRACKER?: Fetcher;
 }
 
 type AnyObj = Record<string, any>;
 
-const VERSION = "V5.11.1 AUTO PREFLIGHT PERIOD FIX";
+const VERSION = "V5.12 SIGNAL DRIVEN PREFLIGHT";
 
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
@@ -50,10 +51,10 @@ const TIMEOUT_MS = 8000;
 // ============================================================
 
 const BET_CONFIG = {
-  ENABLED: true,
+  ENABLED: false,
   AMOUNT: 0.10,
-  MIN_MINUTE: 5,
-  MAX_MINUTE: 40
+  MIN_MINUTE: 10,
+  MAX_MINUTE: 20
 };
 
 
@@ -2741,7 +2742,8 @@ async function getAccountBalance(
 
 async function betPreflight(
   env: Env,
-  eventId: string
+  eventId: string,
+  liveContext?: AnyObj
 ): Promise<AnyObj> {
 
   const direct =
@@ -2772,19 +2774,27 @@ async function betPreflight(
   const event =
     direct.event;
 
+  // IMPORTANT:
+  // /events?live=true carries the reliable live clock / phase / score.
+  // /events/{id} is used for the full market tree.
+  // Do not overwrite the live context with the direct event response.
+  const stateEvent =
+    liveContext ??
+    event;
+
   const minute =
     preflightEventMinute(
-      event
+      stateEvent
     );
 
   const score =
     preflightScore(
-      event
+      stateEvent
     );
 
   const firstHalf =
     preflightFirstHalf(
-      event
+      stateEvent
     );
 
   const inMinuteWindow =
@@ -2955,11 +2965,15 @@ async function betPreflight(
         eventId,
 
       home:
+        stateEvent?.home?.name ??
+        stateEvent?.home ??
         event?.home?.name ??
         event?.home ??
         null,
 
       away:
+        stateEvent?.away?.name ??
+        stateEvent?.away ??
         event?.away?.name ??
         event?.away ??
         null,
@@ -2974,7 +2988,7 @@ async function betPreflight(
 
       period_debug:
         preflightPeriodDebug(
-          event
+          stateEvent
         )
     },
 
@@ -3123,6 +3137,9 @@ async function autoPreflight(
   const periodDebugSamples:
     AnyObj[] = [];
 
+  const acceptedLiveStateSamples:
+    AnyObj[] = [];
+
   for (
     const rawEvent
     of liveEvents
@@ -3139,45 +3156,24 @@ async function autoPreflight(
       continue;
     }
 
-    let event =
+    // Keep RAW live event for clock / phase / score.
+    // Direct event is fetched later inside betPreflight() for market data.
+    const liveEvent =
       rawEvent;
-
-    // Use direct event data because list responses are often compact.
-    try {
-
-      const direct =
-        await getEventDirect(
-          env,
-          eventId
-        );
-
-      if (
-        direct?.found &&
-        direct?.event
-      ) {
-        event =
-          direct.event;
-      }
-
-    } catch {
-
-      rejected.event_fetch_failed++;
-      continue;
-    }
 
     const minute =
       preflightEventMinute(
-        event
+        liveEvent
       );
 
     const score =
       preflightScore(
-        event
+        liveEvent
       );
 
     const firstHalf =
       preflightFirstHalf(
-        event
+        liveEvent
       );
 
     if (!firstHalf) {
@@ -3191,20 +3187,20 @@ async function autoPreflight(
             eventId,
 
           home:
-            event?.home?.name ??
-            event?.home ??
+            liveEvent?.home?.name ??
+            liveEvent?.home ??
             null,
 
           away:
-            event?.away?.name ??
-            event?.away ??
+            liveEvent?.away?.name ??
+            liveEvent?.away ??
             null,
 
           minute,
 
           period_debug:
             preflightPeriodDebug(
-              event
+              liveEvent
             )
         });
       }
@@ -3234,10 +3230,39 @@ async function autoPreflight(
       continue;
     }
 
+    if (
+      acceptedLiveStateSamples.length < 10
+    ) {
+      acceptedLiveStateSamples.push({
+        event_id:
+          eventId,
+
+        home:
+          liveEvent?.home?.name ??
+          liveEvent?.home ??
+          null,
+
+        away:
+          liveEvent?.away?.name ??
+          liveEvent?.away ??
+          null,
+
+        minute,
+
+        score,
+
+        period_debug:
+          preflightPeriodDebug(
+            liveEvent
+          )
+      });
+    }
+
     const result =
       await betPreflight(
         env,
-        eventId
+        eventId,
+        liveEvent
       );
 
     candidates.push(
@@ -3318,6 +3343,9 @@ async function autoPreflight(
     period_debug_samples:
       periodDebugSamples,
 
+    accepted_live_state_samples:
+      acceptedLiveStateSamples,
+
     summary: {
       candidates:
         candidates.length,
@@ -3343,6 +3371,820 @@ async function autoPreflight(
       BET_CONFIG.ENABLED
         ? "ENABLED=true, but AUTO PREFLIGHT remains preview-only and sends no real wager."
         : "ENABLED=false. AUTO PREFLIGHT is preview-only."
+  };
+}
+
+
+
+// ============================================================
+// SIGNAL-DRIVEN PREFLIGHT
+//
+// Source of candidates:
+//   TRACKER /entries
+//
+// NO scan of all Cloudbet live events.
+// NO second 1H/0:0 discovery pass.
+// The Tracker/Matcher already supplied the qualified signal and
+// cloudbet_event_id.
+//
+// This worker only checks:
+//   - configured entry-minute window
+//   - exact Cloudbet event id
+//   - exact 1H O0.5 market
+//   - latest line / enabled status
+//   - min/max stake
+//   - account balance
+//
+// PREVIEW ONLY. NO REAL WAGER POST.
+// ============================================================
+
+function trackerArray(
+  data: any
+): AnyObj[] {
+
+  if (Array.isArray(data)) {
+    return data;
+  }
+
+  const candidates =
+    [
+      data?.entries,
+      data?.signals,
+      data?.items,
+      data?.data,
+      data?.results,
+      data?.matches
+    ];
+
+  for (
+    const value
+    of candidates
+  ) {
+    if (Array.isArray(value)) {
+      return value;
+    }
+  }
+
+  return [];
+}
+
+
+function trackerEventId(
+  signal: AnyObj
+): string {
+
+  return String(
+    signal?.cloudbet_event_id ??
+    signal?.cloudbetEventId ??
+    signal?.event_id ??
+    signal?.cloudbet?.event_id ??
+    signal?.cloudbet?.eventId ??
+    ""
+  ).trim();
+}
+
+
+function trackerEntryMinute(
+  signal: AnyObj
+): number | null {
+
+  return finiteNumber(
+    signal?.entry_minute ??
+    signal?.entryMinute ??
+    signal?.signal?.entry_minute ??
+    signal?.minute ??
+    null
+  );
+}
+
+
+function trackerEntryScore(
+  signal: AnyObj
+): AnyObj | null {
+
+  const home =
+    finiteNumber(
+      signal?.entry_home_score ??
+      signal?.entryHomeScore ??
+      signal?.signal?.entry_home_score ??
+      signal?.score?.home ??
+      null
+    );
+
+  const away =
+    finiteNumber(
+      signal?.entry_away_score ??
+      signal?.entryAwayScore ??
+      signal?.signal?.entry_away_score ??
+      signal?.score?.away ??
+      null
+    );
+
+  if (
+    home === null ||
+    away === null
+  ) {
+    return null;
+  }
+
+  return {
+    home,
+    away
+  };
+}
+
+
+function trackerSignalStatus(
+  signal: AnyObj
+): string {
+
+  return String(
+    signal?.status ??
+    signal?.signal?.status ??
+    ""
+  )
+    .trim()
+    .toUpperCase();
+}
+
+
+async function fetchTrackerEntries(
+  env: Env
+): Promise<AnyObj> {
+
+  if (!env.TRACKER) {
+    throw new Error(
+      "TRACKER binding is missing"
+    );
+  }
+
+  const started =
+    Date.now();
+
+  const response =
+    await env.TRACKER.fetch(
+      new Request(
+        "https://tracker.internal/entries",
+        {
+          method:
+            "GET",
+
+          headers: {
+            "Accept":
+              "application/json"
+          }
+        }
+      )
+    );
+
+  const parsed =
+    await readResponse(
+      response
+    );
+
+  return {
+    success:
+      response.ok,
+
+    status:
+      response.status,
+
+    elapsed_ms:
+      Date.now() -
+      started,
+
+    entries:
+      trackerArray(
+        parsed.data
+      ),
+
+    data:
+      parsed.data,
+
+    raw:
+      parsed.raw
+  };
+}
+
+
+async function signalBetPreflight(
+  env: Env,
+  signal: AnyObj
+): Promise<AnyObj> {
+
+  const eventId =
+    trackerEventId(
+      signal
+    );
+
+  const entryMinute =
+    trackerEntryMinute(
+      signal
+    );
+
+  const entryScore =
+    trackerEntryScore(
+      signal
+    );
+
+  const status =
+    trackerSignalStatus(
+      signal
+    );
+
+  const inMinuteWindow =
+    entryMinute !== null &&
+    entryMinute >= BET_CONFIG.MIN_MINUTE &&
+    entryMinute <= BET_CONFIG.MAX_MINUTE;
+
+  if (!eventId) {
+    return {
+      success:
+        true,
+
+      ready_to_place_bet:
+        false,
+
+      reason:
+        "MISSING_CLOUDBET_EVENT_ID",
+
+      signal: {
+        id:
+          signal?.id ??
+          null,
+
+        match:
+          signal?.match_name ??
+          signal?.match ??
+          signal?.signal?.match ??
+          null,
+
+        status,
+
+        entry_minute:
+          entryMinute,
+
+        entry_score:
+          entryScore
+      }
+    };
+  }
+
+  if (!inMinuteWindow) {
+    return {
+      success:
+        true,
+
+      ready_to_place_bet:
+        false,
+
+      reason:
+        "ENTRY_MINUTE_OUTSIDE_CONFIG",
+
+      event_id:
+        eventId,
+
+      config:
+        BET_CONFIG,
+
+      signal: {
+        id:
+          signal?.id ??
+          null,
+
+        match:
+          signal?.match_name ??
+          signal?.match ??
+          signal?.signal?.match ??
+          null,
+
+        status,
+
+        entry_minute:
+          entryMinute,
+
+        entry_score:
+          entryScore
+      }
+    };
+  }
+
+  const direct =
+    await getEventDirect(
+      env,
+      eventId
+    );
+
+  if (
+    !direct?.found ||
+    !direct?.event
+  ) {
+    return {
+      success:
+        false,
+
+      ready_to_place_bet:
+        false,
+
+      reason:
+        "CLOUDBET_EVENT_NOT_FOUND",
+
+      event_id:
+        eventId,
+
+      signal: {
+        id:
+          signal?.id ??
+          null,
+
+        match:
+          signal?.match_name ??
+          signal?.match ??
+          null,
+
+        status,
+
+        entry_minute:
+          entryMinute,
+
+        entry_score:
+          entryScore
+      }
+    };
+  }
+
+  const event =
+    direct.event;
+
+  const target =
+    findExactTarget(
+      event
+    );
+
+  if (!target) {
+    return {
+      success:
+        true,
+
+      ready_to_place_bet:
+        false,
+
+      reason:
+        "TARGET_NOT_FOUND",
+
+      event_id:
+        eventId,
+
+      signal: {
+        id:
+          signal?.id ??
+          null,
+
+        match:
+          signal?.match_name ??
+          signal?.match ??
+          null,
+
+        status,
+
+        entry_minute:
+          entryMinute,
+
+        entry_score:
+          entryScore
+      }
+    };
+  }
+
+  const marketUrl =
+    String(
+      target?.marketUrl ??
+      TARGET_MARKET_URL
+    ).trim();
+
+  const line =
+    await latestLineFetch(
+      env,
+      eventId,
+      marketUrl
+    );
+
+  const price =
+    finiteNumber(
+      line?.line?.price
+    );
+
+  const minStake =
+    finiteNumber(
+      line?.line?.minStake
+    );
+
+  const maxStake =
+    finiteNumber(
+      line?.line?.maxStake
+    );
+
+  const selectionEnabled =
+    line?.available ===
+    true;
+
+  const amount =
+    Number(
+      BET_CONFIG.AMOUNT
+    );
+
+  const stakeAboveMin =
+    minStake !== null &&
+    Number.isFinite(amount) &&
+    amount >= minStake;
+
+  const stakeBelowMax =
+    maxStake !== null &&
+    Number.isFinite(amount) &&
+    amount <= maxStake;
+
+  const priceValid =
+    price !== null &&
+    price > 1;
+
+  const currency =
+    "USDT";
+
+  const balance =
+    await getAccountBalance(
+      env,
+      currency
+    );
+
+  const balanceEnough =
+    balance?.success === true &&
+    balance?.amount !== null &&
+    balance.amount >= amount;
+
+  const ready =
+    inMinuteWindow &&
+    selectionEnabled &&
+    priceValid &&
+    stakeAboveMin &&
+    stakeBelowMax &&
+    balanceEnough;
+
+  const payload =
+    ready
+      ? buildStraightBetPayload(
+          eventId,
+          marketUrl,
+          price as number,
+          amount,
+          currency
+        )
+      : null;
+
+  return {
+    success:
+      true,
+
+    action:
+      "SIGNAL_BET_PREFLIGHT",
+
+    read_only:
+      true,
+
+    wager_sent:
+      false,
+
+    place_bet_called:
+      false,
+
+    betting_enabled_setting:
+      BET_CONFIG.ENABLED,
+
+    ready_to_place_bet:
+      ready,
+
+    config:
+      BET_CONFIG,
+
+    signal: {
+      id:
+        signal?.id ??
+        null,
+
+      match:
+        signal?.match_name ??
+        signal?.match ??
+        signal?.signal?.match ??
+        null,
+
+      status,
+
+      hunter_score:
+        finiteNumber(
+          signal?.hunter_score ??
+          signal?.signal?.hunter_score ??
+          signal?.signal?.score ??
+          null
+        ),
+
+      entry_minute:
+        entryMinute,
+
+      entry_score:
+        entryScore,
+
+      cloudbet_event_id:
+        eventId
+    },
+
+    cloudbet: {
+      event_id:
+        eventId,
+
+      home:
+        event?.home?.name ??
+        event?.home ??
+        null,
+
+      away:
+        event?.away?.name ??
+        event?.away ??
+        null,
+
+      event_status:
+        event?.status ??
+        null,
+
+      market:
+        target?.market ??
+        null,
+
+      market_url:
+        marketUrl,
+
+      selection_status:
+        line?.line?.status ??
+        null,
+
+      price,
+
+      min_stake:
+        minStake,
+
+      max_stake:
+        maxStake
+    },
+
+    account: {
+      currency,
+
+      balance:
+        balance?.amount ??
+        null
+    },
+
+    checks: {
+      tracker_event_id_present:
+        true,
+
+      entry_minute_known:
+        entryMinute !== null,
+
+      entry_minute_in_config:
+        inMinuteWindow,
+
+      target_found:
+        true,
+
+      selection_enabled:
+        selectionEnabled,
+
+      price_valid:
+        priceValid,
+
+      stake_above_min:
+        stakeAboveMin,
+
+      stake_below_max:
+        stakeBelowMax,
+
+      balance_sufficient:
+        balanceEnough
+    },
+
+    would_send:
+      payload
+  };
+}
+
+
+async function trackerSignalPreflight(
+  env: Env
+): Promise<AnyObj> {
+
+  const started =
+    Date.now();
+
+  const tracker =
+    await fetchTrackerEntries(
+      env
+    );
+
+  if (!tracker.success) {
+    return {
+      success:
+        false,
+
+      action:
+        "TRACKER_SIGNAL_PREFLIGHT",
+
+      read_only:
+        true,
+
+      wager_sent:
+        false,
+
+      place_bet_called:
+        false,
+
+      tracker_status:
+        tracker.status,
+
+      tracker_raw:
+        tracker.raw
+    };
+  }
+
+  const allSignals =
+    tracker.entries;
+
+  // Prefer active TRACKING signals.
+  // If Tracker uses another active status, signals with a Cloudbet event id
+  // are still retained below as long as they are not explicitly final.
+  const finalStatuses =
+    new Set(
+      [
+        "GOAL",
+        "NO_GOAL",
+        "COMPLETED",
+        "SETTLED",
+        "CANCELLED"
+      ]
+    );
+
+  const candidates =
+    allSignals.filter(
+      signal => {
+
+        const eventId =
+          trackerEventId(
+            signal
+          );
+
+        const status =
+          trackerSignalStatus(
+            signal
+          );
+
+        return (
+          Boolean(eventId) &&
+          !finalStatuses.has(status)
+        );
+      }
+    );
+
+  const unique:
+    AnyObj[] = [];
+
+  const seen =
+    new Set<string>();
+
+  for (
+    const signal
+    of candidates
+  ) {
+
+    const eventId =
+      trackerEventId(
+        signal
+      );
+
+    if (
+      !eventId ||
+      seen.has(eventId)
+    ) {
+      continue;
+    }
+
+    seen.add(eventId);
+    unique.push(signal);
+  }
+
+  const results:
+    AnyObj[] = [];
+
+  for (
+    const signal
+    of unique
+  ) {
+
+    try {
+
+      results.push(
+        await signalBetPreflight(
+          env,
+          signal
+        )
+      );
+
+    } catch (
+      error
+    ) {
+
+      results.push({
+        success:
+          false,
+
+        ready_to_place_bet:
+          false,
+
+        event_id:
+          trackerEventId(
+            signal
+          ),
+
+        error:
+          error instanceof Error
+            ? error.message
+            : String(error)
+      });
+    }
+  }
+
+  const ready =
+    results.filter(
+      item =>
+        item?.ready_to_place_bet ===
+        true
+    );
+
+  return {
+    success:
+      true,
+
+    action:
+      "TRACKER_SIGNAL_PREFLIGHT",
+
+    architecture:
+      "TRACKER -> cloudbet_event_id -> DIRECT EVENT -> LINE -> ACCOUNT",
+
+    read_only:
+      true,
+
+    wager_sent:
+      false,
+
+    place_bet_called:
+      false,
+
+    betting_enabled_setting:
+      BET_CONFIG.ENABLED,
+
+    config:
+      BET_CONFIG,
+
+    tracker: {
+      status:
+        tracker.status,
+
+      elapsed_ms:
+        tracker.elapsed_ms,
+
+      entries_received:
+        allSignals.length,
+
+      signals_with_event_id:
+        candidates.length,
+
+      unique_event_ids:
+        unique.length
+    },
+
+    summary: {
+      checked_signals:
+        results.length,
+
+      ready_to_place_bet:
+        ready.length,
+
+      elapsed_ms:
+        Date.now() -
+        started
+    },
+
+    ready_candidates:
+      ready,
+
+    results
   };
 }
 
@@ -3406,7 +4248,8 @@ export default {
           "/trading-access-test",
           "/all-live-line-audit",
           "/bet-preflight?id=EVENT_ID",
-          "/auto-preflight"
+          "/auto-preflight",
+          "/signal-preflight"
         ]
       });
     }
@@ -4249,6 +5092,70 @@ export default {
 
             action:
               "AUTO_PREFLIGHT",
+
+            read_only:
+              true,
+
+            wager_sent:
+              false,
+
+            place_bet_called:
+              false,
+
+            error:
+              error instanceof Error
+                ? error.message
+                : String(error)
+          },
+          500
+        );
+      }
+    }
+
+
+    // ========================================================
+    // SIGNAL-DRIVEN PREFLIGHT — TRACKER SOURCE
+    // ========================================================
+
+    if (
+      path ===
+      "/signal-preflight"
+    ) {
+
+      try {
+
+        const result =
+          await trackerSignalPreflight(
+            env
+          );
+
+        return json({
+          worker:
+            "cloudbet-live-soccer-detector",
+
+          version:
+            VERSION,
+
+          ...result
+        });
+
+      } catch (
+        error
+      ) {
+
+        return json(
+          {
+            success:
+              false,
+
+            worker:
+              "cloudbet-live-soccer-detector",
+
+            version:
+              VERSION,
+
+            action:
+              "TRACKER_SIGNAL_PREFLIGHT",
 
             read_only:
               true,
