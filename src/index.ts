@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET LIVE SOCCER DETECTOR V5.9.3 — TRADING PREFLIGHT
+// CLOUDBET LIVE SOCCER DETECTOR V5.9.4 — ACTIVE SELECTION FIX
 //
 // EXISTING PURPOSE:
 // - fast /live for matcher
@@ -9,7 +9,7 @@
 // - /event uses direct event endpoint
 // - /line-test preserved for diagnostics
 //
-// V5.9.3:
+// V5.9.4:
 // - Added /account-test
 // - Uses official Cloudbet REST Account API
 // - Reads currencies and balance for each currency
@@ -23,7 +23,7 @@ interface Env {
 
 type AnyObj = Record<string, any>;
 
-const VERSION = "V5.9.3 TRADING PREFLIGHT";
+const VERSION = "V5.9.4 ACTIVE SELECTION FIX";
 
 const API_BASE =
   "https://sports-api.cloudbet.com/pub/v2/odds";
@@ -553,11 +553,14 @@ async function getEventDirect(
 // EXACT 1H OVER 0.5 TARGET
 // ============================================================
 
-function inspectSelections(
+function collectMatchingSelections(
   marketKey: string,
   market: AnyObj,
   require1h: boolean
-): AnyObj | null {
+): AnyObj[] {
+
+  const results:
+    AnyObj[] = [];
 
   const submarkets =
     market?.submarkets;
@@ -567,7 +570,7 @@ function inspectSelections(
     typeof submarkets !==
       "object"
   ) {
-    return null;
+    return results;
   }
 
   for (
@@ -612,6 +615,7 @@ function inspectSelections(
           selection?.outcome ??
           ""
         )
+          .trim()
           .toLowerCase() !==
         "over"
       ) {
@@ -623,6 +627,7 @@ function inspectSelections(
           selection?.params ??
           ""
         )
+          .trim()
           .toLowerCase();
 
       if (
@@ -656,16 +661,27 @@ function inspectSelections(
           .trim()
           .toUpperCase();
 
-      const enabled =
+      const statusEnabled =
         !status ||
         [
           "SELECTION_ENABLED",
           "OPEN",
           "TRADING",
           "ACTIVE"
-        ].includes(status);
+        ].includes(
+          status
+        );
 
-      return {
+      const enabled =
+        statusEnabled &&
+        price !== null &&
+        price > 1 &&
+        (
+          maxStake === null ||
+          maxStake > 0
+        );
+
+      results.push({
         market:
           marketKey,
 
@@ -698,28 +714,24 @@ function inspectSelections(
 
         maxStake,
 
-        enabled:
-          enabled &&
-          price !== null &&
-          price > 1 &&
-          (
-            maxStake === null ||
-            maxStake > 0
-          ),
+        status_enabled:
+          statusEnabled,
+
+        enabled,
 
         target:
           true
-      };
+      });
     }
   }
 
-  return null;
+  return results;
 }
 
 
-function findExactTarget(
+function findExactTargets(
   event: AnyObj
-): AnyObj | null {
+): AnyObj[] {
 
   const markets =
     event?.markets;
@@ -729,8 +741,11 @@ function findExactTarget(
     typeof markets !==
       "object"
   ) {
-    return null;
+    return [];
   }
+
+  const candidates:
+    AnyObj[] = [];
 
   const legacy =
     markets[
@@ -742,16 +757,13 @@ function findExactTarget(
     typeof legacy ===
       "object"
   ) {
-    const found =
-      inspectSelections(
+    candidates.push(
+      ...collectMatchingSelections(
         "soccer.total_goals_period_first_half",
         legacy,
         false
-      );
-
-    if (found) {
-      return found;
-    }
+      )
+    );
   }
 
   const generic =
@@ -764,19 +776,97 @@ function findExactTarget(
     typeof generic ===
       "object"
   ) {
-    const found =
-      inspectSelections(
+    candidates.push(
+      ...collectMatchingSelections(
         "soccer.total_goals",
         generic,
         true
-      );
-
-    if (found) {
-      return found;
-    }
+      )
+    );
   }
 
-  return null;
+  return candidates;
+}
+
+
+function findExactTarget(
+  event: AnyObj
+): AnyObj | null {
+
+  const candidates =
+    findExactTargets(
+      event
+    );
+
+  if (
+    candidates.length ===
+    0
+  ) {
+    return null;
+  }
+
+  // IMPORTANT:
+  // Prefer an actually tradable target.
+  // Older code returned the first matching legacy selection even
+  // when it was disabled, which could hide an active generic 1H market.
+  const active =
+    candidates.find(
+      candidate =>
+        candidate?.enabled ===
+        true
+    );
+
+  if (active) {
+    return {
+      ...active,
+      selection_source:
+        "ACTIVE_PREFERRED",
+      candidates_checked:
+        candidates.length
+    };
+  }
+
+  // Diagnostic fallback only: return the best matching disabled selection.
+  const fallback =
+    candidates
+      .slice()
+      .sort(
+        (a, b) => {
+          const ap =
+            finiteNumber(
+              a?.price
+            ) ?? 0;
+
+          const bp =
+            finiteNumber(
+              b?.price
+            ) ?? 0;
+
+          const am =
+            finiteNumber(
+              a?.maxStake
+            ) ?? 0;
+
+          const bm =
+            finiteNumber(
+              b?.maxStake
+            ) ?? 0;
+
+          if (bp !== ap) {
+            return bp - ap;
+          }
+
+          return bm - am;
+        }
+      )[0];
+
+  return {
+    ...fallback,
+    selection_source:
+      "DISABLED_DIAGNOSTIC_FALLBACK",
+    candidates_checked:
+      candidates.length
+  };
 }
 
 
@@ -1244,6 +1334,13 @@ async function tradingPreflight(
       eventId
     );
 
+  const targetCandidates =
+    eventResult.event
+      ? findExactTargets(
+          eventResult.event
+        )
+      : [];
+
   const target =
     eventResult.event
       ? findExactTarget(
@@ -1405,6 +1502,12 @@ async function tradingPreflight(
           ?.status ??
         null
     },
+
+    selection_candidates:
+      targetCandidates,
+
+    selection_candidates_count:
+      targetCandidates.length,
 
     selection: target
       ? {
@@ -1755,6 +1858,13 @@ export default {
               )
             : null;
 
+        const targetCandidates =
+          result.event
+            ? findExactTargets(
+                result.event
+              )
+            : [];
+
         return json({
           success:
             result.found,
@@ -1780,6 +1890,12 @@ export default {
           ...result,
 
           target,
+
+          target_candidates:
+            targetCandidates,
+
+          target_candidates_count:
+            targetCandidates.length,
 
           target_available:
             !!target
