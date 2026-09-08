@@ -1,17 +1,19 @@
 // ============================================================
-// CLOUDBET BET WORKER V7.2.0
-// DRY RUN · TRACKER READY CANDIDATE · FINAL HANDOFF
+// CLOUDBET BET WORKER V7.3.0
+// DRY RUN · TRACKER READY CANDIDATE · EXACT MATCHER ODDS REFRESH
 // EXACT 1H TOTAL GOALS OVER 0.5
 //
-// V7.2.0:
-// - BASED ON V7.0.2
+// V7.3.0:
+// - BASED ON FULL V7.2.0
 // - TRACKER /entries is the ONLY source for matched Cloudbet event_id
 // - Uses Tracker cloudbet.entry_odds / odds_available / matcher_score
-// - NO matcher lookup inside Bet Worker
+// - MATCHER is used ONLY to refresh exact odds for SAME event_id
+// - NO matcher team/name lookup inside Bet Worker
 // - NO fuzzy name matching inside Bet Worker
 // - NO direct Cloudbet fallback to another event
 // - Final verification is locked to SAME Cloudbet event_id
-// - Refreshes SAME event through /event?id=EVENT_ID before READY_TO_BET
+// - /event?id=EVENT_ID verifies SAME event + state
+// - MATCHER /live refreshes exact 1H O0.5 odds for SAME event_id
 // - Keeps entry_odds and current_odds separately
 // - Persistent pending_odds retry preserved for SAME EVENT / MARKET / LINE
 // - D1 bet_archive preserved
@@ -28,6 +30,7 @@
 interface Env {
   TRACKER: Fetcher;
   CLOUDBET: Fetcher;
+  MATCHER: Fetcher;
   DB: D1Database;
 }
 
@@ -38,7 +41,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.2.0 ACCOUNT PREFLIGHT";
+  "V7.3.0 EXACT MATCHER ODDS REFRESH";
 
 const MODE =
   "DRY_RUN";
@@ -1629,6 +1632,283 @@ function findTargetSelection(
 }
 
 // ============================================================
+// V7.3.0 — EXACT ODDS FROM MATCHER /live
+//
+// IMPORTANT:
+// - MATCHER IS NOT USED TO FIND / MATCH TEAMS HERE
+// - Tracker remains the ONLY source of matched event_id
+// - NO names
+// - NO fuzzy matching
+// - NO alternative event
+// - Lookup below is EXACT SAME event_id only
+// ============================================================
+
+interface MatcherOddsResult {
+  success: boolean;
+  event_id: string | null;
+  match: string | null;
+  current_odds: number | null;
+  max_stake: number | null;
+  min_stake: number | null;
+  selection_status: string | null;
+  market_url: string | null;
+  available: boolean;
+  error?: string;
+}
+
+function matcherLiveMatches(
+  data: any
+): any[] {
+  if (!data) {
+    return [];
+  }
+
+  if (
+    Array.isArray(
+      data.matches
+    )
+  ) {
+    return data.matches;
+  }
+
+  if (
+    Array.isArray(
+      data.data?.matches
+    )
+  ) {
+    return data.data.matches;
+  }
+
+  return [];
+}
+
+async function fetchExactMatcherOdds(
+  env: Env,
+  expectedEventId: string
+): Promise<MatcherOddsResult> {
+  const expected =
+    normalizeEventId(
+      expectedEventId
+    );
+
+  if (!expected) {
+    return {
+      success:
+        false,
+      event_id:
+        null,
+      match:
+        null,
+      current_odds:
+        null,
+      max_stake:
+        null,
+      min_stake:
+        null,
+      selection_status:
+        null,
+      market_url:
+        null,
+      available:
+        false,
+      error:
+        "CLOUDBET_EVENT_ID_MISSING"
+    };
+  }
+
+  const result =
+    await fetchServiceJSON(
+      env.MATCHER,
+      "/live",
+      SERVICE_TIMEOUT_MS
+    );
+
+  if (!result.ok) {
+    return {
+      success:
+        false,
+      event_id:
+        expected,
+      match:
+        null,
+      current_odds:
+        null,
+      max_stake:
+        null,
+      min_stake:
+        null,
+      selection_status:
+        null,
+      market_url:
+        null,
+      available:
+        false,
+      error:
+        result.error ||
+        "MATCHER_LIVE_FAILED"
+    };
+  }
+
+  const matches =
+    matcherLiveMatches(
+      result.data
+    );
+
+  const exact =
+    matches.find(
+      row =>
+        normalizeEventId(
+          row?.event_id ??
+          row?.id ??
+          null
+        ) ===
+        expected
+    );
+
+  if (!exact) {
+    return {
+      success:
+        false,
+      event_id:
+        expected,
+      match:
+        null,
+      current_odds:
+        null,
+      max_stake:
+        null,
+      min_stake:
+        null,
+      selection_status:
+        null,
+      market_url:
+        null,
+      available:
+        false,
+      error:
+        "EXACT_ODDS_EVENT_NOT_FOUND"
+    };
+  }
+
+  const odds =
+    exact?.odds ??
+    null;
+
+  if (!odds) {
+    return {
+      success:
+        false,
+      event_id:
+        expected,
+      match:
+        safe(
+          exact?.match
+        ) || null,
+      current_odds:
+        null,
+      max_stake:
+        null,
+      min_stake:
+        null,
+      selection_status:
+        null,
+      market_url:
+        null,
+      available:
+        false,
+      error:
+        "TARGET_ODDS_NOT_AVAILABLE"
+    };
+  }
+
+  const currentOdds =
+    numberOrNull(
+      odds?.price ??
+      odds?.raw_price ??
+      null
+    );
+
+  const selectionStatus =
+    safe(
+      odds?.selection_status ??
+      odds?.status ??
+      ""
+    ) || null;
+
+  const available =
+    odds?.available ===
+      true &&
+    selectionStatus ===
+      "SELECTION_ENABLED" &&
+    currentOdds !==
+      null &&
+    currentOdds >
+      1;
+
+  if (!available) {
+    return {
+      success:
+        false,
+      event_id:
+        expected,
+      match:
+        safe(
+          exact?.match
+        ) || null,
+      current_odds:
+        currentOdds,
+      max_stake:
+        numberOrNull(
+          odds?.max_stake
+        ),
+      min_stake:
+        numberOrNull(
+          odds?.min_stake
+        ),
+      selection_status:
+        selectionStatus,
+      market_url:
+        safe(
+          odds?.market_url
+        ) || null,
+      available:
+        false,
+      error:
+        "TARGET_ODDS_NOT_AVAILABLE"
+    };
+  }
+
+  return {
+    success:
+      true,
+    event_id:
+      expected,
+    match:
+      safe(
+        exact?.match
+      ) || null,
+    current_odds:
+      currentOdds,
+    max_stake:
+      numberOrNull(
+        odds?.max_stake
+      ),
+    min_stake:
+      numberOrNull(
+        odds?.min_stake
+      ),
+    selection_status:
+      selectionStatus,
+    market_url:
+      safe(
+        odds?.market_url
+      ) || null,
+    available:
+      true
+  };
+}
+
+// ============================================================
 // FINAL EVENT CHECK
 // ============================================================
 
@@ -1650,6 +1930,11 @@ async function verifySameEventAndOdds(
   expectedEventId: string
 ): Promise<CurrentOddsResult> {
   try {
+    // ========================================================
+    // STEP 1 — SAME EVENT VERIFICATION
+    // /event is used only to verify SAME event_id and state.
+    // ========================================================
+
     const event =
       await fetchCloudbetEvent(
         env,
@@ -1691,6 +1976,11 @@ async function verifySameEventAndOdds(
       };
     }
 
+    // ========================================================
+    // STEP 2 — SAME EVENT MUST STILL BE VALID
+    // 0:0 + first half + <=45.
+    // ========================================================
+
     const validation =
       eventStillValidForTarget(
         event
@@ -1721,13 +2011,24 @@ async function verifySameEventAndOdds(
       };
     }
 
-    const selection =
-      findTargetSelection(
-        event
+    // ========================================================
+    // STEP 3 — V7.3.0 FIX
+    //
+    // Do NOT use recursive /event market parsing for final odds.
+    // Matcher /live already exposes exact Cloudbet 1H O0.5 odds.
+    //
+    // We do NOT ask Matcher to match names here.
+    // We locate ONLY the SAME exact event_id from Tracker.
+    // ========================================================
+
+    const matcherOdds =
+      await fetchExactMatcherOdds(
+        env,
+        expectedEventId
       );
 
     if (
-      !selection
+      !matcherOdds.success
     ) {
       return {
         success:
@@ -1735,64 +2036,37 @@ async function verifySameEventAndOdds(
         event_id:
           expectedEventId,
         current_odds:
-          null,
+          matcherOdds
+            .current_odds,
         max_stake:
-          null,
+          matcherOdds
+            .max_stake,
         min_stake:
-          null,
+          matcherOdds
+            .min_stake,
         selection_status:
-          null,
+          matcherOdds
+            .selection_status,
         market_url:
-          null,
+          matcherOdds
+            .market_url,
         event,
-        validation,
+        validation: {
+          ...validation,
+          odds_source:
+            "MATCHER_LIVE_EXACT_EVENT_ID",
+          exact_event_id:
+            true
+        },
         error:
-          "TARGET_SELECTION_NOT_AVAILABLE"
-      };
-    }
-
-    const currentOdds =
-      extractPrice(
-        selection
-      );
-
-    if (
-      currentOdds ===
-      null
-    ) {
-      return {
-        success:
-          false,
-        event_id:
-          expectedEventId,
-        current_odds:
-          null,
-        max_stake:
-          selectionMaxStake(
-            selection
-          ),
-        min_stake:
-          selectionMinStake(
-            selection
-          ),
-        selection_status:
-          safe(
-            selection?.status ||
-            selection?.state ||
-            ""
-          ) || null,
-        market_url:
-          safe(
-            selection?.marketUrl ||
-            selection?.market_url ||
-            ""
-          ) || null,
-        event,
-        validation,
-        error:
+          matcherOdds.error ||
           "TARGET_ODDS_NOT_AVAILABLE"
       };
     }
+
+    // ========================================================
+    // STEP 4 — SAME EVENT + VALID STATE + EXACT ENABLED ODDS
+    // ========================================================
 
     return {
       success:
@@ -1800,29 +2074,28 @@ async function verifySameEventAndOdds(
       event_id:
         expectedEventId,
       current_odds:
-        currentOdds,
+        matcherOdds
+          .current_odds,
       max_stake:
-        selectionMaxStake(
-          selection
-        ),
+        matcherOdds
+          .max_stake,
       min_stake:
-        selectionMinStake(
-          selection
-        ),
+        matcherOdds
+          .min_stake,
       selection_status:
-        safe(
-          selection?.status ||
-          selection?.state ||
-          ""
-        ) || null,
+        matcherOdds
+          .selection_status,
       market_url:
-        safe(
-          selection?.marketUrl ||
-          selection?.market_url ||
-          ""
-        ) || null,
+        matcherOdds
+          .market_url,
       event,
-      validation
+      validation: {
+        ...validation,
+        odds_source:
+          "MATCHER_LIVE_EXACT_EVENT_ID",
+        exact_event_id:
+          true
+      }
     };
   } catch (
     error
@@ -3411,7 +3684,15 @@ async function runWorker(
       tracker_is_match_source:
         true,
       matcher_lookup:
+        true,
+      matcher_used_for_matching:
         false,
+      matcher_used_for_exact_odds:
+        true,
+      matcher_odds_endpoint:
+        "/live",
+      matcher_odds_event_lock:
+        "EXACT_EVENT_ID_ONLY",
       fuzzy_fallback:
         false,
       direct_cloudbet_match_fallback:
@@ -3446,7 +3727,9 @@ async function runWorker(
       tracker:
         "/entries",
       cloudbet_event:
-        "/event?id=CLOUDBET_EVENT_ID"
+        "/event?id=CLOUDBET_EVENT_ID",
+      current_odds:
+        "MATCHER /live -> EXACT SAME EVENT_ID"
     },
 
     stats: {
@@ -3550,13 +3833,25 @@ async function runDiagnostic(
         "cloudbet.matcher_score"
       ],
       matcher_lookup:
+        true,
+      matcher_purpose:
+        "EXACT_ODDS_ONLY",
+      matcher_name_matching:
         false,
+      matcher_event_selection:
+        false,
+      matcher_odds_endpoint:
+        "/live",
+      matcher_event_lock:
+        "EXACT_EVENT_ID_ONLY",
       name_matching:
         false,
       fallback_to_other_event:
         false,
       final_verification:
         "/event?id=SAME_CLOUDBET_EVENT_ID",
+      current_odds_source:
+        "MATCHER /live EXACT SAME EVENT_ID",
       final_handoff:
         true,
       real_bet_post:
@@ -3691,7 +3986,13 @@ function healthResponse():
       tracker_match_source:
         true,
       matcher_lookup:
+        true,
+      matcher_used_for_matching:
         false,
+      matcher_used_for_exact_odds:
+        true,
+      matcher_odds_endpoint:
+        "/live",
       fuzzy_matching:
         false,
       cloudbet_fallback:
@@ -3700,6 +4001,8 @@ function healthResponse():
         true,
       final_event_refresh:
         true,
+      current_odds_source:
+        "MATCHER /live EXACT EVENT_ID",
       final_handoff:
         true,
       real_bet_post:
@@ -3782,8 +4085,10 @@ export default {
             "READ cloudbet.event_id + entry_odds",
             "LOCK SAME EVENT ID",
             "CLOUDBET /event?id=EVENT_ID",
-            "VERIFY 1H + 0:0 + OVER 0.5 ENABLED",
-            "REFRESH current_odds",
+            "VERIFY SAME EVENT + 1H + 0:0",
+            "MATCHER /live",
+            "FIND EXACT SAME EVENT_ID ONLY",
+            "REFRESH exact 1H OVER 0.5 current_odds",
             "IF UNAVAILABLE -> PENDING_ODDS",
             "RETRY SAME EVENT / MARKET / LINE",
             "READY_TO_BET",
@@ -3820,6 +4125,12 @@ export default {
 
           safety: {
             matcher_inside_bet_worker:
+              true,
+            matcher_purpose:
+              "EXACT_ODDS_ONLY",
+            matcher_name_matching:
+              false,
+            matcher_event_selection:
               false,
             fuzzy_name_matching:
               false,
@@ -3896,7 +4207,7 @@ export default {
         404
       );
     } catch (
-      error
+    error
     ) {
       return json(
         {
