@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7.6.0
+// CLOUDBET MATCH MATCHER V7.6.2
 // CANDIDATE RANKING + D1 DIAGNOSTICS + SEPARATE ODDS LOOKUP
 // LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
 // V27 SERVICE BINDING + DIRECT CLOUDBET PUBLIC SPORTS API
@@ -27,6 +27,12 @@
 // - /diagnostic
 //   -> light V27 + Cloudbet diagnostic
 //
+// V7.6.2 FIXES:
+// - full +/-5 minute candidate audit (token index can no longer hide a valid event)
+// - women/female markers removed from team identity while category protection remains
+// - conservative consonant-signature recovery for transliteration variants
+// - unmatched response preserves best Cloudbet candidate + exact scoring diagnostics
+//
 // READ ONLY:
 // - no login
 // - no auth
@@ -44,7 +50,7 @@ interface Env {
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.6.1-CONTEXT-FALLBACK-UNIQUE-D1-SAFE";
+  "V7.6.2-CANDIDATE-AUDIT-NAME-NORMALIZATION";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -349,7 +355,8 @@ const GENERIC_WORDS =
     "spa",
     "srl",
     "football",
-    "soccer"
+    "soccer",
+    "al"
   ]);
 
 
@@ -364,6 +371,22 @@ const WEAK_TEAM_TOKENS =
     "deportivo",
     "olympic",
     "olympique"
+  ]);
+
+
+// Provider labels that describe the team category, not the club identity.
+// teamCategory() still sees the original name before these markers are removed.
+const TEAM_CATEGORY_TOKENS =
+  new Set([
+    "w",
+    "women",
+    "woman",
+    "ladies",
+    "female",
+    "femenil",
+    "femenino",
+    "feminino",
+    "feminina"
   ]);
 
 
@@ -412,6 +435,9 @@ function normalizeTeam(
       .filter(
         token =>
           !GENERIC_WORDS.has(
+            token
+          ) &&
+          !TEAM_CATEGORY_TOKENS.has(
             token
           )
       );
@@ -623,6 +649,16 @@ function levenshtein(
 }
 
 
+function consonantSignature(
+  value: string
+): string {
+
+  return value
+    .replace(/[aeiouy]/g, "")
+    .replace(/(.)\1+/g, "$1");
+}
+
+
 function tokenSimilarity(
   a: string,
   b: string
@@ -660,6 +696,28 @@ function tokenSimilarity(
         b.length
       )
     );
+  }
+
+  // V7.6.2: conservative transliteration recovery.
+  // Example: qadsiah <-> qadisiyah => qdsh.
+  // Only long tokens with an identical consonant signature qualify.
+  if (
+    a.length >= 5 &&
+    b.length >= 5
+  ) {
+
+    const aSignature =
+      consonantSignature(a);
+
+    const bSignature =
+      consonantSignature(b);
+
+    if (
+      aSignature.length >= 3 &&
+      aSignature === bSignature
+    ) {
+      return 0.90;
+    }
   }
 
   const distance =
@@ -788,7 +846,7 @@ function teamScore(
       shorter[0];
 
     if (
-      distinctiveToken.length >= 5 &&
+      distinctiveToken.length >= CONTEXT_DISTINCTIVE_TOKEN_MIN_LENGTH &&
       !WEAK_TEAM_TOKENS.has(
         distinctiveToken
       )
@@ -2926,21 +2984,17 @@ function candidateIndexesForSignal(
     }
   }
 
-  // Important:
-  // If name tokens fail because names are very different,
-  // evaluate the already-small LIVE+1H+0:0 list.
-  if (
-    set.size === 0
+  // V7.6.2 CANDIDATE AUDIT:
+  // Token hits are kept first, but every already-small LIVE+1H+0:0
+  // event is also appended. The +/-5 minute gate is still enforced in
+  // findHunterTargetMatch(). This prevents token indexing from hiding
+  // the correct event when providers spell both club names differently.
+  for (
+    let i = 0;
+    i < cloudbetCount;
+    i++
   ) {
-
-    for (
-      let i = 0;
-      i <
-        cloudbetCount;
-      i++
-    ) {
-      set.add(i);
-    }
+    set.add(i);
   }
 
   return [
@@ -4386,7 +4440,7 @@ async function runFastHunter(
           "CONFIDENT_MATCH",
 
         candidate_discovery:
-          "ALL_LIVE_SOCCER_THEN_1H_00_MINUTE_THEN_NAME_MATCH"
+          "ALL_LIVE_SOCCER_THEN_1H_00_FULL_MINUTE_AUDIT_THEN_NAME_MATCH"
       },
 
       diagnostics: {
@@ -4462,6 +4516,50 @@ async function runFastHunter(
 
         context_min_score_gap:
           CONTEXT_MIN_SCORE_GAP,
+
+        candidate_audit:
+          true,
+
+        best_candidate:
+          result.best
+            ? {
+                event_id:
+                  cloudbetEventId(
+                    result.best.raw
+                  ),
+
+                match:
+                  matchDisplayName(
+                    result.best.raw
+                  ),
+
+                home:
+                  extractHome(
+                    result.best.raw
+                  ),
+
+                away:
+                  extractAway(
+                    result.best.raw
+                  ),
+
+                minute:
+                  result.bestMinute ?? null,
+
+                minute_difference:
+                  result.bestMinuteDifference ?? null,
+
+                scoring:
+                  result.detail
+                    ? scoringRecord(
+                        result.detail
+                      )
+                    : null,
+
+                competition:
+                  result.best.raw?.competition ?? null
+              }
+            : null,
 
         second_best:
           result.second
@@ -4598,7 +4696,7 @@ async function runFastHunter(
         true,
 
       matcher:
-        "STRICT TWO-SIDED FIRST + CONTEXT FALLBACK + UNIQUE-CANDIDATE ABBREVIATION RECOVERY + DISTINCTIVE TOKEN + COMPETITION/MINUTE PROTECTION + SCORE GAP",
+        "FULL MINUTE CANDIDATE AUDIT + STRICT TWO-SIDED FIRST + CONTEXT FALLBACK + TRANSLITERATION RECOVERY + DISTINCTIVE TOKEN + COMPETITION/MINUTE PROTECTION + SCORE GAP",
 
       hunter_security:
         "STRICT CONFIDENT_MATCH OR UNIQUE/SEPARATED CONTEXT FALLBACK",
@@ -4946,7 +5044,7 @@ export default {
           true,
 
         filter:
-          "ALL LIVE SOCCER -> 1H + 0:0 + +/-5 MINUTES -> STRICT MATCH -> CONTEXT FALLBACK -> SCORE GAP",
+          "ALL LIVE SOCCER -> 1H + 0:0 + +/-5 MINUTES -> FULL CANDIDATE AUDIT -> STRICT MATCH -> CONTEXT FALLBACK -> SCORE GAP",
 
         discovery_market_filter:
           false,
