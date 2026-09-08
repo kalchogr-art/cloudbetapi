@@ -1,6 +1,6 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7.4.2
-// FAST HUNTER + SEPARATE EVENT DISCOVERY / ODDS LOOKUP
+// CLOUDBET MATCH MATCHER V7.5.0
+// CANDIDATE RANKING + D1 DIAGNOSTICS + SEPARATE ODDS LOOKUP
 // LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
 // V27 SERVICE BINDING + DIRECT CLOUDBET PUBLIC SPORTS API
 // READ ONLY
@@ -38,12 +38,13 @@
 
 interface Env {
   V27: Fetcher;
+  DB: D1Database;
 }
 
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.4.2-GENERAL-DISTINCTIVE-TOKEN-MATCH";
+  "V7.4.2-GENERAL-TEAM-MATCH-FIX";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -73,6 +74,15 @@ const COUNTRY_BONUS =
   0.02;
 
 const MATCH_MINUTE_TOLERANCE =
+  5;
+
+// V7.5 candidate ranking protection.
+// A confident name match is accepted only when the best candidate
+// is sufficiently separated from the second-best candidate.
+const MIN_CONFIDENT_SCORE_GAP =
+  0.12;
+
+const DIAGNOSTIC_TOP_CANDIDATES =
   5;
 
 
@@ -634,70 +644,6 @@ function tokenSimilarity(
 
 
 // ============================================================
-// DISTINCTIVE TOKEN BRIDGE
-// ============================================================
-//
-// General abbreviation protection.
-//
-// Examples that may receive the bridge:
-//   Atletico Colina <-> AC Colina
-//   SC Freiburg     <-> Freiburg
-//   CD Example      <-> Example
-//
-// The bridge is intentionally NOT allowed for weak/common tokens
-// such as city, united, sporting, real, deportivo, etc.
-//
-// It does not by itself create a match. classifyMatch() still
-// requires a strong TWO-SIDED match and all existing live/category/
-// minute protections remain active.
-// ============================================================
-
-function distinctiveSingleTokenBridge(
-  aTokens: string[],
-  bTokens: string[]
-): number | null {
-
-  const shorter =
-    aTokens.length <= bTokens.length
-      ? aTokens
-      : bTokens;
-
-  const longer =
-    aTokens.length <= bTokens.length
-      ? bTokens
-      : aTokens;
-
-  if (
-    shorter.length !== 1 ||
-    longer.length < 2
-  ) {
-    return null;
-  }
-
-  const token =
-    shorter[0];
-
-  if (
-    !token ||
-    token.length < 4 ||
-    WEAK_TEAM_TOKENS.has(token)
-  ) {
-    return null;
-  }
-
-  if (
-    !longer.includes(token)
-  ) {
-    return null;
-  }
-
-  // A unique, exact, meaningful token is a strong abbreviation bridge,
-  // but deliberately below an exact full-name match.
-  return 0.88;
-}
-
-
-// ============================================================
 // TEAM SCORE
 // ============================================================
 
@@ -753,12 +699,6 @@ function teamScore(
     return 0;
   }
 
-  const distinctiveBridge =
-    distinctiveSingleTokenBridge(
-      aTokens,
-      bTokens
-    );
-
   const shorter =
     aTokens.length <=
     bTokens.length
@@ -778,6 +718,48 @@ function teamScore(
           token
         )
     );
+
+  // ==========================================================
+  // V7.4.2 GENERAL DISTINCTIVE TOKEN FIX
+  //
+  // Handles provider prefixes / abbreviations without requiring
+  // one alias per club:
+  //
+  //   Atletico Colina      <-> AC Colina
+  //   Provincial Ovalle    <-> CD Provincial Ovalle FC
+  //   Freiburg             <-> SC Freiburg
+  //
+  // Generic prefixes/suffixes (FC/CD/AC/SC...) are already
+  // removed by normalizeTeam(). If one normalized side is left
+  // with one strong, distinctive token which appears exactly in
+  // the other side, treat it as a strong team match.
+  //
+  // Safety:
+  // - token must be >= 5 chars
+  // - token must not be a weak/generic football word
+  // - the longer name may contain at most one additional token
+  // - category protection has already passed above
+  // ==========================================================
+
+  if (
+    shorterAllExact &&
+    shorter.length === 1 &&
+    longer.length <= 2
+  ) {
+
+    const distinctiveToken =
+      shorter[0];
+
+    if (
+      distinctiveToken.length >= 5 &&
+      !WEAK_TEAM_TOKENS.has(
+        distinctiveToken
+      )
+    ) {
+
+      return 0.88;
+    }
+  }
 
   if (
     shorterAllExact &&
@@ -968,16 +950,6 @@ function teamScore(
       Math.min(
         score,
         0.58
-      );
-  }
-
-  if (
-    distinctiveBridge !== null
-  ) {
-    score =
-      Math.max(
-        score,
-        distinctiveBridge
       );
   }
 
@@ -3003,6 +2975,87 @@ function scoringRecord(
 }
 
 
+function candidateDiagnosticRecord(
+  cb: PreparedMatch,
+  detail: AnyObj,
+  signal: AnyObj
+): AnyObj {
+
+  const minute =
+    cloudbetMinute(
+      cb.raw
+    );
+
+  const diff =
+    minuteDifference(
+      signal,
+      cb.raw
+    );
+
+  return {
+    event_id:
+      cloudbetEventId(
+        cb.raw
+      ),
+
+    match:
+      matchDisplayName(
+        cb.raw
+      ),
+
+    home:
+      extractHome(
+        cb.raw
+      ),
+
+    away:
+      extractAway(
+        cb.raw
+      ),
+
+    minute,
+
+    minute_difference:
+      diff,
+
+    scoring:
+      scoringRecord(
+        detail
+      ),
+
+    category: {
+      hunter_home:
+        teamCategory(
+          signal?.home
+        ),
+
+      cloudbet_home:
+        teamCategory(
+          extractHome(
+            cb.raw
+          )
+        ),
+
+      hunter_away:
+        teamCategory(
+          signal?.away
+        ),
+
+      cloudbet_away:
+        teamCategory(
+          extractAway(
+            cb.raw
+          )
+        )
+    },
+
+    competition:
+      cb.raw?.competition ??
+      null
+  };
+}
+
+
 function findHunterTargetMatch(
   signal: AnyObj,
   cloudbet:
@@ -3040,47 +3093,62 @@ function findHunterTargetMatch(
         null
     });
 
+  const emptyResult = (
+    reason: string,
+    targetMinute: number | null,
+    candidates = 0,
+    minuteCandidates = 0,
+    candidateEvaluations = 0
+  ): AnyObj => ({
+    found:
+      false,
+
+    best:
+      null,
+
+    second:
+      null,
+
+    detail:
+      null,
+
+    secondDetail:
+      null,
+
+    classification:
+      "TRUE_UNMATCHED",
+
+    reason,
+
+    candidateEvaluations,
+    candidates,
+    minuteCandidates,
+    targetMinute,
+
+    bestMinute:
+      null,
+
+    bestMinuteDifference:
+      null,
+
+    scoreGap:
+      null,
+
+    topCandidates:
+      []
+  });
+
   if (
     !target.home ||
     !target.away
   ) {
 
-    return {
-      found:
-        false,
-
-      best:
-        null,
-
-      detail:
-        null,
-
-      classification:
-        "TRUE_UNMATCHED",
-
-      reason:
-        "HUNTER_SIGNAL_MISSING_HOME_OR_AWAY",
-
-      candidateEvaluations:
-        0,
-
-      candidates:
-        0,
-
-      minuteCandidates:
-        0,
-
-      targetMinute:
-        hunterReferenceMinute(
-          signal
-        ),
-
-      bestMinute:
-        null,
-
-      bestMinuteDifference:
-        null
-    };
+    return emptyResult(
+      "HUNTER_SIGNAL_MISSING_HOME_OR_AWAY",
+      hunterReferenceMinute(
+        signal
+      )
+    );
   }
 
   const targetMinute =
@@ -3092,40 +3160,10 @@ function findHunterTargetMatch(
     targetMinute === null
   ) {
 
-    return {
-      found:
-        false,
-
-      best:
-        null,
-
-      detail:
-        null,
-
-      classification:
-        "TRUE_UNMATCHED",
-
-      reason:
-        "HUNTER_SIGNAL_MINUTE_MISSING",
-
-      candidateEvaluations:
-        0,
-
-      candidates:
-        0,
-
-      minuteCandidates:
-        0,
-
-      targetMinute:
-        null,
-
-      bestMinute:
-        null,
-
-      bestMinuteDifference:
-        null
-    };
+    return emptyResult(
+      "HUNTER_SIGNAL_MINUTE_MISSING",
+      null
+    );
   }
 
   const candidates =
@@ -3135,30 +3173,20 @@ function findHunterTargetMatch(
       cloudbet.length
     );
 
-  let best:
-    PreparedMatch | null =
-    null;
-
-  let bestDetail:
-    AnyObj | null =
-    null;
-
-  let bestScore =
-    -1;
+  const ranked:
+    {
+      cb: PreparedMatch;
+      detail: AnyObj;
+      score: number;
+      minute: number | null;
+      minuteDifference: number | null;
+    }[] = [];
 
   let candidateEvaluations =
     0;
 
   let minuteCandidates =
     0;
-
-  let bestMinute:
-    number | null =
-    null;
-
-  let bestMinuteDifference:
-    number | null =
-    null;
 
   for (
     const index
@@ -3172,9 +3200,6 @@ function findHunterTargetMatch(
       continue;
     }
 
-    // HARD FILTER:
-    // candidate must be within +/-5 minutes
-    // of the Hunter current/entry minute.
     if (
       !minuteCompatible(
         signal,
@@ -3193,110 +3218,502 @@ function findHunterTargetMatch(
         cb.raw
       );
 
-    if (
-      detail.total >
-      bestScore
-    ) {
-
-      best =
-        cb;
-
-      bestDetail =
-        detail;
-
-      bestScore =
-        detail.total;
-
-      bestMinute =
+    ranked.push({
+      cb,
+      detail,
+      score:
+        detail.total,
+      minute:
         cloudbetMinute(
           cb.raw
-        );
-
-      bestMinuteDifference =
+        ),
+      minuteDifference:
         minuteDifference(
           signal,
           cb.raw
-        );
-    }
+        )
+    });
   }
+
+  ranked.sort(
+    (a, b) =>
+      b.score - a.score
+  );
 
   if (
-    !best ||
-    !bestDetail
+    ranked.length === 0
   ) {
 
-    return {
-      found:
-        false,
-
-      best:
-        null,
-
-      detail:
-        null,
-
-      classification:
-        "TRUE_UNMATCHED",
-
-      reason:
-        minuteCandidates === 0
-          ? "NO_CLOUDBET_CANDIDATE_WITHIN_MINUTE_WINDOW"
-          : "NO_VALID_CLOUDBET_CANDIDATE",
-
-      candidateEvaluations,
-
-      candidates:
-        candidates.length,
-
-      minuteCandidates,
-
+    return emptyResult(
+      minuteCandidates === 0
+        ? "NO_CLOUDBET_CANDIDATE_WITHIN_MINUTE_WINDOW"
+        : "NO_VALID_CLOUDBET_CANDIDATE",
       targetMinute,
-
-      bestMinute:
-        null,
-
-      bestMinuteDifference:
-        null
-    };
+      candidates.length,
+      minuteCandidates,
+      candidateEvaluations
+    );
   }
+
+  const bestRank =
+    ranked[0];
+
+  const secondRank =
+    ranked.length > 1
+      ? ranked[1]
+      : null;
+
+  const scoreGap =
+    secondRank
+      ? Math.max(
+          0,
+          bestRank.score -
+          secondRank.score
+        )
+      : 1;
 
   const classification =
     classifyMatch(
-      bestDetail,
+      bestRank.detail,
       threshold
     );
 
+  const initiallyConfident =
+    classification
+      .classification ===
+    "CONFIDENT_MATCH";
+
+  const ambiguous =
+    initiallyConfident &&
+    secondRank !== null &&
+    scoreGap <
+      MIN_CONFIDENT_SCORE_GAP;
+
+  const finalClassification =
+    ambiguous
+      ? "AMBIGUOUS_TOP_TWO"
+      : classification
+          .classification;
+
+  const finalReason =
+    ambiguous
+      ? "BEST_AND_SECOND_CANDIDATES_TOO_CLOSE"
+      : classification.reason;
+
+  const topCandidates =
+    ranked
+      .slice(
+        0,
+        DIAGNOSTIC_TOP_CANDIDATES
+      )
+      .map(
+        item =>
+          candidateDiagnosticRecord(
+            item.cb,
+            item.detail,
+            signal
+          )
+      );
+
   return {
     found:
-      classification
-        .classification ===
-      "CONFIDENT_MATCH",
+      initiallyConfident &&
+      !ambiguous,
 
-    best,
+    best:
+      bestRank.cb,
+
+    second:
+      secondRank
+        ?.cb ??
+      null,
 
     detail:
-      bestDetail,
+      bestRank.detail,
+
+    secondDetail:
+      secondRank
+        ?.detail ??
+      null,
 
     classification:
-      classification
-        .classification,
+      finalClassification,
 
     reason:
-      classification.reason,
+      finalReason,
 
     candidateEvaluations,
-
     candidates:
       candidates.length,
-
     minuteCandidates,
-
     targetMinute,
 
-    bestMinute,
+    bestMinute:
+      bestRank.minute,
 
-    bestMinuteDifference
+    bestMinuteDifference:
+      bestRank
+        .minuteDifference,
+
+    scoreGap,
+
+    topCandidates
   };
+}
+
+
+// ============================================================
+// D1 MATCHER DIAGNOSTICS
+// ============================================================
+
+function roundScore(
+  value: any
+): number | null {
+
+  const number =
+    numericOrNull(
+      value
+    );
+
+  return number === null
+    ? null
+    : Number(
+        number.toFixed(
+          3
+        )
+      );
+}
+
+
+async function saveMatcherDiagnostic(
+  env: Env,
+  signal: AnyObj,
+  result: AnyObj,
+  odds: AnyObj | null
+): Promise<AnyObj> {
+
+  try {
+
+    const best =
+      result?.best ??
+      null;
+
+    const second =
+      result?.second ??
+      null;
+
+    const detail =
+      result?.detail ??
+      null;
+
+    const secondDetail =
+      result?.secondDetail ??
+      null;
+
+    const decision =
+      result?.found === true
+        ? (
+            odds?.available === true
+              ? "MATCH_ACCEPTED_ODDS_AVAILABLE"
+              : "MATCH_ACCEPTED_NO_ODDS"
+          )
+        : String(
+            result?.classification ??
+            "UNMATCHED"
+          );
+
+    const statement =
+      env.DB.prepare(`
+        INSERT INTO matcher_diagnostics (
+          signal_match_id,
+          signal_match,
+          signal_home,
+          signal_away,
+          signal_minute,
+          decision,
+          reason,
+          best_event_id,
+          best_match,
+          best_home,
+          best_away,
+          best_minute,
+          minute_difference,
+          total_score,
+          home_score,
+          away_score,
+          competition_score,
+          country_score,
+          second_event_id,
+          second_match,
+          second_total_score,
+          score_gap,
+          candidates_total,
+          candidates_in_minute_window,
+          odds_available,
+          odds_price,
+          matcher_version,
+          created_at
+        )
+        VALUES (
+          ?, ?, ?, ?, ?,
+          ?, ?,
+          ?, ?, ?, ?, ?, ?,
+          ?, ?, ?, ?, ?,
+          ?, ?, ?,
+          ?,
+          ?, ?,
+          ?, ?,
+          ?, ?
+        )
+      `);
+
+    await statement
+      .bind(
+        signal?.match_id ??
+          null,
+
+        signal?.match ??
+          `${signal?.home ?? ""} - ${signal?.away ?? ""}`,
+
+        signal?.home ??
+          null,
+
+        signal?.away ??
+          null,
+
+        hunterReferenceMinute(
+          signal
+        ),
+
+        decision,
+
+        result?.reason ??
+          null,
+
+        best
+          ? cloudbetEventId(
+              best.raw
+            )
+          : null,
+
+        best
+          ? matchDisplayName(
+              best.raw
+            )
+          : null,
+
+        best
+          ? extractHome(
+              best.raw
+            )
+          : null,
+
+        best
+          ? extractAway(
+              best.raw
+            )
+          : null,
+
+        result?.bestMinute ??
+          null,
+
+        result
+          ?.bestMinuteDifference ??
+          null,
+
+        roundScore(
+          detail?.total
+        ),
+
+        roundScore(
+          detail?.homeScore
+        ),
+
+        roundScore(
+          detail?.awayScore
+        ),
+
+        roundScore(
+          detail?.competitionScore
+        ),
+
+        roundScore(
+          detail?.countryScore
+        ),
+
+        second
+          ? cloudbetEventId(
+              second.raw
+            )
+          : null,
+
+        second
+          ? matchDisplayName(
+              second.raw
+            )
+          : null,
+
+        roundScore(
+          secondDetail?.total
+        ),
+
+        roundScore(
+          result?.scoreGap
+        ),
+
+        result?.candidates ??
+          0,
+
+        result?.minuteCandidates ??
+          0,
+
+        odds?.available === true
+          ? 1
+          : 0,
+
+        roundScore(
+          odds?.price
+        ),
+
+        VERSION,
+
+        new Date()
+          .toISOString()
+      )
+      .run();
+
+    return {
+      saved:
+        true,
+      error:
+        null
+    };
+
+  } catch (
+    error
+  ) {
+
+    // Diagnostics must never stop the live matcher.
+    return {
+      saved:
+        false,
+
+      error:
+        error instanceof Error
+          ? error.message
+          : String(
+              error
+            )
+    };
+  }
+}
+
+
+async function readMatcherDiagnostics(
+  env: Env,
+  request: Request
+): Promise<Response> {
+
+  const url =
+    new URL(
+      request.url
+    );
+
+  const requested =
+    Number(
+      url.searchParams.get(
+        "limit"
+      ) ??
+      "50"
+    );
+
+  const limit =
+    Number.isFinite(
+      requested
+    )
+      ? Math.max(
+          1,
+          Math.min(
+            200,
+            Math.floor(
+              requested
+            )
+          )
+        )
+      : 50;
+
+  try {
+
+    const rows =
+      await env.DB
+        .prepare(`
+          SELECT *
+          FROM matcher_diagnostics
+          ORDER BY id DESC
+          LIMIT ?
+        `)
+        .bind(
+          limit
+        )
+        .all();
+
+    return json({
+      success:
+        true,
+
+      worker:
+        "cloudbet-match-matcher",
+
+      version:
+        VERSION,
+
+      action:
+        "MATCHER_DIAGNOSTICS",
+
+      limit,
+
+      count:
+        rows.results
+          ?.length ??
+        0,
+
+      rows:
+        rows.results ??
+        [],
+
+      timestamp:
+        new Date()
+          .toISOString()
+    });
+
+  } catch (
+    error
+  ) {
+
+    return json(
+      {
+        success:
+          false,
+
+        worker:
+          "cloudbet-match-matcher",
+
+        version:
+          VERSION,
+
+        action:
+          "MATCHER_DIAGNOSTICS",
+
+        error:
+          error instanceof Error
+            ? error.message
+            : String(
+                error
+              )
+      },
+      500
+    );
+  }
 }
 
 
@@ -3507,7 +3924,7 @@ async function runFastHunter(
           )
         : null;
 
-    hunterResults.push({
+    const resultRow: AnyObj = {
 
       status:
         result.found
@@ -3793,9 +4210,62 @@ async function runFastHunter(
         target_normalized_away:
           normalizeTeam(
             signal?.away
-          )
+          ),
+
+        score_gap:
+          result.scoreGap ??
+          null,
+
+        min_confident_score_gap:
+          MIN_CONFIDENT_SCORE_GAP,
+
+        second_best:
+          result.second
+            ? {
+                event_id:
+                  cloudbetEventId(
+                    result.second.raw
+                  ),
+
+                match:
+                  matchDisplayName(
+                    result.second.raw
+                  ),
+
+                scoring:
+                  result.secondDetail
+                    ? scoringRecord(
+                        result.secondDetail
+                      )
+                    : null
+              }
+            : null,
+
+        top_candidates:
+          result.topCandidates ??
+          []
       }
-    });
+    };
+
+    const diagnosticWrite =
+      await saveMatcherDiagnostic(
+        env,
+        signal,
+        result,
+        odds
+      );
+
+    resultRow.diagnostics
+      .d1_saved =
+        diagnosticWrite.saved;
+
+    resultRow.diagnostics
+      .d1_error =
+        diagnosticWrite.error;
+
+    hunterResults.push(
+      resultRow
+    );
   }
 
 
@@ -3851,6 +4321,18 @@ async function runFastHunter(
       minute_tolerance:
         MATCH_MINUTE_TOLERANCE,
 
+      min_confident_score_gap:
+        MIN_CONFIDENT_SCORE_GAP,
+
+      diagnostic_top_candidates:
+        DIAGNOSTIC_TOP_CANDIDATES,
+
+      candidate_ranking:
+        true,
+
+      d1_diagnostics:
+        true,
+
       prefilter:
         "LIVE + 1H + 0:0 + VALID MINUTE",
 
@@ -3864,7 +4346,7 @@ async function runFastHunter(
         true,
 
       matcher:
-        "STRICT TWO-SIDED TEAM NORMALIZATION + ALIAS + TOKEN FUZZY + CATEGORY PROTECTION",
+        "CANDIDATE RANKING + STRICT TWO-SIDED TEAM NORMALIZATION + ALIAS + TOKEN FUZZY + CATEGORY + SCORE GAP PROTECTION",
 
       hunter_security:
         "ONLY CONFIDENT_MATCH IS ACCEPTED",
@@ -4212,7 +4694,7 @@ export default {
           true,
 
         filter:
-          "ALL LIVE SOCCER -> 1H + 0:0 + +/-5 MINUTES -> NAME MATCH",
+          "ALL LIVE SOCCER -> 1H + 0:0 + +/-5 MINUTES -> CANDIDATE RANKING -> SCORE GAP",
 
         discovery_market_filter:
           false,
@@ -4223,7 +4705,8 @@ export default {
         routes: [
           "/live",
           "/match?signals=[...]",
-          "/diagnostic"
+          "/diagnostic",
+          "/diagnostics?limit=50"
         ]
       });
     }
@@ -4535,6 +5018,22 @@ export default {
           500
         );
       }
+    }
+
+
+    // ========================================================
+    // SAVED MATCHER DIAGNOSTICS
+    // ========================================================
+
+    if (
+      pathname ===
+      "/diagnostics"
+    ) {
+
+      return await readMatcherDiagnostics(
+        env,
+        request
+      );
     }
 
 
