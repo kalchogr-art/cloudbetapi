@@ -38,13 +38,13 @@
 
 interface Env {
   V27: Fetcher;
-  DB: D1Database;
+  DB?: D1Database;
 }
 
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.6.0-CONTEXT-FALLBACK";
+  "V7.6.1-CONTEXT-FALLBACK-UNIQUE-D1-SAFE";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -3096,28 +3096,116 @@ function candidateDiagnosticRecord(
 function evaluateContextFallback(
   signal: AnyObj,
   cb: PreparedMatch,
-  detail: AnyObj
+  detail: AnyObj,
+  uniqueMinuteCandidate = false
 ): AnyObj {
   const hunterHome = signal?.home ?? "";
   const hunterAway = signal?.away ?? "";
   const cbHome = extractHome(cb.raw) ?? "";
   const cbAway = extractAway(cb.raw) ?? "";
+
   const homeCategoryOk = categoryCompatible(hunterHome, cbHome);
   const awayCategoryOk = categoryCompatible(hunterAway, cbAway);
+
   const homeToken = sharedDistinctiveToken(hunterHome, cbHome);
   const awayToken = sharedDistinctiveToken(hunterAway, cbAway);
+
   const strongestSide = Math.max(detail.homeScore, detail.awayScore);
   const weakerSide = Math.min(detail.homeScore, detail.awayScore);
-  const competitionKnown = Boolean(competitionText(signal)) && Boolean(competitionText(cb.raw));
-  const countryKnown = Boolean(countryText(signal)) && Boolean(countryText(cb.raw));
-  const competitionOk = !competitionKnown || detail.competitionScore >= CONTEXT_MIN_COMPETITION_SCORE || (countryKnown && detail.countryScore === 1);
+
+  const competitionKnown =
+    Boolean(competitionText(signal)) &&
+    Boolean(competitionText(cb.raw));
+
+  const countryKnown =
+    Boolean(countryText(signal)) &&
+    Boolean(countryText(cb.raw));
+
+  const competitionOk =
+    !competitionKnown ||
+    detail.competitionScore >= CONTEXT_MIN_COMPETITION_SCORE ||
+    (countryKnown && detail.countryScore === 1);
+
+  const exactCompetition =
+    competitionKnown &&
+    detail.competitionScore >= 0.99;
+
   const minuteDiff = minuteDifference(signal, cb.raw);
-  const minuteScore = minuteDiff === null ? 0 : Math.max(0, 1 - minuteDiff / Math.max(1, MATCH_MINUTE_TOLERANCE));
-  const anchorCount = (homeToken ? 1 : 0) + (awayToken ? 1 : 0);
-  let contextScore = strongestSide * 0.40 + weakerSide * 0.10 + detail.competitionScore * 0.25 + detail.countryScore * 0.05 + minuteScore * 0.10 + (anchorCount >= 2 ? 0.10 : anchorCount === 1 ? 0.05 : 0);
+  const minuteScore =
+    minuteDiff === null
+      ? 0
+      : Math.max(
+          0,
+          1 -
+          minuteDiff /
+          Math.max(1, MATCH_MINUTE_TOLERANCE)
+        );
+
+  const anchorCount =
+    (homeToken ? 1 : 0) +
+    (awayToken ? 1 : 0);
+
+  const hasDistinctiveAnchor =
+    Boolean(homeToken || awayToken);
+
+  const standardSecondSideOk =
+    weakerSide >= CONTEXT_MIN_SECOND_TEAM_SCORE;
+
+  // V7.6.1 FIX:
+  // If there is exactly one Cloudbet candidate inside the +/-5 minute
+  // window, competition is an exact match and one team is strongly
+  // identified by a distinctive token, allow the context fallback even
+  // when the second provider name is a completely different abbreviation
+  // (example: KuPS <-> Kuopion Palloseura).
+  const uniqueCandidateOverride =
+    uniqueMinuteCandidate &&
+    exactCompetition &&
+    hasDistinctiveAnchor &&
+    strongestSide >= CONTEXT_STRONG_TEAM_SCORE;
+
+  let contextScore =
+    strongestSide * 0.40 +
+    weakerSide * 0.10 +
+    detail.competitionScore * 0.25 +
+    detail.countryScore * 0.05 +
+    minuteScore * 0.10 +
+    (anchorCount >= 2
+      ? 0.10
+      : anchorCount === 1
+        ? 0.05
+        : 0) +
+    (uniqueCandidateOverride ? 0.05 : 0);
+
   contextScore = Math.min(1, contextScore);
-  const eligible = homeCategoryOk && awayCategoryOk && competitionOk && Boolean(homeToken || awayToken) && strongestSide >= CONTEXT_STRONG_TEAM_SCORE && weakerSide >= CONTEXT_MIN_SECOND_TEAM_SCORE;
-  return { eligible, contextScore, homeToken, awayToken, anchorCount, strongestSide, weakerSide, competitionKnown, countryKnown, competitionOk, homeCategoryOk, awayCategoryOk, minuteDiff, minuteScore };
+
+  const eligible =
+    homeCategoryOk &&
+    awayCategoryOk &&
+    competitionOk &&
+    hasDistinctiveAnchor &&
+    strongestSide >= CONTEXT_STRONG_TEAM_SCORE &&
+    (standardSecondSideOk || uniqueCandidateOverride);
+
+  return {
+    eligible,
+    contextScore,
+    homeToken,
+    awayToken,
+    anchorCount,
+    strongestSide,
+    weakerSide,
+    competitionKnown,
+    countryKnown,
+    competitionOk,
+    exactCompetition,
+    homeCategoryOk,
+    awayCategoryOk,
+    minuteDiff,
+    minuteScore,
+    uniqueMinuteCandidate,
+    uniqueCandidateOverride,
+    standardSecondSideOk
+  };
 }
 
 
@@ -3360,7 +3448,15 @@ function findHunterTargetMatch(
 
   if (!initiallyConfident) {
     const contextRanked = ranked
-      .map(item => ({ ...item, context: evaluateContextFallback(target.raw, item.cb, item.detail) }))
+      .map(item => ({
+        ...item,
+        context: evaluateContextFallback(
+          target.raw,
+          item.cb,
+          item.detail,
+          ranked.length === 1
+        )
+      }))
       .filter(item => item.context.eligible)
       .sort((a, b) => b.context.contextScore - a.context.contextScore);
 
@@ -3391,7 +3487,9 @@ function findHunterTargetMatch(
 
   if (!initiallyConfident && contextAccepted && contextBest) {
     finalClassification = "CONFIDENT_MATCH";
-    finalReason = "CONTEXT_FALLBACK_CONFIDENT_MATCH";
+    finalReason = contextBest.context.uniqueCandidateOverride
+      ? "CONTEXT_FALLBACK_UNIQUE_CANDIDATE"
+      : "CONTEXT_FALLBACK_CONFIDENT_MATCH";
     finalFound = true;
     finalBest = contextBest;
     finalSecond = contextSecond;
@@ -3435,6 +3533,10 @@ function findHunterTargetMatch(
           competition_known: contextBest.context.competitionKnown,
           country_known: contextBest.context.countryKnown,
           competition_ok: contextBest.context.competitionOk,
+          exact_competition: contextBest.context.exactCompetition,
+          unique_minute_candidate: contextBest.context.uniqueMinuteCandidate,
+          unique_candidate_override: contextBest.context.uniqueCandidateOverride,
+          standard_second_side_ok: contextBest.context.standardSecondSideOk,
           minute_difference: contextBest.context.minuteDiff,
           score_gap: contextGap
         }
@@ -3480,6 +3582,20 @@ async function saveMatcherDiagnostic(
   result: AnyObj,
   odds: AnyObj | null
 ): Promise<AnyObj> {
+
+  // V7.6.1 FIX: D1 diagnostics are optional.
+  // Missing DB binding must never throw or affect live matching.
+  if (
+    !env?.DB ||
+    typeof (env.DB as any)?.prepare !== "function"
+  ) {
+    return {
+      saved: false,
+      skipped: true,
+      error: null,
+      reason: "D1_BINDING_NOT_AVAILABLE"
+    };
+  }
 
   try {
 
@@ -3730,6 +3846,23 @@ async function readMatcherDiagnostics(
           )
         )
       : 50;
+
+  if (
+    !env?.DB ||
+    typeof (env.DB as any)?.prepare !== "function"
+  ) {
+    return json(
+      {
+        success: false,
+        worker: "cloudbet-match-matcher",
+        version: VERSION,
+        action: "MATCHER_DIAGNOSTICS",
+        error: "D1_BINDING_NOT_AVAILABLE",
+        timestamp: new Date().toISOString()
+      },
+      503
+    );
+  }
 
   try {
 
@@ -4374,6 +4507,14 @@ async function runFastHunter(
       .d1_error =
         diagnosticWrite.error;
 
+    resultRow.diagnostics
+      .d1_skipped =
+        diagnosticWrite.skipped === true;
+
+    resultRow.diagnostics
+      .d1_reason =
+        diagnosticWrite.reason ?? null;
+
     hunterResults.push(
       resultRow
     );
@@ -4457,7 +4598,7 @@ async function runFastHunter(
         true,
 
       matcher:
-        "STRICT TWO-SIDED FIRST + CONTEXT FALLBACK + DISTINCTIVE TOKEN + COMPETITION/MINUTE PROTECTION + SCORE GAP",
+        "STRICT TWO-SIDED FIRST + CONTEXT FALLBACK + UNIQUE-CANDIDATE ABBREVIATION RECOVERY + DISTINCTIVE TOKEN + COMPETITION/MINUTE PROTECTION + SCORE GAP",
 
       hunter_security:
         "STRICT CONFIDENT_MATCH OR UNIQUE/SEPARATED CONTEXT FALLBACK",
