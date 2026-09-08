@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7.6.2
+// CLOUDBET MATCH MATCHER V7.6.3
 // CANDIDATE RANKING + D1 DIAGNOSTICS + SEPARATE ODDS LOOKUP
 // LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
 // V27 SERVICE BINDING + DIRECT CLOUDBET PUBLIC SPORTS API
@@ -27,6 +27,11 @@
 // - /diagnostic
 //   -> light V27 + Cloudbet diagnostic
 //
+// V7.6.3 FIXES:
+// - reserve-team marker normalization: 2 / II / Reserve / Reserves are category markers, not club identity
+// - fixes provider variants such as Quilmes 2 <-> CA Quilmes Reserve and Ferro 2 <-> Ferro Carril Oeste
+// - category protection still uses the original unnormalized names, so the reserve signal is preserved
+//
 // V7.6.2 FIXES:
 // - full +/-5 minute candidate audit (token index can no longer hide a valid event)
 // - women/female markers removed from team identity while category protection remains
@@ -50,7 +55,7 @@ interface Env {
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.6.2-CANDIDATE-AUDIT-NAME-NORMALIZATION";
+  "V7.6.3-RESERVE-TEAM-NORMALIZATION";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -386,7 +391,15 @@ const TEAM_CATEGORY_TOKENS =
     "femenil",
     "femenino",
     "feminino",
-    "feminina"
+    "feminina",
+
+    // Reserve / second-team provider markers.
+    // teamCategory() reads the original name first, so removing these
+    // from identity does not remove the RESERVE classification.
+    "reserve",
+    "reserves",
+    "ii",
+    "2"
   ]);
 
 
