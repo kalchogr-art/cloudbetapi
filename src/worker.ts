@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7.5.0
+// CLOUDBET MATCH MATCHER V7.6.0
 // CANDIDATE RANKING + D1 DIAGNOSTICS + SEPARATE ODDS LOOKUP
 // LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
 // V27 SERVICE BINDING + DIRECT CLOUDBET PUBLIC SPORTS API
@@ -44,7 +44,7 @@ interface Env {
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.4.2-GENERAL-TEAM-MATCH-FIX";
+  "V7.6.0-CONTEXT-FALLBACK";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -84,6 +84,21 @@ const MIN_CONFIDENT_SCORE_GAP =
 
 const DIAGNOSTIC_TOP_CANDIDATES =
   5;
+
+const CONTEXT_MIN_COMPETITION_SCORE =
+  0.50;
+
+const CONTEXT_STRONG_TEAM_SCORE =
+  0.78;
+
+const CONTEXT_MIN_SECOND_TEAM_SCORE =
+  0.20;
+
+const CONTEXT_MIN_SCORE_GAP =
+  0.12;
+
+const CONTEXT_DISTINCTIVE_TOKEN_MIN_LENGTH =
+  4;
 
 
 // ============================================================
@@ -422,6 +437,28 @@ function teamTokens(
   )
     .split(" ")
     .filter(Boolean);
+}
+
+function isDistinctiveTeamToken(
+  token: string
+): boolean {
+  if (!token || token.length < CONTEXT_DISTINCTIVE_TOKEN_MIN_LENGTH) return false;
+  if (GENERIC_WORDS.has(token) || WEAK_TEAM_TOKENS.has(token)) return false;
+  if (/^u\d{2}$/.test(token)) return false;
+  if (token === "women" || token === "reserve" || token === "reserves") return false;
+  return true;
+}
+
+function sharedDistinctiveToken(
+  a: any,
+  b: any
+): string | null {
+  const A = teamTokens(a);
+  const B = new Set(teamTokens(b));
+  const shared = A
+    .filter(token => B.has(token) && isDistinctiveTeamToken(token))
+    .sort((x, y) => y.length - x.length);
+  return shared[0] ?? null;
 }
 
 
@@ -3056,6 +3093,34 @@ function candidateDiagnosticRecord(
 }
 
 
+function evaluateContextFallback(
+  signal: AnyObj,
+  cb: PreparedMatch,
+  detail: AnyObj
+): AnyObj {
+  const hunterHome = signal?.home ?? "";
+  const hunterAway = signal?.away ?? "";
+  const cbHome = extractHome(cb.raw) ?? "";
+  const cbAway = extractAway(cb.raw) ?? "";
+  const homeCategoryOk = categoryCompatible(hunterHome, cbHome);
+  const awayCategoryOk = categoryCompatible(hunterAway, cbAway);
+  const homeToken = sharedDistinctiveToken(hunterHome, cbHome);
+  const awayToken = sharedDistinctiveToken(hunterAway, cbAway);
+  const strongestSide = Math.max(detail.homeScore, detail.awayScore);
+  const weakerSide = Math.min(detail.homeScore, detail.awayScore);
+  const competitionKnown = Boolean(competitionText(signal)) && Boolean(competitionText(cb.raw));
+  const countryKnown = Boolean(countryText(signal)) && Boolean(countryText(cb.raw));
+  const competitionOk = !competitionKnown || detail.competitionScore >= CONTEXT_MIN_COMPETITION_SCORE || (countryKnown && detail.countryScore === 1);
+  const minuteDiff = minuteDifference(signal, cb.raw);
+  const minuteScore = minuteDiff === null ? 0 : Math.max(0, 1 - minuteDiff / Math.max(1, MATCH_MINUTE_TOLERANCE));
+  const anchorCount = (homeToken ? 1 : 0) + (awayToken ? 1 : 0);
+  let contextScore = strongestSide * 0.40 + weakerSide * 0.10 + detail.competitionScore * 0.25 + detail.countryScore * 0.05 + minuteScore * 0.10 + (anchorCount >= 2 ? 0.10 : anchorCount === 1 ? 0.05 : 0);
+  contextScore = Math.min(1, contextScore);
+  const eligible = homeCategoryOk && awayCategoryOk && competitionOk && Boolean(homeToken || awayToken) && strongestSide >= CONTEXT_STRONG_TEAM_SCORE && weakerSide >= CONTEXT_MIN_SECOND_TEAM_SCORE;
+  return { eligible, contextScore, homeToken, awayToken, anchorCount, strongestSide, weakerSide, competitionKnown, countryKnown, competitionOk, homeCategoryOk, awayCategoryOk, minuteDiff, minuteScore };
+}
+
+
 function findHunterTargetMatch(
   signal: AnyObj,
   cloudbet:
@@ -3133,6 +3198,13 @@ function findHunterTargetMatch(
 
     scoreGap:
       null,
+
+    matchMode:
+      "NONE",
+
+    contextFallback: {
+      accepted: false
+    },
 
     topCandidates:
       []
@@ -3273,32 +3345,59 @@ function findHunterTargetMatch(
       : 1;
 
   const classification =
-    classifyMatch(
-      bestRank.detail,
-      threshold
-    );
+    classifyMatch(bestRank.detail, threshold);
 
   const initiallyConfident =
-    classification
-      .classification ===
-    "CONFIDENT_MATCH";
+    classification.classification === "CONFIDENT_MATCH";
 
-  const ambiguous =
-    initiallyConfident &&
-    secondRank !== null &&
-    scoreGap <
-      MIN_CONFIDENT_SCORE_GAP;
+  const strictAmbiguous =
+    initiallyConfident && secondRank !== null && scoreGap < MIN_CONFIDENT_SCORE_GAP;
 
-  const finalClassification =
-    ambiguous
-      ? "AMBIGUOUS_TOP_TWO"
-      : classification
-          .classification;
+  let contextAccepted = false;
+  let contextBest: AnyObj | null = null;
+  let contextSecond: AnyObj | null = null;
+  let contextGap: number | null = null;
 
-  const finalReason =
-    ambiguous
-      ? "BEST_AND_SECOND_CANDIDATES_TOO_CLOSE"
-      : classification.reason;
+  if (!initiallyConfident) {
+    const contextRanked = ranked
+      .map(item => ({ ...item, context: evaluateContextFallback(target.raw, item.cb, item.detail) }))
+      .filter(item => item.context.eligible)
+      .sort((a, b) => b.context.contextScore - a.context.contextScore);
+
+    if (contextRanked.length > 0) {
+      contextBest = contextRanked[0];
+      contextSecond = contextRanked.length > 1 ? contextRanked[1] : null;
+      contextGap = contextSecond
+        ? Math.max(0, contextBest.context.contextScore - contextSecond.context.contextScore)
+        : 1;
+      contextAccepted = contextSecond === null || contextGap >= CONTEXT_MIN_SCORE_GAP;
+    }
+  }
+
+  let finalClassification = classification.classification;
+  let finalReason = classification.reason;
+  let finalFound = initiallyConfident && !strictAmbiguous;
+  let finalBest: AnyObj = bestRank;
+  let finalSecond: AnyObj | null = secondRank;
+  let finalScoreGap: number | null = scoreGap;
+  let matchMode = "STRICT";
+
+  if (strictAmbiguous) {
+    finalClassification = "AMBIGUOUS_TOP_TWO";
+    finalReason = "BEST_AND_SECOND_CANDIDATES_TOO_CLOSE";
+    finalFound = false;
+    matchMode = "STRICT_AMBIGUOUS";
+  }
+
+  if (!initiallyConfident && contextAccepted && contextBest) {
+    finalClassification = "CONFIDENT_MATCH";
+    finalReason = "CONTEXT_FALLBACK_CONFIDENT_MATCH";
+    finalFound = true;
+    finalBest = contextBest;
+    finalSecond = contextSecond;
+    finalScoreGap = contextGap;
+    matchMode = "CONTEXT_FALLBACK";
+  }
 
   const topCandidates =
     ranked
@@ -3316,47 +3415,37 @@ function findHunterTargetMatch(
       );
 
   return {
-    found:
-      initiallyConfident &&
-      !ambiguous,
-
-    best:
-      bestRank.cb,
-
-    second:
-      secondRank
-        ?.cb ??
-      null,
-
-    detail:
-      bestRank.detail,
-
-    secondDetail:
-      secondRank
-        ?.detail ??
-      null,
-
-    classification:
-      finalClassification,
-
-    reason:
-      finalReason,
-
+    found: finalFound,
+    best: finalBest.cb,
+    second: finalSecond?.cb ?? null,
+    detail: finalBest.detail,
+    secondDetail: finalSecond?.detail ?? null,
+    classification: finalClassification,
+    reason: finalReason,
+    matchMode,
+    contextFallback: matchMode === "CONTEXT_FALLBACK" && contextBest
+      ? {
+          accepted: true,
+          context_score: Number(contextBest.context.contextScore.toFixed(3)),
+          home_token: contextBest.context.homeToken,
+          away_token: contextBest.context.awayToken,
+          anchor_count: contextBest.context.anchorCount,
+          strongest_side: Number(contextBest.context.strongestSide.toFixed(3)),
+          weaker_side: Number(contextBest.context.weakerSide.toFixed(3)),
+          competition_known: contextBest.context.competitionKnown,
+          country_known: contextBest.context.countryKnown,
+          competition_ok: contextBest.context.competitionOk,
+          minute_difference: contextBest.context.minuteDiff,
+          score_gap: contextGap
+        }
+      : { accepted: false },
     candidateEvaluations,
-    candidates:
-      candidates.length,
+    candidates: candidates.length,
     minuteCandidates,
     targetMinute,
-
-    bestMinute:
-      bestRank.minute,
-
-    bestMinuteDifference:
-      bestRank
-        .minuteDifference,
-
-    scoreGap,
-
+    bestMinute: finalBest.minute,
+    bestMinuteDifference: finalBest.minuteDifference,
+    scoreGap: finalScoreGap,
     topCandidates
   };
 }
@@ -4144,7 +4233,11 @@ async function runFastHunter(
 
         match_method:
           result.found
-            ? "FAST_HUNTER_LIVE_00_CLOSE_MINUTE_TWO_SIDED"
+            ? (
+                result.matchMode === "CONTEXT_FALLBACK"
+                  ? "FAST_HUNTER_CONTEXT_FALLBACK"
+                  : "FAST_HUNTER_LIVE_00_CLOSE_MINUTE_TWO_SIDED"
+              )
             : null,
 
         score_only_match:
@@ -4218,6 +4311,24 @@ async function runFastHunter(
 
         min_confident_score_gap:
           MIN_CONFIDENT_SCORE_GAP,
+
+        match_mode:
+          result.matchMode ?? "NONE",
+
+        context_fallback:
+          result.contextFallback ?? { accepted: false },
+
+        context_min_competition_score:
+          CONTEXT_MIN_COMPETITION_SCORE,
+
+        context_strong_team_score:
+          CONTEXT_STRONG_TEAM_SCORE,
+
+        context_min_second_team_score:
+          CONTEXT_MIN_SECOND_TEAM_SCORE,
+
+        context_min_score_gap:
+          CONTEXT_MIN_SCORE_GAP,
 
         second_best:
           result.second
@@ -4346,10 +4457,10 @@ async function runFastHunter(
         true,
 
       matcher:
-        "CANDIDATE RANKING + STRICT TWO-SIDED TEAM NORMALIZATION + ALIAS + TOKEN FUZZY + CATEGORY + SCORE GAP PROTECTION",
+        "STRICT TWO-SIDED FIRST + CONTEXT FALLBACK + DISTINCTIVE TOKEN + COMPETITION/MINUTE PROTECTION + SCORE GAP",
 
       hunter_security:
-        "ONLY CONFIDENT_MATCH IS ACCEPTED",
+        "STRICT CONFIDENT_MATCH OR UNIQUE/SEPARATED CONTEXT FALLBACK",
 
       fast_hunter:
         true,
@@ -4694,7 +4805,7 @@ export default {
           true,
 
         filter:
-          "ALL LIVE SOCCER -> 1H + 0:0 + +/-5 MINUTES -> CANDIDATE RANKING -> SCORE GAP",
+          "ALL LIVE SOCCER -> 1H + 0:0 + +/-5 MINUTES -> STRICT MATCH -> CONTEXT FALLBACK -> SCORE GAP",
 
         discovery_market_filter:
           false,
