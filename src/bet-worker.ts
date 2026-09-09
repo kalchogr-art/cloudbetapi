@@ -1,7 +1,14 @@
 // ============================================================
-// CLOUDBET BET WORKER V7.3.2
+// CLOUDBET BET WORKER V7.3.3
 // DRY RUN · TRACKER READY CANDIDATE · EXACT MATCHER ODDS REFRESH
 // EXACT 1H TOTAL GOALS OVER 0.5
+//
+// V7.3.3:
+// - LEGACY bet_archive compatibility
+// - writes required legacy match_id on every archive INSERT
+// - prefers Hunter/V27 match_id; safe fallback is locked Cloudbet event_id
+// - keeps V7.3.2 automatic D1 migration
+// - no Matcher / Tracker / betting logic changes
 //
 // V7.3.2:
 // - SAFE AUTOMATIC D1 SCHEMA MIGRATION
@@ -58,7 +65,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.3.2 D1 AUTO MIGRATION";
+  "V7.3.3 LEGACY ARCHIVE COMPAT";
 
 const MODE =
   "DRY_RUN";
@@ -2625,6 +2632,8 @@ const PENDING_ODDS_COLUMNS:
 
 const BET_ARCHIVE_COLUMNS:
   Record<string, string> = {
+    match_id:
+      "TEXT",
     execution_id:
       "TEXT",
     timestamp:
@@ -2841,6 +2850,7 @@ async function ensureDatabaseSchema(
       .prepare(`
         CREATE TABLE IF NOT EXISTS bet_archive (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
+          match_id TEXT,
           execution_id TEXT,
           timestamp TEXT,
           cloudbet_id TEXT,
@@ -3383,10 +3393,23 @@ async function archiveBet(
         ?.current_odds
     );
 
+  // V7.3.3 legacy D1 compatibility:
+  // production bet_archive may require match_id NOT NULL.
+  const archiveMatchId =
+    safe(
+      signal?.match_id ??
+      signal?.id ??
+      bet?.signal?.match_id ??
+      bet?.match_id ??
+      ""
+    ) ||
+    cloudbetId;
+
   try {
     await env.DB
       .prepare(`
         INSERT INTO bet_archive (
+          match_id,
           execution_id,
           timestamp,
           cloudbet_id,
@@ -3398,9 +3421,10 @@ async function archiveBet(
           selection,
           payload_json
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .bind(
+        archiveMatchId,
         bet.execution_id,
         nowISO(),
         cloudbetId,
