@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.6 REAL-PAYLOAD DRY RUN";
+  "V7.6.7 ONE-SHOT 0.10 USDT";
 
 const MODE =
   "DRY_RUN";
@@ -101,15 +101,16 @@ const TRADING_TRANSPORT =
   "GRAPHQL";
 
 // ONE-SHOT REAL API TEST. This does not enable normal betting.
-// It can send exactly one 100 USDT request, only when the freshly
-// read balance is below 100 USDT, with partial stake disabled.
-const REAL_TEST_ENABLED = false;
-const REAL_TEST_STAKE = 100;
-const REAL_TEST_KEY = "V7.6.3_GRAPHQL_ONE_SHOT_100_USDT";
+// Dedicated one-shot real API test. Normal betting remains disabled.
+// Exactly one 0.10 USDT request can be sent through the explicit confirmed route.
+const REAL_TEST_ENABLED = true;
+const REAL_TEST_STAKE = 0.10;
+const REAL_TEST_KEY = "V7.6.7_GRAPHQL_ONE_SHOT_0_10_USDT";
+const REAL_TEST_CONFIRM = "PLACE_0_10_USDT_ONCE";
 
 // Legacy display/archive value preserved from V7.0.2.
 const BET_STAKE_EUR =
-  10;
+  0.10;
 
 const BET_MARKET =
   "1H Total Goals";
@@ -4558,6 +4559,63 @@ function buildDirectSignal(
   };
 }
 
+async function runExplicitOneShot010(
+  env: Env,
+  eventIdInput: any,
+  confirmInput: any
+): Promise<any> {
+  const eventId = normalizeEventId(eventIdInput);
+  const confirm = safe(confirmInput);
+
+  if (!eventId) {
+    return { success: false, action: "REAL_ONE_SHOT_0_10", attempted: false, error: "EVENT_ID_REQUIRED" };
+  }
+
+  if (confirm !== REAL_TEST_CONFIRM) {
+    return { success: false, action: "REAL_ONE_SHOT_0_10", attempted: false, error: "EXPLICIT_CONFIRMATION_REQUIRED" };
+  }
+
+  const current = await verifySameEventAndOdds(env, eventId);
+  if (!current?.success) {
+    return { success: false, action: "REAL_ONE_SHOT_0_10", attempted: false, error: current?.error || "TARGET_ODDS_NOT_AVAILABLE", current };
+  }
+
+  const price = numberOrNull(current?.current_odds);
+  const minStake = numberOrNull(current?.min_stake);
+  const maxStake = numberOrNull(current?.max_stake);
+  const marketUrl = safe(current?.market_url);
+  const enabled = safe(current?.selection_status) === "SELECTION_ENABLED";
+
+  if (!enabled || price === null || price <= 1 || !marketUrl ||
+      minStake === null || REAL_TEST_STAKE < minStake ||
+      (maxStake !== null && REAL_TEST_STAKE > maxStake)) {
+    return {
+      success: false, action: "REAL_ONE_SHOT_0_10", attempted: false,
+      error: "LIVE_SELECTION_OR_STAKE_VALIDATION_FAILED",
+      event_id: eventId, current_odds: price, min_stake: minStake, max_stake: maxStake,
+      selection_status: current?.selection_status ?? null, market_url: marketUrl || null
+    };
+  }
+
+  const account = await fetchAccountSnapshot(env);
+  const handoff = {
+    graphql_input: { eventId, marketUrl, price: String(price) }
+  };
+
+  const result = await oneShotRealBetTest(env, eventId, handoff, account);
+  return {
+    success: result?.attempted === true,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    action: "REAL_ONE_SHOT_0_10",
+    normal_betting_enabled: BETTING_ENABLED,
+    exact_test_stake: REAL_TEST_STAKE,
+    currency: BET_CURRENCY,
+    event_id: eventId,
+    result
+  };
+}
+
 async function ensureRealTestTable(env: Env): Promise<void> {
   await env.DB.prepare(`
     CREATE TABLE IF NOT EXISTS real_bet_test_guard (
@@ -4589,10 +4647,10 @@ async function oneShotRealBetTest(
     return { attempted: false, reason: "BALANCE_UNAVAILABLE" };
   }
 
-  if (balance >= REAL_TEST_STAKE) {
+  if (balance < REAL_TEST_STAKE) {
     return {
       attempted: false,
-      reason: "SAFETY_BLOCK_BALANCE_CAN_FUND_TEST",
+      reason: "INSUFFICIENT_BALANCE_FOR_0_10_TEST",
       balance,
       test_stake: REAL_TEST_STAKE
     };
@@ -5786,15 +5844,12 @@ async function runDirectPreflight(
   const handoff = buildTradingHandoff(bet, current, account);
   const ready = handoff?.ready_to_send === true;
 
-  const realTest =
-    ready
-      ? await oneShotRealBetTest(
-          env,
-          eventId,
-          handoff,
-          account
-        )
-      : { attempted: false, reason: "PREFLIGHT_NOT_READY" };
+  // V7.6.7 SAFETY: normal preflight NEVER executes the real one-shot test.
+  // The only execution path is the explicit /real-test-010 route with confirmation.
+  const realTest = {
+    attempted: false,
+    reason: "REAL_TEST_REQUIRES_EXPLICIT_CONFIRMED_ROUTE"
+  };
 
   return {
     success: true,
@@ -6302,6 +6357,7 @@ function healthResponse():
       "/health",
       "/run",
       "/preflight",
+      "/real-test-010",
       "/trading-diagnostic",
       "/graphql-diagnostic",
       "/auth-matrix",
@@ -6395,6 +6451,7 @@ export default {
             "/run",
             "/preflight",
             "/real-test-status",
+            "/real-test-010",
             "/trading-diagnostic",
             "/graphql-diagnostic",
             "/auth-matrix",
@@ -6543,6 +6600,12 @@ export default {
         return json(
           await restPostPathDiagnostic(env)
         );
+      }
+
+      if (path === "/real-test-010") {
+        const eventId = url.searchParams.get("event_id");
+        const confirm = url.searchParams.get("confirm");
+        return json(await runExplicitOneShot010(env, eventId, confirm));
       }
 
       if (path === "/graphql-validation-test") {
