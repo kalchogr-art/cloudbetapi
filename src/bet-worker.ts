@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.4.1 TRADING GET DIAGNOSTIC";
+  "V7.4.2 V4 STRAIGHT PAYLOAD FIX";
 
 const MODE =
   "DRY_RUN";
@@ -2553,13 +2553,10 @@ function buildTradingHandoff(
       stake:
         BET_STAKE,
 
-      acceptPartialStake:
-        true,
-
-      priceChange: {
-        value:
-          "BETTER"
-      },
+      // Cloudbet Trading API v4 straight-bet schema:
+      // priceChange is the enum value itself, not { value: "BETTER" }.
+      priceChange:
+        "BETTER",
 
       selection: {
         eventId,
@@ -4193,7 +4190,7 @@ async function oneShotRealBetTest(
     referenceId: crypto.randomUUID(),
     currency: BET_CURRENCY,
     stake: String(REAL_TEST_STAKE),
-    acceptPartialStake: false,
+    priceChange: "BETTER",
     selection: {
       ...handoff.body.selection,
       eventId
@@ -4241,7 +4238,7 @@ async function oneShotRealBetTest(
         event_id: eventId,
         currency: BET_CURRENCY,
         stake: REAL_TEST_STAKE,
-        accept_partial_stake: false,
+        price_change: "BETTER",
         market_url: payload.selection.marketUrl,
         price: payload.selection.price,
         balance_before_request: balance
@@ -4393,6 +4390,34 @@ async function tradingDiagnostic(
       processing_ms: Date.now() - started
     };
   }
+}
+
+function v4StraightPayloadPreview(): any {
+  return {
+    success: true,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    action: "V4_STRAIGHT_PAYLOAD_PREVIEW",
+    safe_read_only: true,
+    wager_sent: false,
+    schema: {
+      referenceId: "<UUID>",
+      currency: BET_CURRENCY,
+      stake: "<STAKE>",
+      priceChange: "BETTER",
+      selection: {
+        eventId: "<EXACT_CLOUDBET_EVENT_ID>",
+        marketUrl: "<EXACT_MARKET_URL>",
+        price: "<CURRENT_PRICE>"
+      }
+    },
+    removed_from_v7_4_0: [
+      "acceptPartialStake",
+      "priceChange.value wrapper"
+    ],
+    one_shot_rearmed: false,
+    one_shot_key: REAL_TEST_KEY
+  };
 }
 
 async function realTestStatus(env: Env): Promise<any> {
@@ -5492,6 +5517,7 @@ function healthResponse():
       "/run",
       "/preflight",
       "/trading-diagnostic",
+      "/trading-payload-preview",
       "/diagnostic",
       "/entries"
     ]
@@ -5602,8 +5628,8 @@ export default {
               REAL_TEST_ENABLED,
             one_shot_test_stake:
               REAL_TEST_STAKE,
-            partial_stake_for_test:
-              false
+            v4_payload_schema_fixed:
+              true
           },
 
           endpoints: [
@@ -5613,6 +5639,7 @@ export default {
             "/preflight",
             "/real-test-status",
             "/trading-diagnostic",
+            "/trading-payload-preview",
             "/diagnostic",
             "/entries"
           ]
@@ -5734,6 +5761,15 @@ export default {
 
         return json(
           await tradingDiagnostic(env)
+        );
+      }
+
+      if (
+        path ===
+        "/trading-payload-preview"
+      ) {
+        return json(
+          v4StraightPayloadPreview()
         );
       }
 
