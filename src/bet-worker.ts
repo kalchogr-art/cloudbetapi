@@ -64,6 +64,8 @@ interface Env {
   MATCHER: Fetcher;
   DB: D1Database;
   CLOUDBET_API_KEY?: string;
+  TELEGRAM_BOT_TOKEN?: string;
+  TELEGRAM_CHAT_ID?: string;
 }
 
 type Obj = Record<string, any>;
@@ -73,7 +75,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.8 HARD SAFETY GATES 0.10 USDT";
+  "V7.6.9 BET ARCHIVE + TELEGRAM 0.10 USDT";
 
 const MODE =
   "DRY_RUN";
@@ -3644,7 +3646,8 @@ async function archiveBet(
 
 async function processPending(
   env: Env,
-  account: AccountSnapshot
+  account: AccountSnapshot,
+  current?: CurrentOddsResult
 ): Promise<any> {
   const rows =
     await loadPending(
@@ -4499,6 +4502,215 @@ function buildDirectSignal(
   };
 }
 
+
+// ============================================================
+// V7.6.9 — REAL BET ARCHIVE + TELEGRAM
+// Separate from legacy bet_archive (which also contains DRY_RUN rows).
+// Every real PlaceBet response is persisted here by reference_id.
+// Telegram failure NEVER changes the wager result.
+// ============================================================
+
+async function ensureRealBetArchiveTable(env: Env): Promise<void> {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS real_bet_archive (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      reference_id TEXT UNIQUE,
+      event_id TEXT NOT NULL,
+      match TEXT,
+      home TEXT,
+      away TEXT,
+      market_url TEXT NOT NULL,
+      market TEXT NOT NULL,
+      selection TEXT NOT NULL,
+      currency TEXT NOT NULL,
+      stake REAL NOT NULL,
+      odds REAL,
+      bet_status TEXT,
+      bet_error_code TEXT,
+      http_status INTEGER,
+      transport TEXT,
+      source TEXT,
+      response_json TEXT,
+      telegram_status TEXT,
+      telegram_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_real_bet_archive_reference
+    ON real_bet_archive(reference_id)
+  `).run();
+
+  await env.DB.prepare(`
+    CREATE INDEX IF NOT EXISTS idx_real_bet_archive_event
+    ON real_bet_archive(event_id, market_url)
+  `).run();
+}
+
+function cloudbetEventTeams(event: any): { match: string; home: string; away: string } {
+  const home = safe(event?.home?.name || event?.home?.team?.name || event?.home || "");
+  const away = safe(event?.away?.name || event?.away?.team?.name || event?.away || "");
+  const match = home && away ? `${home} - ${away}` : safe(event?.name || event?.match || "");
+  return { match, home, away };
+}
+
+function telegramEscape(value: any): string {
+  // Plain-text Telegram message; normalize only control whitespace.
+  return safe(value).replace(/[\r\n]+/g, " ");
+}
+
+async function sendTelegramMessage(env: Env, text: string): Promise<any> {
+  const token = safe(env.TELEGRAM_BOT_TOKEN);
+  const chatId = safe(env.TELEGRAM_CHAT_ID);
+
+  if (!token || !chatId) {
+    return {
+      sent: false,
+      skipped: true,
+      reason: !token ? "TELEGRAM_BOT_TOKEN_MISSING" : "TELEGRAM_CHAT_ID_MISSING"
+    };
+  }
+
+  try {
+    const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        disable_web_page_preview: true
+      })
+    });
+
+    const raw = await response.text();
+    let body: any = null;
+    try { body = raw ? JSON.parse(raw) : null; } catch { body = raw || null; }
+
+    return {
+      sent: response.ok && body?.ok !== false,
+      skipped: false,
+      http_status: response.status,
+      error: response.ok && body?.ok !== false ? null : safe(body?.description || raw || `HTTP_${response.status}`),
+      body
+    };
+  } catch (error) {
+    return {
+      sent: false,
+      skipped: false,
+      http_status: 0,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+function realBetTelegramText(ctx: any): string {
+  const status = safe(ctx.bet_status).toUpperCase();
+  const title = status === "ACCEPTED"
+    ? "✅ BET ACCEPTED"
+    : status === "REJECTED"
+      ? "❌ BET REJECTED"
+      : "✅ BET PLACED";
+
+  const lines = [
+    title,
+    "",
+    `⚽ ${telegramEscape(ctx.match || `${ctx.home || ""} - ${ctx.away || ""}`) || `Event ${ctx.event_id}`}`,
+    `🎯 1H Over 0.5`,
+    `💰 Stake: ${Number(ctx.stake).toFixed(2)} ${telegramEscape(ctx.currency)}`,
+    `📈 Odds: ${ctx.odds ?? "—"}`,
+    `🧾 Status: ${status || "UNKNOWN"}`,
+    `🔑 Reference ID: ${telegramEscape(ctx.reference_id)}`
+  ];
+
+  if (ctx.bet_error_code) lines.push(`⚠️ Error: ${telegramEscape(ctx.bet_error_code)}`);
+  return lines.join("\n");
+}
+
+async function archiveAndNotifyRealBet(env: Env, ctx: any): Promise<any> {
+  await ensureRealBetArchiveTable(env);
+
+  const now = nowISO();
+  const referenceId = safe(ctx.reference_id);
+  if (!referenceId) {
+    return { archived: false, telegram: { sent: false, skipped: true, reason: "REFERENCE_ID_MISSING" } };
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO real_bet_archive (
+      reference_id, event_id, match, home, away,
+      market_url, market, selection, currency, stake, odds,
+      bet_status, bet_error_code, http_status, transport, source,
+      response_json, telegram_status, telegram_error, created_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+    ON CONFLICT(reference_id) DO UPDATE SET
+      bet_status = excluded.bet_status,
+      bet_error_code = excluded.bet_error_code,
+      http_status = excluded.http_status,
+      response_json = excluded.response_json,
+      updated_at = excluded.updated_at
+  `).bind(
+    referenceId,
+    safe(ctx.event_id),
+    safe(ctx.match) || null,
+    safe(ctx.home) || null,
+    safe(ctx.away) || null,
+    safe(ctx.market_url),
+    BET_MARKET,
+    BET_SELECTION,
+    safe(ctx.currency || BET_CURRENCY),
+    numberOrNull(ctx.stake) ?? 0,
+    numberOrNull(ctx.odds),
+    safe(ctx.bet_status) || null,
+    safe(ctx.bet_error_code) || null,
+    numberOrNull(ctx.http_status),
+    safe(ctx.transport || "GRAPHQL"),
+    safe(ctx.source || "REAL_PLACEBET"),
+    JSON.stringify(ctx.response ?? null).slice(0, 20000),
+    now,
+    now
+  ).run();
+
+  const telegram = await sendTelegramMessage(env, realBetTelegramText(ctx));
+
+  await env.DB.prepare(`
+    UPDATE real_bet_archive
+    SET telegram_status = ?, telegram_error = ?, updated_at = ?
+    WHERE reference_id = ?
+  `).bind(
+    telegram.sent ? "SENT" : (telegram.skipped ? "SKIPPED" : "FAILED"),
+    safe(telegram.error || telegram.reason) || null,
+    nowISO(),
+    referenceId
+  ).run();
+
+  return { archived: true, telegram };
+}
+
+async function listRealBets(env: Env, limitInput: any): Promise<any> {
+  await ensureRealBetArchiveTable(env);
+  const parsed = Number(limitInput);
+  const limit = Number.isFinite(parsed) ? Math.max(1, Math.min(100, Math.floor(parsed))) : 25;
+  const result = await env.DB.prepare(`
+    SELECT reference_id, event_id, match, home, away, market_url, market, selection,
+           currency, stake, odds, bet_status, bet_error_code, http_status, transport,
+           source, telegram_status, telegram_error, created_at, updated_at
+    FROM real_bet_archive
+    ORDER BY id DESC
+    LIMIT ?
+  `).bind(limit).all<any>();
+
+  return {
+    success: true,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    action: "REAL_BET_ARCHIVE",
+    count: (result.results || []).length,
+    bets: result.results || []
+  };
+}
+
 // ============================================================
 // HARD GATE #5 — REAL BET DUPLICATE PROTECTION
 // One real bet max per Cloudbet event + exact target market URL.
@@ -4590,7 +4802,7 @@ async function runExplicitOneShot010(
     graphql_input: { eventId, marketUrl, price: String(price) }
   };
 
-  const result = await oneShotRealBetTest(env, eventId, handoff, account);
+  const result = await oneShotRealBetTest(env, eventId, handoff, account, current);
   return {
     success: result?.attempted === true,
     worker: "cloudbet-bet-worker",
@@ -4760,9 +4972,32 @@ async function oneShotRealBetTest(
       WHERE test_key = ?
     `).bind(httpStatus, stored, nowISO(), REAL_TEST_KEY).run();
 
+    const placeBet = responseBody?.data?.placeBet ?? null;
+    const teams = cloudbetEventTeams(current?.event);
+    const archive_notification = placeBet?.referenceId
+      ? await archiveAndNotifyRealBet(env, {
+          reference_id: placeBet.referenceId,
+          event_id: placeBet.eventId || eventId,
+          match: teams.match,
+          home: teams.home,
+          away: teams.away,
+          market_url: placeBet.marketUrl || input.marketUrl,
+          currency: placeBet.currency || BET_CURRENCY,
+          stake: placeBet.stake || REAL_TEST_STAKE,
+          odds: placeBet.price || input.price,
+          bet_status: placeBet.betStatus,
+          bet_error_code: placeBet.betErrorCode,
+          http_status: httpStatus,
+          transport: "GRAPHQL",
+          source: "REAL_ONE_SHOT_0_10",
+          response: responseBody
+        })
+      : { archived: false, telegram: { sent: false, skipped: true, reason: "PLACEBET_REFERENCE_ID_MISSING" } };
+
     return {
       attempted: true,
       one_shot_consumed: true,
+      archive_notification,
       transport: "GRAPHQL",
       request: {
         endpoint: GRAPHQL_ENDPOINT,
@@ -6353,6 +6588,7 @@ function healthResponse():
       "/run",
       "/preflight",
       "/real-test-010",
+      "/real-bets",
       "/trading-diagnostic",
       "/graphql-diagnostic",
       "/auth-matrix",
@@ -6437,6 +6673,10 @@ export default {
             real_betting: false,
             one_shot_real_test: REAL_TEST_ENABLED,
             one_shot_test_stake: REAL_TEST_STAKE,
+            real_bet_archive: true,
+            telegram_notifications: true,
+            telegram_bot_token_present: !!safe(env.TELEGRAM_BOT_TOKEN),
+            telegram_chat_id_present: !!safe(env.TELEGRAM_CHAT_ID),
             v4_payload_schema_fixed: true
           },
 
@@ -6522,6 +6762,13 @@ export default {
         return json(
           await realTestStatus(env)
         );
+      }
+
+      if (path === "/real-bets") {
+        if (request.method !== "GET") {
+          return json({ success: false, worker: "cloudbet-bet-worker", version: VERSION, error: "METHOD_NOT_ALLOWED", expected_method: "GET" }, 405);
+        }
+        return json(await listRealBets(env, url.searchParams.get("limit")));
       }
 
       if (path === "/trading-diagnostic") {
