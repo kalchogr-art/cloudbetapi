@@ -75,7 +75,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.12 PENDING ODDS AUTO BET FIX 0.10 USDT";
+  "V7.6.13 SCORE UNKNOWN ALLOWED 0.10 USDT";
 
 const MODE =
   "DRY_RUN";
@@ -1200,12 +1200,10 @@ function eventStillValidForTarget(
   const period = cloudbetPeriod(event);
   const minute = cloudbetMinute(event);
 
-  // HARD GATE #1 — score must be explicitly known and exactly 0:0.
-  if (!score.known) {
-    return { valid: false, reason: "SCORE_UNKNOWN", score, period, minute };
-  }
-
-  if (score.home !== 0 || score.away !== 0) {
+  // HARD GATE #1 — if Cloudbet exposes the score, it must still be exactly 0:0.
+  // Some live Cloudbet events do not expose a live score at all. In that case
+  // SCORE_UNKNOWN is allowed to continue to the remaining safety gates.
+  if (score.known && (score.home !== 0 || score.away !== 0)) {
     return { valid: false, reason: "SCORE_NOT_0_0", score, period, minute };
   }
 
