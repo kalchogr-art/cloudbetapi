@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.4 GRAPHQL SAFE VALIDATION";
+  "V7.6.5 GRAPHQL ZERO-STAKE VALIDATION";
 
 const MODE =
   "DRY_RUN";
@@ -4020,21 +4020,21 @@ function graphqlTradingPayloadPreview(): any {
 
 
 // ============================================================
-// V7.6.4 — SAFE GRAPHQL PLACEBET VALIDATION
+// V7.6.5 — SAFE GRAPHQL ZERO-STAKE VALIDATION
 //
 // Purpose:
 // - locks to one REAL Cloudbet event id
 // - refreshes REAL current odds for the exact 1H O0.5 selection
 // - sends the real eventId / marketUrl / price to GraphQL placeBet
-// - deliberately sends a NON-NUMERIC stake so no valid wager exists
+// - deliberately sends numeric ZERO stake so no valid wager exists
 // - never uses BET_STAKE / REAL_TEST_STAKE
 //
 // This is NOT a read-only HTTP request: it does call the placeBet resolver.
 // It is intentionally non-wagering because the stake is invalid by design.
 // ============================================================
 
-const GRAPHQL_VALIDATION_INVALID_STAKE =
-  "INVALID_DIAGNOSTIC_STAKE";
+const GRAPHQL_VALIDATION_ZERO_STAKE =
+  "0";
 
 function graphqlErrorMessages(body: any): string[] {
   if (!Array.isArray(body?.errors)) {
@@ -4097,7 +4097,7 @@ async function runGraphqlSafeValidation(
       success: false,
       worker: "cloudbet-bet-worker",
       version: VERSION,
-      action: "GRAPHQL_SAFE_VALIDATION",
+      action: "GRAPHQL_ZERO_STAKE_VALIDATION",
       valid_wager_sent: false,
       placebet_request_sent: false,
       error: "EVENT_ID_REQUIRED",
@@ -4113,7 +4113,7 @@ async function runGraphqlSafeValidation(
       success: false,
       worker: "cloudbet-bet-worker",
       version: VERSION,
-      action: "GRAPHQL_SAFE_VALIDATION",
+      action: "GRAPHQL_ZERO_STAKE_VALIDATION",
       event_id: eventId,
       valid_wager_sent: false,
       placebet_request_sent: false,
@@ -4130,7 +4130,7 @@ async function runGraphqlSafeValidation(
       success: false,
       worker: "cloudbet-bet-worker",
       version: VERSION,
-      action: "GRAPHQL_SAFE_VALIDATION",
+      action: "GRAPHQL_ZERO_STAKE_VALIDATION",
       event_id: eventId,
       valid_wager_sent: false,
       placebet_request_sent: false,
@@ -4148,7 +4148,7 @@ async function runGraphqlSafeValidation(
       success: false,
       worker: "cloudbet-bet-worker",
       version: VERSION,
-      action: "GRAPHQL_SAFE_VALIDATION",
+      action: "GRAPHQL_ZERO_STAKE_VALIDATION",
       event_id: eventId,
       valid_wager_sent: false,
       placebet_request_sent: false,
@@ -4168,27 +4168,31 @@ async function runGraphqlSafeValidation(
     price: String(price),
     currency: BET_CURRENCY,
     marketUrl,
-    // CRITICAL SAFETY GUARD: never replace this with a number here.
-    stake: GRAPHQL_VALIDATION_INVALID_STAKE
+    // CRITICAL SAFETY GUARD: diagnostic stake must remain exactly zero.
+    stake: GRAPHQL_VALIDATION_ZERO_STAKE
   };
 
-  // Defense in depth: refuse to send if the diagnostic stake ever becomes numeric.
-  if (/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(safe(input.stake))) {
+  const minStake = numberOrNull(current?.min_stake);
+
+  // Defense in depth: zero must be strictly below the live minimum stake.
+  if (safe(input.stake) !== "0" || minStake === null || minStake <= 0) {
     return {
       success: false,
       worker: "cloudbet-bet-worker",
       version: VERSION,
-      action: "GRAPHQL_SAFE_VALIDATION",
+      action: "GRAPHQL_ZERO_STAKE_VALIDATION",
       event_id: eventId,
       valid_wager_sent: false,
       placebet_request_sent: false,
-      error: "SAFETY_GUARD_BLOCKED_NUMERIC_DIAGNOSTIC_STAKE",
+      error: "SAFETY_GUARD_ZERO_STAKE_NOT_CONFIRMED_BELOW_MIN",
+      diagnostic_stake: input.stake,
+      min_stake: minStake,
       processing_ms: Date.now() - started
     };
   }
 
   const query = `
-    mutation V764SafeValidation($input: PlaceBetInput!) {
+    mutation V765ZeroStakeValidation($input: PlaceBetInput!) {
       placeBet(input: $input) {
         referenceId
         eventId
@@ -4239,7 +4243,7 @@ async function runGraphqlSafeValidation(
       success: true,
       worker: "cloudbet-bet-worker",
       version: VERSION,
-      action: "GRAPHQL_SAFE_VALIDATION",
+      action: "GRAPHQL_ZERO_STAKE_VALIDATION",
       safe_non_wagering_test: true,
       valid_wager_sent: false,
       placebet_request_sent: true,
@@ -4251,21 +4255,24 @@ async function runGraphqlSafeValidation(
       current_odds: price,
       market_url: marketUrl,
       currency: BET_CURRENCY,
-      diagnostic_stake: GRAPHQL_VALIDATION_INVALID_STAKE,
+      diagnostic_stake: GRAPHQL_VALIDATION_ZERO_STAKE,
+      min_stake: minStake,
       safety: {
         real_stake_used: false,
         bet_stake_constant_used: false,
         real_test_stake_used: false,
-        diagnostic_stake_is_numeric: false
+        diagnostic_stake_is_numeric: true,
+        diagnostic_stake_is_zero: true,
+        diagnostic_stake_below_min: minStake > 0
       },
       request: {
-        operation: "V764SafeValidation",
+        operation: "V765ZeroStakeValidation",
         reference_id: referenceId,
         event_id: eventId,
         price: String(price),
         currency: BET_CURRENCY,
         market_url: marketUrl,
-        stake: GRAPHQL_VALIDATION_INVALID_STAKE
+        stake: GRAPHQL_VALIDATION_ZERO_STAKE
       },
       response: {
         ok: response.ok,
@@ -4282,7 +4289,7 @@ async function runGraphqlSafeValidation(
       success: false,
       worker: "cloudbet-bet-worker",
       version: VERSION,
-      action: "GRAPHQL_SAFE_VALIDATION",
+      action: "GRAPHQL_ZERO_STAKE_VALIDATION",
       safe_non_wagering_test: true,
       valid_wager_sent: false,
       placebet_request_sent: false,
