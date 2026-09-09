@@ -1,7 +1,14 @@
 // ============================================================
-// CLOUDBET BET WORKER V7.3.3
+// CLOUDBET BET WORKER V7.3.4
 // DRY RUN · TRACKER READY CANDIDATE · EXACT MATCHER ODDS REFRESH
 // EXACT 1H TOTAL GOALS OVER 0.5
+//
+// V7.3.4:
+// - dynamic legacy bet_archive compatibility
+// - reads production schema with PRAGMA table_info(bet_archive)
+// - fills known required legacy columns (match_id/result/status/mode/etc.)
+// - blocks clearly on unknown required columns instead of inventing data
+// - no Matcher / Tracker / betting logic changes
 //
 // V7.3.3:
 // - LEGACY bet_archive compatibility
@@ -65,7 +72,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.3.3 LEGACY ARCHIVE COMPAT";
+  "V7.3.4 DYNAMIC LEGACY ARCHIVE";
 
 const MODE =
   "DRY_RUN";
@@ -2634,6 +2641,12 @@ const BET_ARCHIVE_COLUMNS:
   Record<string, string> = {
     match_id:
       "TEXT",
+    result:
+      "TEXT",
+    status:
+      "TEXT",
+    mode:
+      "TEXT",
     execution_id:
       "TEXT",
     timestamp:
@@ -2851,6 +2864,9 @@ async function ensureDatabaseSchema(
         CREATE TABLE IF NOT EXISTS bet_archive (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           match_id TEXT,
+          result TEXT,
+          status TEXT,
+          mode TEXT,
           execution_id TEXT,
           timestamp TEXT,
           cloudbet_id TEXT,
@@ -3317,6 +3333,208 @@ async function incrementPendingMissing(
   };
 }
 
+
+// ============================================================
+// V7.3.4 — DYNAMIC LEGACY ARCHIVE HELPERS
+// ============================================================
+
+async function getBetArchiveSchema(
+  env: Env
+): Promise<D1ColumnInfo[]> {
+  const result =
+    await env.DB
+      .prepare(
+        "PRAGMA table_info(bet_archive)"
+      )
+      .all<D1ColumnInfo>();
+
+  return result.results || [];
+}
+
+function getLegacyArchiveValue(
+  name: string,
+  ctx: any
+): any {
+  const key = name.toLowerCase();
+
+  switch (key) {
+    case "match_id":
+    case "signal_match_id":
+      return ctx.match_id;
+
+    case "result":
+      return "PREFLIGHT_READY";
+
+    case "status":
+      return "ARCHIVED";
+
+    case "mode":
+      return MODE;
+
+    case "execution_id":
+      return ctx.execution_id;
+
+    case "timestamp":
+    case "created_at":
+    case "updated_at":
+      return nowISO();
+
+    case "cloudbet_id":
+    case "event_id":
+      return ctx.cloudbet_id;
+
+    case "match":
+    case "match_name":
+      return signalMatch(ctx.signal);
+
+    case "home":
+    case "home_team":
+      return signalHome(ctx.signal);
+
+    case "away":
+    case "away_team":
+      return signalAway(ctx.signal);
+
+    case "odds":
+    case "entry_odds":
+    case "current_odds":
+      return ctx.current_odds;
+
+    case "stake_eur":
+    case "stake":
+      return BET_STAKE_EUR;
+
+    case "market":
+      return BET_MARKET;
+
+    case "selection":
+      return BET_SELECTION;
+
+    case "entry_minute":
+    case "minute":
+      return ctx.signal?.entry_minute ?? ctx.signal?.minute ?? null;
+
+    case "hunter_score":
+      return ctx.signal?.hunter_score ?? ctx.signal?.score ?? null;
+
+    case "payload_json":
+    case "payload":
+      return ctx.payload_json;
+
+    default:
+      return undefined;
+  }
+}
+
+async function insertArchiveCompatible(
+  env: Env,
+  base: Record<string, any>,
+  ctx: any
+): Promise<any> {
+  const schema =
+    await getBetArchiveSchema(env);
+
+  const valuesByColumn:
+    Record<string, any> = {
+      ...base
+    };
+
+  const filled:
+    string[] = [];
+
+  for (const col of schema) {
+    const name =
+      safe(col?.name).toLowerCase();
+
+    if (!name) continue;
+
+    if (
+      name === "id" &&
+      Number(col?.pk || 0) === 1
+    ) {
+      continue;
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(
+        valuesByColumn,
+        name
+      )
+    ) {
+      continue;
+    }
+
+    const mapped =
+      getLegacyArchiveValue(
+        name,
+        ctx
+      );
+
+    if (mapped !== undefined) {
+      valuesByColumn[name] =
+        mapped;
+
+      filled.push(name);
+      continue;
+    }
+
+    const required =
+      Number(col?.notnull || 0) === 1;
+
+    const hasDefault =
+      col?.dflt_value !== null &&
+      col?.dflt_value !== undefined;
+
+    if (required && !hasDefault) {
+      throw new Error(
+        `UNSUPPORTED_REQUIRED_LEGACY_COLUMN:${col?.name}`
+      );
+    }
+  }
+
+  const validNames =
+    new Set(
+      schema
+        .map(
+          c =>
+            safe(c?.name)
+              .toLowerCase()
+        )
+        .filter(Boolean)
+    );
+
+  const columns =
+    Object.keys(valuesByColumn)
+      .filter(
+        c =>
+          validNames.has(c)
+      );
+
+  const placeholders =
+    columns.map(() => "?")
+      .join(", ");
+
+  const sql =
+    `INSERT INTO bet_archive (${columns.join(", ")}) VALUES (${placeholders})`;
+
+  const values =
+    columns.map(
+      c =>
+        valuesByColumn[c]
+    );
+
+  await env.DB
+    .prepare(sql)
+    .bind(...values)
+    .run();
+
+  return {
+    columns,
+    legacy_filled: filled
+  };
+}
+
+
 // ============================================================
 // ARCHIVE
 // ============================================================
@@ -3406,46 +3624,54 @@ async function archiveBet(
     cloudbetId;
 
   try {
-    await env.DB
-      .prepare(`
-        INSERT INTO bet_archive (
-          match_id,
-          execution_id,
-          timestamp,
-          cloudbet_id,
-          home,
-          away,
-          odds,
-          stake_eur,
-          market,
-          selection,
-          payload_json
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `)
-      .bind(
-        archiveMatchId,
-        bet.execution_id,
-        nowISO(),
-        cloudbetId,
-        signalHome(
-          signal
-        ),
-        signalAway(
-          signal
-        ),
-        currentOdds,
-        BET_STAKE_EUR,
-        BET_MARKET,
-        BET_SELECTION,
-        JSON.stringify({
-          bet,
+    const archivePayloadJson =
+      JSON.stringify({
+        signal,
+        bet,
+        current
+      });
+
+    const archiveInsert =
+      await insertArchiveCompatible(
+        env,
+        {
+          match_id:
+            archiveMatchId,
+          execution_id:
+            bet.execution_id,
+          timestamp:
+            nowISO(),
+          cloudbet_id:
+            cloudbetId,
+          home:
+            signalHome(signal),
+          away:
+            signalAway(signal),
+          odds:
+            currentOdds,
+          stake_eur:
+            BET_STAKE_EUR,
+          market:
+            BET_MARKET,
+          selection:
+            BET_SELECTION,
+          payload_json:
+            archivePayloadJson
+        },
+        {
+          match_id:
+            archiveMatchId,
+          execution_id:
+            bet.execution_id,
+          cloudbet_id:
+            cloudbetId,
           signal,
-          current_check:
-            current
-        })
-      )
-      .run();
+          current_odds:
+            currentOdds,
+          payload_json:
+            archivePayloadJson
+        }
+      );
 
     return {
       success:
@@ -3458,6 +3684,10 @@ async function archiveBet(
         bet.execution_id,
       cloudbet_id:
         cloudbetId,
+      archive_columns:
+        archiveInsert.columns,
+      legacy_columns_filled:
+        archiveInsert.legacy_filled,
       entry_odds:
         bet?.odds
           ?.entry_odds ??
