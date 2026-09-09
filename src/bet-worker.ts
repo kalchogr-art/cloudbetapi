@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.1 POST AUTH DIAGNOSTIC";
+  "V7.6.2 POST AUTH DIAGNOSTIC FIX";
 
 const MODE =
   "DRY_RUN";
@@ -4940,18 +4940,39 @@ async function restPostPathDiagnostic(env: Env): Promise<any> {
       )
     );
 
+  // V7.6.2 FIX:
+  // A GraphQL POST can be authenticated/reach the API even when a resolver
+  // returns an application-level INTERNAL_SERVER_ERROR. The important
+  // distinction here is that the request was not rejected with HTTP 401/403.
   const graphqlAuthenticated =
-    graphqlReadOnly?.http_status === 200 &&
     graphqlReadOnly?.body_type === "JSON" &&
-    graphqlReadErrors.length === 0 &&
-    Array.isArray(
-      graphqlReadOnly?.body?.data?.accountBalances
+    ![401, 403].includes(
+      graphqlReadOnly?.http_status
+    ) &&
+    [200, 400].includes(
+      graphqlReadOnly?.http_status
     );
 
+  const graphqlMutationErrorText =
+    graphqlMutationErrors
+      .map((e: any) => String(e?.message ?? ""))
+      .join(" | ")
+      .toLowerCase();
+
+  // Cloudbet returns HTTP 400 for GraphQL variable validation errors.
+  // That still proves that POST /graphql, the placeBet mutation and
+  // PlaceBetInput! schema validation were reached. No wager is formed.
   const graphqlMutationValidationReached =
-    graphqlPlaceBetNoInput?.http_status === 200 &&
     graphqlPlaceBetNoInput?.body_type === "JSON" &&
-    graphqlMutationErrors.length > 0;
+    [200, 400].includes(
+      graphqlPlaceBetNoInput?.http_status
+    ) &&
+    graphqlMutationErrors.length > 0 &&
+    (
+      graphqlMutationErrorText.includes("placebetinput") ||
+      graphqlMutationErrorText.includes('variable "$input"') ||
+      graphqlMutationErrorText.includes("non-null type")
+    );
 
   let interpretation =
     "POST_AUTH_DIAGNOSTIC_MIXED_RESULT";
@@ -4975,10 +4996,10 @@ async function restPostPathDiagnostic(env: Env): Promise<any> {
     graphqlMutationValidationReached
   ) {
     interpretation =
-      "REST_POST_401_BUT_GRAPHQL_POST_AND_PLACEBET_PATH_REACHED";
+      "REST_POST_401_BUT_GRAPHQL_PLACEBET_PATH_REACHED";
 
     recommendedNextStep =
-      "GRAPHQL_POST_AUTH_WORKS_REST_V4_POST_PATH_OR_PERMISSION_IS_THE_PROBLEM";
+      "USE_GRAPHQL_PLACEBET_PATH_FOR_NEXT_CONTROLLED_TEST";
   } else if (
     restGetAuthenticated &&
     restPostUnauthorized &&
@@ -5053,7 +5074,9 @@ async function restPostPathDiagnostic(env: Env): Promise<any> {
       graphql_post_authenticated:
         graphqlAuthenticated,
       graphql_place_bet_validation_reached:
-        graphqlMutationValidationReached
+        graphqlMutationValidationReached,
+      graphql_account_resolver_error:
+        graphqlReadErrors.length > 0
     },
 
     probes: {
