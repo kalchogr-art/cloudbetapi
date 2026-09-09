@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7.6.4
+// CLOUDBET MATCH MATCHER V7.6.5
 // CANDIDATE RANKING + D1 DIAGNOSTICS + SEPARATE ODDS LOOKUP
 // LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
 // V27 SERVICE BINDING + DIRECT CLOUDBET PUBLIC SPORTS API
@@ -26,6 +26,14 @@
 //
 // - /diagnostic
 //   -> light V27 + Cloudbet diagnostic
+//
+// V7.6.5 FIXES:
+// - provider abbreviation recovery: QPR <-> Queens Park Rangers
+// - provider abbreviation recovery: PSG <-> Paris Saint Germain
+// - common short form recovery: Atl. Madrid <-> Atletico Madrid
+// - generic provider suffix/prefix cleanup expanded
+// - single distinctive-token short/full match strengthened from 0.88 to 0.92
+// - acronym recovery is conservative and still requires the existing two-sided, category, minute and ambiguity protections
 //
 // V7.6.4 FIXES:
 // - STRONG EVENT RECOVERY when the normal +/-5 minute window has zero candidates
@@ -65,7 +73,7 @@ interface Env {
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.6.4-STRONG-EVENT-RECOVERY";
+  "V7.6.5-NAME-NORMALIZATION-ACRONYM-FIX";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -262,6 +270,21 @@ const TEAM_ALIASES:
   "paris sg":
     "paris saint germain",
 
+  "psg fc":
+    "paris saint germain",
+
+  "paris saint germain fc":
+    "paris saint germain",
+
+  "qpr":
+    "queens park rangers",
+
+  "queens park rangers fc":
+    "queens park rangers",
+
+  "queens park rangers":
+    "queens park rangers",
+
   "inter":
     "inter milan",
 
@@ -278,6 +301,18 @@ const TEAM_ALIASES:
     "atletico madrid",
 
   "atletico de madrid":
+    "atletico madrid",
+
+  "atl madrid":
+    "atletico madrid",
+
+  "atl de madrid":
+    "atletico madrid",
+
+  "at madrid":
+    "atletico madrid",
+
+  "atletico madrid fc":
     "atletico madrid",
 
   "sporting cp":
@@ -382,6 +417,12 @@ const GENERIC_WORDS =
     "sv",
     "vfb",
     "vfl",
+    "cfc",
+    "ffc",
+    "rfc",
+    "rsc",
+    "ssc",
+    "sa",
     "club",
     "calcio",
     "spa",
@@ -779,6 +820,75 @@ function tokenSimilarity(
 
 
 // ============================================================
+// V7.6.5 CONSERVATIVE ACRONYM MATCH
+// ============================================================
+
+function teamAcronym(
+  value: string
+): string {
+
+  const tokens =
+    value
+      .split(" ")
+      .filter(Boolean);
+
+  if (
+    tokens.length < 2 ||
+    tokens.length > 5
+  ) {
+    return "";
+  }
+
+  return tokens
+    .map(token => token[0] ?? "")
+    .join("");
+}
+
+
+function acronymTeamMatch(
+  A: string,
+  B: string
+): boolean {
+
+  const aTokens =
+    A.split(" ")
+      .filter(Boolean);
+
+  const bTokens =
+    B.split(" ")
+      .filter(Boolean);
+
+  const aSingle =
+    aTokens.length === 1
+      ? aTokens[0]
+      : "";
+
+  const bSingle =
+    bTokens.length === 1
+      ? bTokens[0]
+      : "";
+
+  if (
+    aSingle.length >= 2 &&
+    aSingle.length <= 5 &&
+    aSingle === teamAcronym(B)
+  ) {
+    return true;
+  }
+
+  if (
+    bSingle.length >= 2 &&
+    bSingle.length <= 5 &&
+    bSingle === teamAcronym(A)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+
+// ============================================================
 // TEAM SCORE
 // ============================================================
 
@@ -817,6 +927,19 @@ function teamScore(
     )
   ) {
     return 0;
+  }
+
+  // V7.6.5: conservative acronym recovery.
+  // Examples: QPR <-> Queens Park Rangers, PSG <-> Paris Saint Germain.
+  // Category protection has already passed above and the match still has
+  // to pass the existing two-sided / minute / score-gap protections.
+  if (
+    acronymTeamMatch(
+      A,
+      B
+    )
+  ) {
+    return 0.96;
   }
 
   const aTokens =
@@ -870,7 +993,7 @@ function teamScore(
   // the other side, treat it as a strong team match.
   //
   // Safety:
-  // - token must be >= 5 chars
+  // - token must meet CONTEXT_DISTINCTIVE_TOKEN_MIN_LENGTH
   // - token must not be a weak/generic football word
   // - the longer name may contain at most one additional token
   // - category protection has already passed above
@@ -892,7 +1015,7 @@ function teamScore(
       )
     ) {
 
-      return 0.88;
+      return 0.92;
     }
   }
 
