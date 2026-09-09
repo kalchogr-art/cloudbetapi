@@ -63,6 +63,7 @@ interface Env {
   CLOUDBET: Fetcher;
   MATCHER: Fetcher;
   DB: D1Database;
+  CLOUDBET_API_KEY?: string;
 }
 
 type Obj = Record<string, any>;
@@ -72,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.3.4 DYNAMIC LEGACY ARCHIVE";
+  "V7.4.0 ONE-SHOT REAL TEST";
 
 const MODE =
   "DRY_RUN";
@@ -95,6 +96,13 @@ const BET_STAKE =
 
 const TRADING_STRAIGHT_ENDPOINT =
   "https://sports-api.cloudbet.com/pub/v4/bets/place/straight";
+
+// ONE-SHOT REAL API TEST. This does not enable normal betting.
+// It can send exactly one 100 USDT request, only when the freshly
+// read balance is below 100 USDT, with partial stake disabled.
+const REAL_TEST_ENABLED = true;
+const REAL_TEST_STAKE = 100;
+const REAL_TEST_KEY = "V7.4.0_ONE_SHOT_100_USDT";
 
 // Legacy display/archive value preserved from V7.0.2.
 const BET_STAKE_EUR =
@@ -4096,6 +4104,190 @@ function buildDirectSignal(
   };
 }
 
+async function ensureRealTestTable(env: Env): Promise<void> {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS real_bet_test_guard (
+      test_key TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      event_id TEXT,
+      stake REAL,
+      balance REAL,
+      http_status INTEGER,
+      response_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `).run();
+}
+
+async function oneShotRealBetTest(
+  env: Env,
+  eventId: string,
+  handoff: any,
+  account: AccountSnapshot
+): Promise<any> {
+  if (!REAL_TEST_ENABLED) {
+    return { attempted: false, reason: "REAL_TEST_DISABLED" };
+  }
+
+  const balance = numberOrNull(account?.balance);
+  if (balance === null) {
+    return { attempted: false, reason: "BALANCE_UNAVAILABLE" };
+  }
+
+  // Hard safety: never send the test if 100 USDT could be fully funded.
+  if (balance >= REAL_TEST_STAKE) {
+    return {
+      attempted: false,
+      reason: "SAFETY_BLOCK_BALANCE_CAN_FUND_TEST",
+      balance,
+      test_stake: REAL_TEST_STAKE
+    };
+  }
+
+  const apiKey = safe(env.CLOUDBET_API_KEY);
+  if (!apiKey) {
+    return { attempted: false, reason: "CLOUDBET_API_KEY_MISSING" };
+  }
+
+  if (!handoff?.body?.selection?.eventId || !handoff?.body?.selection?.marketUrl) {
+    return { attempted: false, reason: "HANDOFF_INCOMPLETE" };
+  }
+
+  await ensureRealTestTable(env);
+  const now = nowISO();
+
+  // Atomic one-shot claim. Only the first READY request can win this insert.
+  const claim = await env.DB.prepare(`
+    INSERT OR IGNORE INTO real_bet_test_guard
+      (test_key, status, event_id, stake, balance, created_at, updated_at)
+    VALUES (?, 'CLAIMED', ?, ?, ?, ?, ?)
+  `).bind(
+    REAL_TEST_KEY,
+    eventId,
+    REAL_TEST_STAKE,
+    balance,
+    now,
+    now
+  ).run();
+
+  const changes = Number((claim as any)?.meta?.changes ?? 0);
+  if (changes !== 1) {
+    const existing = await env.DB.prepare(`
+      SELECT test_key, status, event_id, stake, balance, http_status,
+             response_json, created_at, updated_at
+      FROM real_bet_test_guard
+      WHERE test_key = ?
+      LIMIT 1
+    `).bind(REAL_TEST_KEY).first<any>();
+
+    return {
+      attempted: false,
+      reason: "REAL_TEST_ALREADY_CONSUMED",
+      existing: existing ?? null
+    };
+  }
+
+  const payload = {
+    ...handoff.body,
+    referenceId: crypto.randomUUID(),
+    currency: BET_CURRENCY,
+    stake: String(REAL_TEST_STAKE),
+    acceptPartialStake: false,
+    selection: {
+      ...handoff.body.selection,
+      eventId
+    }
+  };
+
+  let httpStatus = 0;
+  let responseBody: any = null;
+
+  try {
+    const response = await fetch(TRADING_STRAIGHT_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-API-Key": apiKey
+      },
+      body: JSON.stringify(payload)
+    });
+
+    httpStatus = response.status;
+    const text = await response.text();
+    try {
+      responseBody = text ? JSON.parse(text) : null;
+    } catch {
+      responseBody = text ? { raw: text.slice(0, 2000) } : null;
+    }
+
+    const stored = JSON.stringify({
+      ok: response.ok,
+      status: httpStatus,
+      body: responseBody
+    }).slice(0, 12000);
+
+    await env.DB.prepare(`
+      UPDATE real_bet_test_guard
+      SET status = 'COMPLETED', http_status = ?, response_json = ?, updated_at = ?
+      WHERE test_key = ?
+    `).bind(httpStatus, stored, nowISO(), REAL_TEST_KEY).run();
+
+    return {
+      attempted: true,
+      one_shot_consumed: true,
+      request: {
+        event_id: eventId,
+        currency: BET_CURRENCY,
+        stake: REAL_TEST_STAKE,
+        accept_partial_stake: false,
+        market_url: payload.selection.marketUrl,
+        price: payload.selection.price,
+        balance_before_request: balance
+      },
+      response: {
+        ok: response.ok,
+        status: httpStatus,
+        body: responseBody
+      }
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await env.DB.prepare(`
+      UPDATE real_bet_test_guard
+      SET status = 'REQUEST_ERROR', response_json = ?, updated_at = ?
+      WHERE test_key = ?
+    `).bind(JSON.stringify({ error: message }).slice(0, 12000), nowISO(), REAL_TEST_KEY).run();
+
+    return {
+      attempted: true,
+      one_shot_consumed: true,
+      response: { ok: false, status: httpStatus, error: message }
+    };
+  }
+}
+
+async function realTestStatus(env: Env): Promise<any> {
+  await ensureRealTestTable(env);
+  const row = await env.DB.prepare(`
+    SELECT test_key, status, event_id, stake, balance, http_status,
+           response_json, created_at, updated_at
+    FROM real_bet_test_guard
+    WHERE test_key = ?
+    LIMIT 1
+  `).bind(REAL_TEST_KEY).first<any>();
+  return {
+    success: true,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    real_test_enabled: REAL_TEST_ENABLED,
+    test_stake: REAL_TEST_STAKE,
+    consumed: !!row,
+    test: row ?? null
+  };
+}
+
 async function runDirectPreflight(
   env: Env,
   input: DirectPreflightInput
@@ -4338,6 +4530,18 @@ async function runDirectPreflight(
     handoff?.ready_to_send ===
       true;
 
+  // V7.4.0: automatic ONE-SHOT real API test on the first READY event.
+  // Normal betting remains disabled.
+  const realTest =
+    ready
+      ? await oneShotRealBetTest(
+          env,
+          eventId,
+          handoff,
+          account
+        )
+      : { attempted: false, reason: "PREFLIGHT_NOT_READY" };
+
   return {
     success:
       true,
@@ -4397,6 +4601,8 @@ async function runDirectPreflight(
       odds:
         "MATCHER /live EXACT SAME EVENT_ID"
     },
+    real_test:
+      realTest,
     processing_ms:
       Date.now() -
       started
@@ -5263,6 +5469,12 @@ export default {
             same_event_only:
               true,
             real_betting:
+              false,
+            one_shot_real_test:
+              REAL_TEST_ENABLED,
+            one_shot_test_stake:
+              REAL_TEST_STAKE,
+            partial_stake_for_test:
               false
           },
 
@@ -5271,6 +5483,7 @@ export default {
             "/health",
             "/run",
             "/preflight",
+            "/real-test-status",
             "/diagnostic",
             "/entries"
           ]
@@ -5358,6 +5571,15 @@ export default {
             env,
             input
           )
+        );
+      }
+
+      if (
+        path ===
+        "/real-test-status"
+      ) {
+        return json(
+          await realTestStatus(env)
         );
       }
 
