@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.4.3 OFFICIAL V4 RETEST";
+  "V7.5.0 GRAPHQL DIAGNOSTIC";
 
 const MODE =
   "DRY_RUN";
@@ -4275,6 +4275,9 @@ async function oneShotRealBetTest(
 const TRADING_DIAGNOSTIC_ENDPOINT =
   "https://sports-api.cloudbet.com/pub/v4/bets?limit=1&offset=0";
 
+const GRAPHQL_ENDPOINT =
+  "https://sports-api-graphql.cloudbet.com/graphql";
+
 function diagnosticHeaders(
   headers: Headers
 ): Record<string, string | null> {
@@ -4394,6 +4397,162 @@ async function tradingDiagnostic(
         error instanceof Error
           ? error.message
           : String(error),
+      processing_ms: Date.now() - started
+    };
+  }
+}
+
+async function graphqlDiagnostic(env: Env): Promise<any> {
+  const started = Date.now();
+  const key = safe(env.CLOUDBET_API_KEY);
+
+  if (!key) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "GRAPHQL_ACCOUNT_DIAGNOSTIC",
+      safe_read_only: true,
+      wager_sent: false,
+      api_key_present: false,
+      error: "CLOUDBET_API_KEY_MISSING",
+      processing_ms: Date.now() - started
+    };
+  }
+
+  const query = `
+    query AccountBalances {
+      accountBalances {
+        currency
+        amount
+      }
+    }
+  `;
+
+  try {
+    const response = await fetch(
+      GRAPHQL_ENDPOINT,
+      {
+        method: "POST",
+        headers: {
+          "Accept": "application/json",
+          "Content-Type": "application/json",
+          "X-API-KEY": key
+        },
+        body: JSON.stringify({
+          query
+        }),
+        redirect: "manual"
+      }
+    );
+
+    const raw = await response.text();
+
+    let body: any = null;
+    let bodyType = "EMPTY";
+
+    if (raw) {
+      try {
+        body = JSON.parse(raw);
+        bodyType = "JSON";
+      } catch {
+        body = {
+          raw: raw.slice(0, 3000)
+        };
+        bodyType =
+          /<html|<!doctype html/i.test(raw)
+            ? "HTML"
+            : "TEXT";
+      }
+    }
+
+    const cfBlocked =
+      response.status === 403 &&
+      bodyType === "HTML" &&
+      /cloudflare|sorry,\s*you have been blocked|attention required/i.test(raw);
+
+    const graphQLErrors =
+      Array.isArray(body?.errors)
+        ? body.errors
+        : [];
+
+    const balances =
+      Array.isArray(body?.data?.accountBalances)
+        ? body.data.accountBalances
+        : [];
+
+    let interpretation =
+      "GRAPHQL_ACCOUNT_QUERY_FAILED_NON_JSON";
+
+    if (
+      response.ok &&
+      bodyType === "JSON" &&
+      graphQLErrors.length === 0 &&
+      Array.isArray(body?.data?.accountBalances)
+    ) {
+      interpretation =
+        "GRAPHQL_ACCOUNT_QUERY_REACHED_API_SUCCESSFULLY";
+    } else if (cfBlocked) {
+      interpretation =
+        "GRAPHQL_BLOCKED_AT_CLOUDFLARE_EDGE";
+    } else if (
+      bodyType === "JSON" &&
+      graphQLErrors.length > 0
+    ) {
+      interpretation =
+        "GRAPHQL_REACHED_API_AND_RETURNED_GRAPHQL_ERROR";
+    } else if (bodyType === "JSON") {
+      interpretation =
+        "GRAPHQL_REACHED_API_AND_RETURNED_JSON";
+    }
+
+    return {
+      success: response.ok && !cfBlocked,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "GRAPHQL_ACCOUNT_DIAGNOSTIC",
+      safe_read_only: true,
+      wager_sent: false,
+      api_key_present: true,
+      request: {
+        method: "POST",
+        endpoint: GRAPHQL_ENDPOINT,
+        operation: "AccountBalances"
+      },
+      response: {
+        ok: response.ok,
+        http_status: response.status,
+        body_type: bodyType,
+        cloudflare_block_detected: cfBlocked,
+        headers: diagnosticHeaders(response.headers),
+        balances,
+        graphql_errors: graphQLErrors,
+        body
+      },
+      interpretation,
+      processing_ms: Date.now() - started
+    };
+
+  } catch (error: any) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "GRAPHQL_ACCOUNT_DIAGNOSTIC",
+      safe_read_only: true,
+      wager_sent: false,
+      api_key_present: true,
+      request: {
+        method: "POST",
+        endpoint: GRAPHQL_ENDPOINT,
+        operation: "AccountBalances"
+      },
+      error:
+        String(
+          error?.message ??
+          error ??
+          "GRAPHQL_DIAGNOSTIC_FAILED"
+        ),
       processing_ms: Date.now() - started
     };
   }
@@ -5526,6 +5685,7 @@ function healthResponse():
       "/run",
       "/preflight",
       "/trading-diagnostic",
+      "/graphql-diagnostic",
       "/trading-payload-preview",
       "/diagnostic",
       "/entries"
@@ -5648,6 +5808,7 @@ export default {
             "/preflight",
             "/real-test-status",
             "/trading-diagnostic",
+            "/graphql-diagnostic",
             "/trading-payload-preview",
             "/diagnostic",
             "/entries"
@@ -5770,6 +5931,27 @@ export default {
 
         return json(
           await tradingDiagnostic(env)
+        );
+      }
+
+      if (
+        path ===
+        "/graphql-diagnostic"
+      ) {
+        if (request.method !== "GET") {
+          return json(
+            {
+              success: false,
+              worker: "cloudbet-bet-worker",
+              version: VERSION,
+              error: "METHOD_NOT_ALLOWED"
+            },
+            405
+          );
+        }
+
+        return json(
+          await graphqlDiagnostic(env)
         );
       }
 
