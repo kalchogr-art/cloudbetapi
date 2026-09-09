@@ -1,7 +1,16 @@
 // ============================================================
-// CLOUDBET BET WORKER V7.3.0
+// CLOUDBET BET WORKER V7.3.1
 // DRY RUN · TRACKER READY CANDIDATE · EXACT MATCHER ODDS REFRESH
 // EXACT 1H TOTAL GOALS OVER 0.5
+//
+// V7.3.1:
+// - DIRECT /preflight endpoint for ONE Tracker event_id
+// - fixes Tracker -> Bet Worker race condition
+// - /preflight does NOT wait for the same ENTRY to reappear through Tracker /entries
+// - exact SAME event_id lock preserved
+// - current odds still come only from MATCHER /live by exact event_id
+// - no names / no fuzzy matching / no alternate event
+// - pending_odds + D1 archive + account preflight + handoff preserved
 //
 // V7.3.0:
 // - BASED ON FULL V7.2.0
@@ -41,7 +50,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.3.0 EXACT MATCHER ODDS REFRESH";
+  "V7.3.1 DIRECT EVENT PREFLIGHT";
 
 const MODE =
   "DRY_RUN";
@@ -3324,6 +3333,385 @@ async function processPending(
   };
 }
 
+
+// ============================================================
+// V7.3.1 — DIRECT SINGLE EVENT PREFLIGHT
+//
+// Tracker sends the already matched SAME Cloudbet event_id directly.
+// Bet Worker does NOT rediscover this event through Tracker /entries.
+//
+// SAFETY:
+// - exact event_id only
+// - no team matching
+// - no fuzzy matching
+// - no alternate Cloudbet event
+// - real betting remains disabled
+// ============================================================
+
+interface DirectPreflightInput {
+  event_id?: any;
+  match_id?: any;
+  match?: any;
+  home?: any;
+  away?: any;
+  entry_minute?: any;
+  hunter_score?: any;
+  entry_odds?: any;
+  max_stake?: any;
+  matcher_score?: any;
+}
+
+function buildDirectSignal(
+  input: DirectPreflightInput
+): any {
+  const eventId =
+    normalizeEventId(
+      input?.event_id
+    );
+
+  const entryOdds =
+    numberOrNull(
+      input?.entry_odds
+    );
+
+  return {
+    status:
+      "ENTRY",
+
+    match_id:
+      input?.match_id ??
+      null,
+
+    match:
+      safe(
+        input?.match
+      ),
+
+    home:
+      safe(
+        input?.home
+      ),
+
+    away:
+      safe(
+        input?.away
+      ),
+
+    entry_minute:
+      numberOrNull(
+        input?.entry_minute
+      ),
+
+    hunter_score:
+      numberOrNull(
+        input?.hunter_score
+      ),
+
+    cloudbet: {
+      event_id:
+        eventId,
+
+      match:
+        safe(
+          input?.match
+        ) || null,
+
+      entry_odds:
+        entryOdds,
+
+      max_stake:
+        numberOrNull(
+          input?.max_stake
+        ),
+
+      odds_available:
+        entryOdds !== null &&
+        entryOdds > 1,
+
+      matcher_score:
+        numberOrNull(
+          input?.matcher_score
+        )
+    }
+  };
+}
+
+async function runDirectPreflight(
+  env: Env,
+  input: DirectPreflightInput
+): Promise<any> {
+  const started =
+    Date.now();
+
+  const eventId =
+    normalizeEventId(
+      input?.event_id
+    );
+
+  if (!eventId) {
+    return {
+      success:
+        false,
+      worker:
+        "cloudbet-bet-worker",
+      version:
+        VERSION,
+      action:
+        "DIRECT_PREFLIGHT",
+      ready:
+        false,
+      reason:
+        "CLOUDBET_EVENT_ID_MISSING",
+      processing_ms:
+        Date.now() -
+        started
+    };
+  }
+
+  const signal =
+    buildDirectSignal(
+      input
+    );
+
+  const trackerCloudbet =
+    trackerCloudbetData(
+      signal
+    );
+
+  if (
+    trackerCloudbet.event_id !==
+    eventId
+  ) {
+    return {
+      success:
+        false,
+      worker:
+        "cloudbet-bet-worker",
+      version:
+        VERSION,
+      action:
+        "DIRECT_PREFLIGHT",
+      ready:
+        false,
+      event_id:
+        eventId,
+      reason:
+        "DIRECT_EVENT_ID_NORMALIZATION_FAILED",
+      processing_ms:
+        Date.now() -
+        started
+    };
+  }
+
+  const account =
+    await fetchAccountSnapshot(
+      env
+    );
+
+  const current =
+    await verifySameEventAndOdds(
+      env,
+      eventId
+    );
+
+  if (
+    !current.success
+  ) {
+    const pendingExecutionId =
+      crypto.randomUUID();
+
+    const saved =
+      await savePending(
+        env,
+        pendingExecutionId,
+        signal,
+        trackerCloudbet,
+        current
+      );
+
+    return {
+      success:
+        saved.success === true,
+      worker:
+        "cloudbet-bet-worker",
+      version:
+        VERSION,
+      mode:
+        MODE,
+      dry_run:
+        DRY_RUN,
+      betting_enabled:
+        BETTING_ENABLED,
+      action:
+        "PENDING_ODDS",
+      ready:
+        false,
+      event_id:
+        eventId,
+      match:
+        signalMatch(
+          signal
+        ),
+      reason:
+        current.error ||
+        "TARGET_ODDS_NOT_AVAILABLE",
+      entry_odds:
+        trackerCloudbet
+          .entry_odds,
+      current_odds:
+        current
+          .current_odds,
+      max_stake:
+        current
+          .max_stake,
+      account,
+      account_balance:
+        numberOrNull(
+          account?.balance
+        ),
+      current,
+      pending:
+        saved,
+      source: {
+        event:
+          "DIRECT_TRACKER_EVENT_ID",
+        state:
+          "/event?id=SAME_EVENT_ID",
+        odds:
+          "MATCHER /live EXACT SAME EVENT_ID"
+      },
+      processing_ms:
+        Date.now() -
+        started
+    };
+  }
+
+  const bet =
+    buildReadyBet(
+      signal,
+      trackerCloudbet,
+      current
+    );
+
+  const archive =
+    await archiveBet(
+      env,
+      bet,
+      signal,
+      current
+    );
+
+  if (
+    !archive.success
+  ) {
+    return {
+      success:
+        false,
+      worker:
+        "cloudbet-bet-worker",
+      version:
+        VERSION,
+      action:
+        "DIRECT_PREFLIGHT",
+      ready:
+        false,
+      event_id:
+        eventId,
+      reason:
+        archive.error ||
+        "ARCHIVE_FAILED",
+      account,
+      current,
+      archive,
+      processing_ms:
+        Date.now() -
+        started
+    };
+  }
+
+  const accountPreflight =
+    buildAccountPreflight(
+      account,
+      current
+    );
+
+  const handoff =
+    buildTradingHandoff(
+      bet,
+      current,
+      account
+    );
+
+  const ready =
+    handoff?.ready_to_send ===
+      true;
+
+  return {
+    success:
+      true,
+    worker:
+      "cloudbet-bet-worker",
+    version:
+      VERSION,
+    mode:
+      MODE,
+    dry_run:
+      DRY_RUN,
+    betting_enabled:
+      BETTING_ENABLED,
+    action:
+      "READY_TO_BET",
+    ready,
+    event_id:
+      eventId,
+    match:
+      signalMatch(
+        signal
+      ),
+    reason:
+      ready
+        ? "ALL_PREFLIGHT_CHECKS_PASSED"
+        : (
+            accountPreflight
+              ?.block_reason ||
+            "PREFLIGHT_NOT_READY"
+          ),
+    entry_odds:
+      trackerCloudbet
+        .entry_odds,
+    current_odds:
+      current
+        .current_odds,
+    max_stake:
+      current
+        .max_stake,
+    min_stake:
+      current
+        .min_stake,
+    account_balance:
+      numberOrNull(
+        account?.balance
+      ),
+    account_preflight:
+      accountPreflight,
+    handoff,
+    archive,
+    current,
+    source: {
+      event:
+        "DIRECT_TRACKER_EVENT_ID",
+      state:
+        "/event?id=SAME_EVENT_ID",
+      odds:
+        "MATCHER /live EXACT SAME EVENT_ID"
+    },
+    processing_ms:
+      Date.now() -
+      started
+  };
+}
+
+
 // ============================================================
 // MAIN WORKER
 // ============================================================
@@ -3683,6 +4071,10 @@ async function runWorker(
         TARGET_PARAMS,
       tracker_is_match_source:
         true,
+      direct_event_preflight:
+        true,
+      direct_preflight_endpoint:
+        "/preflight",
       matcher_lookup:
         true,
       matcher_used_for_matching:
@@ -3985,6 +4377,10 @@ function healthResponse():
     architecture: {
       tracker_match_source:
         true,
+      direct_event_preflight:
+        true,
+      direct_preflight_endpoint:
+        "/preflight",
       matcher_lookup:
         true,
       matcher_used_for_matching:
@@ -4034,6 +4430,7 @@ function healthResponse():
       "/",
       "/health",
       "/run",
+      "/preflight",
       "/diagnostic",
       "/entries"
     ]
@@ -4081,8 +4478,8 @@ export default {
             "ONLINE",
 
           flow: [
-            "TRACKER /entries",
-            "READ cloudbet.event_id + entry_odds",
+            "TRACKER /entries OR DIRECT /preflight",
+            "READ exact cloudbet.event_id + entry_odds",
             "LOCK SAME EVENT ID",
             "CLOUDBET /event?id=EVENT_ID",
             "VERIFY SAME EVENT + 1H + 0:0",
@@ -4146,6 +4543,7 @@ export default {
             "/",
             "/health",
             "/run",
+            "/preflight",
             "/diagnostic",
             "/entries"
           ]
@@ -4177,6 +4575,61 @@ export default {
         return json(
           await runDiagnostic(
             env
+          )
+        );
+      }
+
+      if (
+        path ===
+        "/preflight"
+      ) {
+        if (
+          request.method !==
+          "POST"
+        ) {
+          return json(
+            {
+              success:
+                false,
+              worker:
+                "cloudbet-bet-worker",
+              version:
+                VERSION,
+              error:
+                "METHOD_NOT_ALLOWED",
+              expected_method:
+                "POST"
+            },
+            405
+          );
+        }
+
+        let input:
+          DirectPreflightInput = {};
+
+        try {
+          input =
+            await request.json();
+        } catch {
+          return json(
+            {
+              success:
+                false,
+              worker:
+                "cloudbet-bet-worker",
+              version:
+                VERSION,
+              error:
+                "INVALID_JSON_BODY"
+            },
+            400
+          );
+        }
+
+        return json(
+          await runDirectPreflight(
+            env,
+            input
           )
         );
       }
