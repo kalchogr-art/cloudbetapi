@@ -75,7 +75,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.13 SCORE UNKNOWN ALLOWED 0.10 USDT";
+  "V7.6.14 SCORE + PERIOD UNKNOWN ALLOWED 0.10 USDT";
 
 const MODE =
   "DRY_RUN";
@@ -1207,15 +1207,33 @@ function eventStillValidForTarget(
     return { valid: false, reason: "SCORE_NOT_0_0", score, period, minute };
   }
 
-  // HARD GATE #2 — event must explicitly be in the first half.
-  // Unknown/ambiguous periods are rejected instead of being treated as valid.
+  // HARD GATE #2 — period handling.
+  // If Cloudbet explicitly says the event is no longer in the first half, BLOCK.
+  // Some live Cloudbet events do not expose a usable period at all. In that case
+  // PERIOD_UNKNOWN is allowed to continue because the exact 1H O0.5 market,
+  // current minute window and selection status are checked later.
   const firstHalfHints = [
     "1p", "1h", "first", "first_half", "first half"
   ];
 
-  if (!firstHalfHints.some(hint => period.includes(hint))) {
-    return { valid: false, reason: "FIRST_HALF_NOT_CONFIRMED", score, period, minute };
+  const nonFirstHalfHints = [
+    "2p", "2h", "second", "second_half", "second half",
+    "ht", "half time", "halftime",
+    "ft", "full time", "finished", "ended", "final"
+  ];
+
+  const firstHalfConfirmed =
+    firstHalfHints.some(hint => period.includes(hint));
+
+  const explicitlyNotFirstHalf =
+    nonFirstHalfHints.some(hint => period.includes(hint));
+
+  if (!firstHalfConfirmed && explicitlyNotFirstHalf) {
+    return { valid: false, reason: "FIRST_HALF_ENDED", score, period, minute };
   }
+
+  // Unknown / generic live period is allowed.
+  // Exact first-half market + active selection remain mandatory downstream.
 
   // HARD GATE #3 — minute must be known and inside configured betting window.
   if (minute === null) {
