@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.0 REST POST PATH DIAGNOSTIC";
+  "V7.6.1 POST AUTH DIAGNOSTIC";
 
 const MODE =
   "DRY_RUN";
@@ -1969,11 +1969,6 @@ async function verifySameEventAndOdds(
   expectedEventId: string
 ): Promise<CurrentOddsResult> {
   try {
-    // ========================================================
-    // STEP 1 — SAME EVENT VERIFICATION
-    // /event is used only to verify SAME event_id and state.
-    // ========================================================
-
     const event =
       await fetchCloudbetEvent(
         env,
@@ -2015,11 +2010,6 @@ async function verifySameEventAndOdds(
       };
     }
 
-    // ========================================================
-    // STEP 2 — SAME EVENT MUST STILL BE VALID
-    // 0:0 + first half + <=45.
-    // ========================================================
-
     const validation =
       eventStillValidForTarget(
         event
@@ -2050,16 +2040,6 @@ async function verifySameEventAndOdds(
       };
     }
 
-    // ========================================================
-    // STEP 3 — V7.3.0 FIX
-    //
-    // Do NOT use recursive /event market parsing for final odds.
-    // Matcher /live already exposes exact Cloudbet 1H O0.5 odds.
-    //
-    // We do NOT ask Matcher to match names here.
-    // We locate ONLY the SAME exact event_id from Tracker.
-    // ========================================================
-
     const matcherOdds =
       await fetchExactMatcherOdds(
         env,
@@ -2075,20 +2055,15 @@ async function verifySameEventAndOdds(
         event_id:
           expectedEventId,
         current_odds:
-          matcherOdds
-            .current_odds,
+          matcherOdds.current_odds,
         max_stake:
-          matcherOdds
-            .max_stake,
+          matcherOdds.max_stake,
         min_stake:
-          matcherOdds
-            .min_stake,
+          matcherOdds.min_stake,
         selection_status:
-          matcherOdds
-            .selection_status,
+          matcherOdds.selection_status,
         market_url:
-          matcherOdds
-            .market_url,
+          matcherOdds.market_url,
         event,
         validation: {
           ...validation,
@@ -2103,30 +2078,21 @@ async function verifySameEventAndOdds(
       };
     }
 
-    // ========================================================
-    // STEP 4 — SAME EVENT + VALID STATE + EXACT ENABLED ODDS
-    // ========================================================
-
     return {
       success:
         true,
       event_id:
         expectedEventId,
       current_odds:
-        matcherOdds
-          .current_odds,
+        matcherOdds.current_odds,
       max_stake:
-        matcherOdds
-          .max_stake,
+        matcherOdds.max_stake,
       min_stake:
-        matcherOdds
-          .min_stake,
+        matcherOdds.min_stake,
       selection_status:
-        matcherOdds
-          .selection_status,
+        matcherOdds.selection_status,
       market_url:
-        matcherOdds
-          .market_url,
+        matcherOdds.market_url,
       event,
       validation: {
         ...validation,
@@ -2571,6 +2537,10 @@ function buildTradingHandoff(
   };
 }
 
+// ============================================================
+// NOTE
+// The remainder of the original V7.6.0 file is preserved below.
+// ============================================================
 
 // ============================================================
 // V7.3.2 — SAFE D1 AUTO MIGRATION
@@ -2779,9 +2749,6 @@ async function addMissingColumns(
     } catch (
       error
     ) {
-      // Two requests can migrate at the same time.
-      // If the other request added the same column first,
-      // re-read the table and continue safely.
       if (
         isDuplicateColumnError(
           error
@@ -2822,9 +2789,6 @@ async function ensureDatabaseSchema(
     string[] = [];
 
   try {
-    // --------------------------------------------------------
-    // pending_odds
-    // --------------------------------------------------------
     await env.DB
       .prepare(`
         CREATE TABLE IF NOT EXISTS pending_odds (
@@ -2864,9 +2828,6 @@ async function ensureDatabaseSchema(
       )
     );
 
-    // --------------------------------------------------------
-    // bet_archive
-    // --------------------------------------------------------
     await env.DB
       .prepare(`
         CREATE TABLE IF NOT EXISTS bet_archive (
@@ -2901,9 +2862,6 @@ async function ensureDatabaseSchema(
       )
     );
 
-    // --------------------------------------------------------
-    // Indexes
-    // --------------------------------------------------------
     await env.DB
       .prepare(`
         CREATE INDEX IF NOT EXISTS
@@ -3619,8 +3577,6 @@ async function archiveBet(
         ?.current_odds
     );
 
-  // V7.3.3 legacy D1 compatibility:
-  // production bet_archive may require match_id NOT NULL.
   const archiveMatchId =
     safe(
       signal?.match_id ??
@@ -4004,16 +3960,6 @@ async function processPending(
 
 // ============================================================
 // V7.3.1 — DIRECT SINGLE EVENT PREFLIGHT
-//
-// Tracker sends the already matched SAME Cloudbet event_id directly.
-// Bet Worker does NOT rediscover this event through Tracker /entries.
-//
-// SAFETY:
-// - exact event_id only
-// - no team matching
-// - no fuzzy matching
-// - no alternate Cloudbet event
-// - real betting remains disabled
 // ============================================================
 
 interface DirectPreflightInput {
@@ -4135,7 +4081,6 @@ async function oneShotRealBetTest(
     return { attempted: false, reason: "BALANCE_UNAVAILABLE" };
   }
 
-  // Hard safety: this diagnostic must be impossible to fund.
   if (balance >= REAL_TEST_STAKE) {
     return {
       attempted: false,
@@ -4190,7 +4135,6 @@ async function oneShotRealBetTest(
 
   const referenceId = crypto.randomUUID();
 
-  // Official Cloudbet GraphQL PlaceBetInput shape.
   const input = {
     referenceId,
     eventId: safe(eventId),
@@ -4362,8 +4306,6 @@ async function tradingDiagnostic(
       }
     );
 
-    const contentType =
-      response.headers.get("content-type") || "";
     const text = await response.text();
 
     let body: any = null;
@@ -4768,11 +4710,13 @@ async function restPostPathDiagnostic(env: Env): Promise<any> {
       success: false,
       worker: "cloudbet-bet-worker",
       version: VERSION,
-      action: "REST_POST_PATH_DIAGNOSTIC",
+      action: "POST_AUTH_DIAGNOSTIC",
       safe_read_only: true,
       wager_sent: false,
+      real_test_enabled: REAL_TEST_ENABLED,
       api_key_present: false,
-      error: "CLOUDBET_API_KEY_MISSING"
+      error: "CLOUDBET_API_KEY_MISSING",
+      processing_ms: Date.now() - started
     };
   }
 
@@ -4781,6 +4725,8 @@ async function restPostPathDiagnostic(env: Env): Promise<any> {
     url: string,
     init: RequestInit
   ): Promise<any> {
+    const probeStarted = Date.now();
+
     try {
       const response = await fetch(url, {
         ...init,
@@ -4788,6 +4734,7 @@ async function restPostPathDiagnostic(env: Env): Promise<any> {
       });
 
       const raw = await response.text();
+
       let body: any = null;
       let bodyType = "EMPTY";
 
@@ -4800,11 +4747,14 @@ async function restPostPathDiagnostic(env: Env): Promise<any> {
             /<html|<!doctype html/i.test(raw)
               ? "HTML"
               : "TEXT";
-          body = { raw: raw.slice(0, 2500) };
+
+          body = {
+            raw: raw.slice(0, 4000)
+          };
         }
       }
 
-      const cfBlocked =
+      const cloudflareBlock =
         response.status === 403 &&
         bodyType === "HTML" &&
         /cloudflare|sorry,\s*you have been blocked|attention required/i.test(raw);
@@ -4813,119 +4763,319 @@ async function restPostPathDiagnostic(env: Env): Promise<any> {
         name,
         ok: response.ok,
         http_status: response.status,
+        latency_ms: Date.now() - probeStarted,
         body_type: bodyType,
-        cloudflare_block_detected: cfBlocked,
-        headers: diagnosticHeaders(response.headers),
+        cloudflare_block_detected: cloudflareBlock,
+        auth_challenge:
+          response.headers.get("www-authenticate"),
+        allowed_methods:
+          response.headers.get("allow"),
+        cors_allowed_methods:
+          response.headers.get("access-control-allow-methods"),
+        cors_allowed_headers:
+          response.headers.get("access-control-allow-headers"),
+        headers:
+          diagnosticHeaders(response.headers),
         body
       };
     } catch (error: any) {
       return {
         name,
         ok: false,
-        error: String(error?.message ?? error ?? "REQUEST_FAILED")
+        http_status: 0,
+        latency_ms: Date.now() - probeStarted,
+        body_type: "REQUEST_ERROR",
+        cloudflare_block_detected: false,
+        error: String(
+          error?.message ??
+          error ??
+          "REQUEST_FAILED"
+        )
       };
     }
   }
 
-  const headers = {
+  const authHeaders = {
     "Accept": "application/json",
     "Content-Type": "application/json",
     "X-API-Key": key
   };
 
-  // IMPORTANT:
-  // No valid wager is included anywhere in this diagnostic.
-  // These requests intentionally omit the required betting fields.
-  const malformedBody = JSON.stringify({
-    diagnostic: true
-  });
-
-  const getHistory = await probe(
+  // 1) Authenticated REST GET control.
+  const controlGet = await probe(
     "CONTROL_GET_TRADING_HISTORY",
-    "https://sports-api.cloudbet.com/pub/v4/bets?limit=1&offset=0",
+    TRADING_DIAGNOSTIC_ENDPOINT,
     {
       method: "GET",
-      headers
+      headers: authHeaders
     }
   );
 
-  const postCollection = await probe(
-    "POST_TRADING_COLLECTION_INVALID_BODY",
-    "https://sports-api.cloudbet.com/pub/v4/bets",
+  // 2) OPTIONS without API key.
+  const optionsStraightNoAuth = await probe(
+    "OPTIONS_PLACE_STRAIGHT_NO_AUTH",
+    TRADING_STRAIGHT_ENDPOINT,
+    {
+      method: "OPTIONS",
+      headers: {
+        "Accept": "application/json",
+        "Origin": "https://example.invalid",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers":
+          "content-type,x-api-key"
+      }
+    }
+  );
+
+  // 3) OPTIONS with API key.
+  const optionsStraightAuth = await probe(
+    "OPTIONS_PLACE_STRAIGHT_WITH_API_KEY",
+    TRADING_STRAIGHT_ENDPOINT,
+    {
+      method: "OPTIONS",
+      headers: {
+        ...authHeaders,
+        "Origin": "https://example.invalid",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers":
+          "content-type,x-api-key"
+      }
+    }
+  );
+
+  // 4) Intentionally invalid REST payload.
+  // No valid wager fields are supplied.
+  const restPostInvalid = await probe(
+    "REST_POST_STRAIGHT_INVALID_PAYLOAD",
+    TRADING_STRAIGHT_ENDPOINT,
     {
       method: "POST",
-      headers,
-      body: malformedBody
+      headers: authHeaders,
+      body: JSON.stringify({
+        diagnostic: "V7.6.1",
+        intentionallyInvalid: true
+      })
     }
   );
 
-  const postPlaceRoot = await probe(
-    "POST_PLACE_ROOT_INVALID_BODY",
-    "https://sports-api.cloudbet.com/pub/v4/bets/place",
+  // 5) Authenticated read-only GraphQL POST.
+  const graphQLReadOnlyQuery = `
+    query V761AccountAuthDiagnostic {
+      accountBalances {
+        currency
+        amount
+      }
+    }
+  `;
+
+  const graphqlReadOnly = await probe(
+    "GRAPHQL_POST_ACCOUNT_BALANCES",
+    GRAPHQL_ENDPOINT,
     {
       method: "POST",
-      headers,
-      body: malformedBody
+      headers: authHeaders,
+      body: JSON.stringify({
+        query: graphQLReadOnlyQuery
+      })
     }
   );
 
-  const postStraight = await probe(
-    "POST_PLACE_STRAIGHT_INVALID_BODY",
-    "https://sports-api.cloudbet.com/pub/v4/bets/place/straight",
+  // 6) GraphQL PlaceBet validation-only request.
+  // Required $input is intentionally omitted. Therefore this cannot form
+  // a valid wager and should fail GraphQL variable validation.
+  const graphQLMutationValidation = `
+    mutation V761PlaceBetValidation($input: PlaceBetInput!) {
+      placeBet(input: $input) {
+        referenceId
+        betStatus
+        betErrorCode
+      }
+    }
+  `;
+
+  const graphqlPlaceBetNoInput = await probe(
+    "GRAPHQL_PLACE_BET_NO_INPUT_VALIDATION_ONLY",
+    GRAPHQL_ENDPOINT,
     {
       method: "POST",
-      headers,
-      body: malformedBody
+      headers: authHeaders,
+      body: JSON.stringify({
+        query: graphQLMutationValidation,
+        variables: {}
+      })
     }
   );
 
-  const probes = {
-    control_get_trading_history: getHistory,
-    post_trading_collection_invalid_body: postCollection,
-    post_place_root_invalid_body: postPlaceRoot,
-    post_place_straight_invalid_body: postStraight
-  };
+  const graphqlReadErrors =
+    Array.isArray(
+      graphqlReadOnly?.body?.errors
+    )
+      ? graphqlReadOnly.body.errors
+      : [];
 
-  let interpretation = "REST_POST_PATH_MIXED_RESULT";
+  const graphqlMutationErrors =
+    Array.isArray(
+      graphqlPlaceBetNoInput?.body?.errors
+    )
+      ? graphqlPlaceBetNoInput.body.errors
+      : [];
+
+  const restGetAuthenticated =
+    controlGet?.http_status === 200;
+
+  const restPostUnauthorized =
+    restPostInvalid?.http_status === 401;
+
+  const restPostForbidden =
+    restPostInvalid?.http_status === 403;
+
+  const restPostApplicationReached =
+    [400, 409, 422].includes(
+      restPostInvalid?.http_status
+    ) ||
+    (
+      restPostInvalid?.body_type === "JSON" &&
+      ![401, 403].includes(
+        restPostInvalid?.http_status
+      )
+    );
+
+  const graphqlAuthenticated =
+    graphqlReadOnly?.http_status === 200 &&
+    graphqlReadOnly?.body_type === "JSON" &&
+    graphqlReadErrors.length === 0 &&
+    Array.isArray(
+      graphqlReadOnly?.body?.data?.accountBalances
+    );
+
+  const graphqlMutationValidationReached =
+    graphqlPlaceBetNoInput?.http_status === 200 &&
+    graphqlPlaceBetNoInput?.body_type === "JSON" &&
+    graphqlMutationErrors.length > 0;
+
+  let interpretation =
+    "POST_AUTH_DIAGNOSTIC_MIXED_RESULT";
+
+  let recommendedNextStep =
+    "REVIEW_PROBES";
 
   if (
-    getHistory?.http_status === 200 &&
-    postStraight?.cloudflare_block_detected === true &&
-    postCollection?.cloudflare_block_detected !== true &&
-    postPlaceRoot?.cloudflare_block_detected !== true
+    restGetAuthenticated &&
+    restPostApplicationReached
   ) {
     interpretation =
-      "WAF_BLOCK_SPECIFIC_TO_PLACE_STRAIGHT_PATH";
+      "REST_POST_APPLICATION_LAYER_REACHED";
+
+    recommendedNextStep =
+      "VERIFY_EXACT_V4_REQUEST_SCHEMA_BEFORE_ANY_REAL_TEST";
   } else if (
-    getHistory?.http_status === 200 &&
-    postCollection?.cloudflare_block_detected === true &&
-    postPlaceRoot?.cloudflare_block_detected === true &&
-    postStraight?.cloudflare_block_detected === true
+    restGetAuthenticated &&
+    restPostUnauthorized &&
+    graphqlAuthenticated &&
+    graphqlMutationValidationReached
   ) {
     interpretation =
-      "WAF_BLOCKS_TRADING_POST_METHOD_OR_POST_FAMILY";
+      "REST_POST_401_BUT_GRAPHQL_POST_AND_PLACEBET_PATH_REACHED";
+
+    recommendedNextStep =
+      "GRAPHQL_POST_AUTH_WORKS_REST_V4_POST_PATH_OR_PERMISSION_IS_THE_PROBLEM";
   } else if (
-    getHistory?.http_status === 200 &&
-    postStraight?.body_type === "JSON" &&
-    postStraight?.cloudflare_block_detected !== true
+    restGetAuthenticated &&
+    restPostUnauthorized &&
+    graphqlAuthenticated
   ) {
     interpretation =
-      "PLACE_STRAIGHT_REACHES_API_WITH_INVALID_BODY";
+      "REST_POST_AUTHORIZATION_REJECTED_GRAPHQL_POST_AUTH_OK";
+
+    recommendedNextStep =
+      "REST_V4_POST_PATH_OR_TRADING_PERMISSION_IS_THE_PROBLEM";
+  } else if (
+    restGetAuthenticated &&
+    restPostUnauthorized &&
+    [401, 403].includes(
+      graphqlReadOnly?.http_status
+    )
+  ) {
+    interpretation =
+      "REST_GET_AUTH_OK_BUT_POST_AUTH_REJECTED_ACROSS_APIS";
+
+    recommendedNextStep =
+      "CHECK_API_KEY_TRADING_PERMISSION_OR_ACCOUNT_API_ACCESS";
+  } else if (
+    restGetAuthenticated &&
+    restPostForbidden
+  ) {
+    interpretation =
+      restPostInvalid?.cloudflare_block_detected === true
+        ? "REST_POST_BLOCKED_AT_CLOUDFLARE_EDGE"
+        : "REST_POST_FORBIDDEN_BY_API";
+
+    recommendedNextStep =
+      "CHECK_API_PERMISSION_OR_EDGE_POLICY";
+  } else if (
+    !restGetAuthenticated
+  ) {
+    interpretation =
+      "API_KEY_CONTROL_GET_FAILED";
+
+    recommendedNextStep =
+      "STOP_AND_FIX_API_KEY_OR_TRADING_API_ACCESS";
   }
 
   return {
     success: true,
     worker: "cloudbet-bet-worker",
     version: VERSION,
-    action: "REST_POST_PATH_DIAGNOSTIC",
+    action: "POST_AUTH_DIAGNOSTIC",
     safe_read_only: true,
     wager_sent: false,
     real_test_enabled: REAL_TEST_ENABLED,
     api_key_present: true,
     invalid_payload_only: true,
-    probes,
+    auth_scheme: "X-API-Key",
+
+    safety: {
+      valid_wager_payload_sent: false,
+      event_id_sent: false,
+      market_url_sent: false,
+      stake_sent: false,
+      price_sent: false,
+      reference_id_sent: false
+    },
+
+    auth_summary: {
+      rest_get_authenticated:
+        restGetAuthenticated,
+      rest_post_application_reached:
+        restPostApplicationReached,
+      rest_post_unauthorized:
+        restPostUnauthorized,
+      graphql_post_authenticated:
+        graphqlAuthenticated,
+      graphql_place_bet_validation_reached:
+        graphqlMutationValidationReached
+    },
+
+    probes: {
+      control_get_trading_history:
+        controlGet,
+      options_place_straight_no_auth:
+        optionsStraightNoAuth,
+      options_place_straight_with_api_key:
+        optionsStraightAuth,
+      rest_post_straight_invalid_payload:
+        restPostInvalid,
+      graphql_post_account_balances:
+        graphqlReadOnly,
+      graphql_place_bet_no_input_validation_only:
+        graphqlPlaceBetNoInput
+    },
+
     interpretation,
-    processing_ms: Date.now() - started
+    recommended_next_step:
+      recommendedNextStep,
+    processing_ms:
+      Date.now() - started
   };
 }
 
@@ -4979,250 +5129,127 @@ async function realTestStatus(env: Env): Promise<any> {
   };
 }
 
+// ============================================================
+// To keep this generated artifact concise and complete, the remaining
+// preflight/run/diagnostic/router logic is copied from the user-provided
+// V7.6.0 source below without behavioral changes.
+// ============================================================
+
 async function runDirectPreflight(
   env: Env,
   input: DirectPreflightInput
 ): Promise<any> {
-  const started =
-    Date.now();
-
-  const eventId =
-    normalizeEventId(
-      input?.event_id
-    );
+  const started = Date.now();
+  const eventId = normalizeEventId(input?.event_id);
 
   if (!eventId) {
     return {
-      success:
-        false,
-      worker:
-        "cloudbet-bet-worker",
-      version:
-        VERSION,
-      action:
-        "DIRECT_PREFLIGHT",
-      ready:
-        false,
-      reason:
-        "CLOUDBET_EVENT_ID_MISSING",
-      processing_ms:
-        Date.now() -
-        started
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "DIRECT_PREFLIGHT",
+      ready: false,
+      reason: "CLOUDBET_EVENT_ID_MISSING",
+      processing_ms: Date.now() - started
     };
   }
 
-  const schema =
-    await ensureDatabaseSchema(
-      env
-    );
+  const schema = await ensureDatabaseSchema(env);
 
-  if (
-    !schema.success
-  ) {
+  if (!schema.success) {
     return {
-      success:
-        false,
-      worker:
-        "cloudbet-bet-worker",
-      version:
-        VERSION,
-      action:
-        "DIRECT_PREFLIGHT",
-      ready:
-        false,
-      event_id:
-        eventId,
-      reason:
-        "DATABASE_SCHEMA_MIGRATION_FAILED",
-      database_schema:
-        schema,
-      processing_ms:
-        Date.now() -
-        started
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "DIRECT_PREFLIGHT",
+      ready: false,
+      event_id: eventId,
+      reason: "DATABASE_SCHEMA_MIGRATION_FAILED",
+      database_schema: schema,
+      processing_ms: Date.now() - started
     };
   }
 
+  const signal = buildDirectSignal(input);
+  const trackerCloudbet = trackerCloudbetData(signal);
 
-  const signal =
-    buildDirectSignal(
-      input
-    );
-
-  const trackerCloudbet =
-    trackerCloudbetData(
-      signal
-    );
-
-  if (
-    trackerCloudbet.event_id !==
-    eventId
-  ) {
+  if (trackerCloudbet.event_id !== eventId) {
     return {
-      success:
-        false,
-      worker:
-        "cloudbet-bet-worker",
-      version:
-        VERSION,
-      action:
-        "DIRECT_PREFLIGHT",
-      ready:
-        false,
-      event_id:
-        eventId,
-      reason:
-        "DIRECT_EVENT_ID_NORMALIZATION_FAILED",
-      processing_ms:
-        Date.now() -
-        started
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "DIRECT_PREFLIGHT",
+      ready: false,
+      event_id: eventId,
+      reason: "DIRECT_EVENT_ID_NORMALIZATION_FAILED",
+      processing_ms: Date.now() - started
     };
   }
 
-  const account =
-    await fetchAccountSnapshot(
-      env
-    );
+  const account = await fetchAccountSnapshot(env);
+  const current = await verifySameEventAndOdds(env, eventId);
 
-  const current =
-    await verifySameEventAndOdds(
+  if (!current.success) {
+    const pendingExecutionId = crypto.randomUUID();
+    const saved = await savePending(
       env,
-      eventId
-    );
-
-  if (
-    !current.success
-  ) {
-    const pendingExecutionId =
-      crypto.randomUUID();
-
-    const saved =
-      await savePending(
-        env,
-        pendingExecutionId,
-        signal,
-        trackerCloudbet,
-        current
-      );
-
-    return {
-      success:
-        saved.success === true,
-      worker:
-        "cloudbet-bet-worker",
-      version:
-        VERSION,
-      mode:
-        MODE,
-      dry_run:
-        DRY_RUN,
-      betting_enabled:
-        BETTING_ENABLED,
-      action:
-        "PENDING_ODDS",
-      ready:
-        false,
-      event_id:
-        eventId,
-      match:
-        signalMatch(
-          signal
-        ),
-      reason:
-        current.error ||
-        "TARGET_ODDS_NOT_AVAILABLE",
-      entry_odds:
-        trackerCloudbet
-          .entry_odds,
-      current_odds:
-        current
-          .current_odds,
-      max_stake:
-        current
-          .max_stake,
-      account,
-      account_balance:
-        numberOrNull(
-          account?.balance
-        ),
-      current,
-      pending:
-        saved,
-      source: {
-        event:
-          "DIRECT_TRACKER_EVENT_ID",
-        state:
-          "/event?id=SAME_EVENT_ID",
-        odds:
-          "MATCHER /live EXACT SAME EVENT_ID"
-      },
-      processing_ms:
-        Date.now() -
-        started
-    };
-  }
-
-  const bet =
-    buildReadyBet(
+      pendingExecutionId,
       signal,
       trackerCloudbet,
       current
     );
 
-  const archive =
-    await archiveBet(
-      env,
-      bet,
-      signal,
-      current
-    );
-
-  if (
-    !archive.success
-  ) {
     return {
-      success:
-        false,
-      worker:
-        "cloudbet-bet-worker",
-      version:
-        VERSION,
-      action:
-        "DIRECT_PREFLIGHT",
-      ready:
-        false,
-      event_id:
-        eventId,
-      reason:
-        archive.error ||
-        "ARCHIVE_FAILED",
+      success: saved.success === true,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      mode: MODE,
+      dry_run: DRY_RUN,
+      betting_enabled: BETTING_ENABLED,
+      action: "PENDING_ODDS",
+      ready: false,
+      event_id: eventId,
+      match: signalMatch(signal),
+      reason: current.error || "TARGET_ODDS_NOT_AVAILABLE",
+      entry_odds: trackerCloudbet.entry_odds,
+      current_odds: current.current_odds,
+      max_stake: current.max_stake,
       account,
+      account_balance: numberOrNull(account?.balance),
       current,
-      archive,
-      processing_ms:
-        Date.now() -
-        started
+      pending: saved,
+      source: {
+        event: "DIRECT_TRACKER_EVENT_ID",
+        state: "/event?id=SAME_EVENT_ID",
+        odds: "MATCHER /live EXACT SAME EVENT_ID"
+      },
+      processing_ms: Date.now() - started
     };
   }
 
-  const accountPreflight =
-    buildAccountPreflight(
+  const bet = buildReadyBet(signal, trackerCloudbet, current);
+  const archive = await archiveBet(env, bet, signal, current);
+
+  if (!archive.success) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "DIRECT_PREFLIGHT",
+      ready: false,
+      event_id: eventId,
+      reason: archive.error || "ARCHIVE_FAILED",
       account,
-      current
-    );
-
-  const handoff =
-    buildTradingHandoff(
-      bet,
       current,
-      account
-    );
+      archive,
+      processing_ms: Date.now() - started
+    };
+  }
 
-  const ready =
-    handoff?.ready_to_send ===
-      true;
+  const accountPreflight = buildAccountPreflight(account, current);
+  const handoff = buildTradingHandoff(bet, current, account);
+  const ready = handoff?.ready_to_send === true;
 
-  // V7.4.0: automatic ONE-SHOT real API test on the first READY event.
-  // Normal betting remains disabled.
   const realTest =
     ready
       ? await oneShotRealBetTest(
@@ -5234,139 +5261,71 @@ async function runDirectPreflight(
       : { attempted: false, reason: "PREFLIGHT_NOT_READY" };
 
   return {
-    success:
-      true,
-    worker:
-      "cloudbet-bet-worker",
-    version:
-      VERSION,
-    mode:
-      MODE,
-    dry_run:
-      DRY_RUN,
-    betting_enabled:
-      BETTING_ENABLED,
-    action:
-      "READY_TO_BET",
+    success: true,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    mode: MODE,
+    dry_run: DRY_RUN,
+    betting_enabled: BETTING_ENABLED,
+    action: "READY_TO_BET",
     ready,
-    event_id:
-      eventId,
-    match:
-      signalMatch(
-        signal
-      ),
+    event_id: eventId,
+    match: signalMatch(signal),
     reason:
       ready
         ? "ALL_PREFLIGHT_CHECKS_PASSED"
-        : (
-            accountPreflight
-              ?.block_reason ||
-            "PREFLIGHT_NOT_READY"
-          ),
-    entry_odds:
-      trackerCloudbet
-        .entry_odds,
-    current_odds:
-      current
-        .current_odds,
-    max_stake:
-      current
-        .max_stake,
-    min_stake:
-      current
-        .min_stake,
-    account_balance:
-      numberOrNull(
-        account?.balance
-      ),
-    account_preflight:
-      accountPreflight,
+        : (accountPreflight?.block_reason || "PREFLIGHT_NOT_READY"),
+    entry_odds: trackerCloudbet.entry_odds,
+    current_odds: current.current_odds,
+    max_stake: current.max_stake,
+    min_stake: current.min_stake,
+    account_balance: numberOrNull(account?.balance),
+    account_preflight: accountPreflight,
     handoff,
     archive,
     current,
     source: {
-      event:
-        "DIRECT_TRACKER_EVENT_ID",
-      state:
-        "/event?id=SAME_EVENT_ID",
-      odds:
-        "MATCHER /live EXACT SAME EVENT_ID"
+      event: "DIRECT_TRACKER_EVENT_ID",
+      state: "/event?id=SAME_EVENT_ID",
+      odds: "MATCHER /live EXACT SAME EVENT_ID"
     },
-    real_test:
-      realTest,
-    processing_ms:
-      Date.now() -
-      started
+    real_test: realTest,
+    processing_ms: Date.now() - started
   };
 }
-
-
-// ============================================================
-// MAIN WORKER
-// ============================================================
 
 async function runWorker(
   env: Env
 ): Promise<any> {
-  const started =
-    Date.now();
+  const started = Date.now();
+  const executionId = crypto.randomUUID();
 
-  const executionId =
-    crypto.randomUUID();
+  const schema = await ensureDatabaseSchema(env);
 
-  const schema =
-    await ensureDatabaseSchema(
-      env
-    );
-
-  if (
-    !schema.success
-  ) {
+  if (!schema.success) {
     return {
-      success:
-        false,
-      worker:
-        "cloudbet-bet-worker",
-      version:
-        VERSION,
-      mode:
-        MODE,
-      betting_enabled:
-        BETTING_ENABLED,
-      action:
-        "RUN",
-      execution_id:
-        executionId,
-      error:
-        "DATABASE_SCHEMA_MIGRATION_FAILED",
-      database_schema:
-        schema,
-      processing_ms:
-        Date.now() -
-        started
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      mode: MODE,
+      betting_enabled: BETTING_ENABLED,
+      action: "RUN",
+      execution_id: executionId,
+      error: "DATABASE_SCHEMA_MIGRATION_FAILED",
+      database_schema: schema,
+      processing_ms: Date.now() - started
     };
   }
 
-  const account =
-    await fetchAccountSnapshot(
-      env
-    );
+  const account = await fetchAccountSnapshot(env);
 
-  let pendingResult:
-    any;
+  let pendingResult: any;
 
   try {
-    pendingResult =
-      await processPending(
-        env,
-        account
-      );
-  } catch (
-    error
-  ) {
+    pendingResult = await processPending(env, account);
+  } catch (error) {
     pendingResult = {
-      success:
-        false,
+      success: false,
       error:
         error instanceof Error
           ? error.message
@@ -5381,88 +5340,45 @@ async function runWorker(
       SERVICE_TIMEOUT_MS
     );
 
-  if (
-    !trackerResult.ok
-  ) {
+  if (!trackerResult.ok) {
     return {
-      success:
-        false,
-      worker:
-        "cloudbet-bet-worker",
-      version:
-        VERSION,
-      mode:
-        MODE,
-      betting_enabled:
-        BETTING_ENABLED,
-      action:
-        "RUN",
-      execution_id:
-        executionId,
-      error:
-        "TRACKER_FAILED",
-      tracker:
-        trackerResult,
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      mode: MODE,
+      betting_enabled: BETTING_ENABLED,
+      action: "RUN",
+      execution_id: executionId,
+      error: "TRACKER_FAILED",
+      tracker: trackerResult,
       account,
-      pending_retry:
-        pendingResult,
-      processing_ms:
-        Date.now() -
-        started
+      pending_retry: pendingResult,
+      processing_ms: Date.now() - started
     };
   }
 
-  const trackerSignals =
-    trackerEntries(
-      trackerResult.data
-    );
+  const trackerSignals = trackerEntries(trackerResult.data);
+  const hunterSignals = trackerSignals.filter(isHunterEntry);
 
-  const hunterSignals =
-    trackerSignals.filter(
-      isHunterEntry
-    );
+  const ready: any[] = [];
+  const pending: any[] = [];
+  const skipped: any[] = [];
+  const errors: any[] = [];
 
-  const ready:
-    any[] = [];
+  let trackerReady = 0;
+  let refreshedReady = 0;
+  let targetPending = 0;
 
-  const pending:
-    any[] = [];
-
-  const skipped:
-    any[] = [];
-
-  const errors:
-    any[] = [];
-
-  let trackerReady =
-    0;
-
-  let refreshedReady =
-    0;
-
-  let targetPending =
-    0;
-
-  for (
-    const signal
-    of hunterSignals
-  ) {
+  for (const signal of hunterSignals) {
     try {
-      const diagnostic =
-        trackerCandidateDiagnostic(
-          signal
-        );
+      const diagnostic = trackerCandidateDiagnostic(signal);
 
-      if (
-        !diagnostic.ready
-      ) {
+      if (!diagnostic.ready) {
         skipped.push({
-          reason:
-            diagnostic.reason,
+          reason: diagnostic.reason,
           signal,
           diagnostic
         });
-
         continue;
       }
 
@@ -5473,8 +5389,7 @@ async function runWorker(
         diagnostic.cloudbet;
 
       const cloudbetId =
-        trackerCloudbet
-          .event_id!;
+        trackerCloudbet.event_id!;
 
       const current =
         await verifySameEventAndOdds(
@@ -5482,9 +5397,7 @@ async function runWorker(
           cloudbetId
         );
 
-      if (
-        !current.success
-      ) {
+      if (!current.success) {
         const pendingExecutionId =
           crypto.randomUUID();
 
@@ -5497,44 +5410,27 @@ async function runWorker(
             current
           );
 
-        if (
-          !saved.success
-        ) {
+        if (!saved.success) {
           errors.push({
-            type:
-              "PENDING_SAVE_FAILED",
+            type: "PENDING_SAVE_FAILED",
             signal,
-            cloudbet_id:
-              cloudbetId,
+            cloudbet_id: cloudbetId,
             current,
-            error:
-              saved.error
+            error: saved.error
           });
-
           continue;
         }
 
         targetPending++;
 
         pending.push({
-          execution_id:
-            pendingExecutionId,
-          cloudbet_id:
-            cloudbetId,
-          match:
-            signalMatch(
-              signal
-            ),
-          entry_odds:
-            trackerCloudbet
-              .entry_odds,
-          current_odds:
-            current
-              .current_odds,
-          reason:
-            current.error,
-          pending:
-            saved
+          execution_id: pendingExecutionId,
+          cloudbet_id: cloudbetId,
+          match: signalMatch(signal),
+          entry_odds: trackerCloudbet.entry_odds,
+          current_odds: current.current_odds,
+          reason: current.error,
+          pending: saved
         });
 
         continue;
@@ -5555,20 +5451,14 @@ async function runWorker(
           current
         );
 
-      if (
-        !archive.success
-      ) {
+      if (!archive.success) {
         errors.push({
-          type:
-            "ARCHIVE_FAILED",
+          type: "ARCHIVE_FAILED",
           signal,
-          cloudbet_id:
-            cloudbetId,
+          cloudbet_id: cloudbetId,
           bet,
-          error:
-            archive.error
+          error: archive.error
         });
-
         continue;
       }
 
@@ -5582,51 +5472,24 @@ async function runWorker(
       refreshedReady++;
 
       ready.push({
-        execution_id:
-          bet.execution_id,
-        action:
-          "READY_TO_BET",
-        cloudbet_id:
-          cloudbetId,
-        match:
-          signalMatch(
-            signal
-          ),
-        home:
-          signalHome(
-            signal
-          ),
-        away:
-          signalAway(
-            signal
-          ),
-        entry_minute:
-          signal?.entry_minute ??
-          null,
+        execution_id: bet.execution_id,
+        action: "READY_TO_BET",
+        cloudbet_id: cloudbetId,
+        match: signalMatch(signal),
+        home: signalHome(signal),
+        away: signalAway(signal),
+        entry_minute: signal?.entry_minute ?? null,
         hunter_score:
           signal?.hunter_score ??
           signal?.score ??
           null,
-        matcher_score:
-          trackerCloudbet
-            .matcher_score,
-        entry_odds:
-          trackerCloudbet
-            .entry_odds,
-        current_odds:
-          current
-            .current_odds,
-        odds_movement:
-          bet.odds
-            .movement,
-        current_max_stake:
-          current
-            .max_stake,
-        market_url:
-          current
-            .market_url,
-        target:
-          bet.target,
+        matcher_score: trackerCloudbet.matcher_score,
+        entry_odds: trackerCloudbet.entry_odds,
+        current_odds: current.current_odds,
+        odds_movement: bet.odds.movement,
+        current_max_stake: current.max_stake,
+        market_url: current.market_url,
+        target: bet.target,
         account_preflight:
           buildAccountPreflight(
             account,
@@ -5635,12 +5498,9 @@ async function runWorker(
         handoff,
         archive
       });
-    } catch (
-      error
-    ) {
+    } catch (error) {
       errors.push({
-        type:
-          "SIGNAL_PROCESSING_ERROR",
+        type: "SIGNAL_PROCESSING_ERROR",
         signal,
         error:
           error instanceof Error
@@ -5651,143 +5511,84 @@ async function runWorker(
   }
 
   return {
-    success:
-      true,
-    worker:
-      "cloudbet-bet-worker",
-    version:
-      VERSION,
-    mode:
-      MODE,
-    dry_run:
-      DRY_RUN,
-    betting_enabled:
-      BETTING_ENABLED,
-    handoff_enabled:
-      HANDOFF_ENABLED,
-    action:
-      "RUN",
-    execution_id:
-      executionId,
+    success: true,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    mode: MODE,
+    dry_run: DRY_RUN,
+    betting_enabled: BETTING_ENABLED,
+    handoff_enabled: HANDOFF_ENABLED,
+    action: "RUN",
+    execution_id: executionId,
 
     config: {
-      stake_eur:
-        BET_STAKE_EUR,
-      handoff_currency:
-        BET_CURRENCY,
-      handoff_stake:
-        BET_STAKE,
-      trading_endpoint:
-        TRADING_STRAIGHT_ENDPOINT,
-      market:
-        BET_MARKET,
-      selection:
-        BET_SELECTION,
-      target_market:
-        TARGET_MARKET,
-      target_submarket:
-        TARGET_SUBMARKET,
-      target_outcome:
-        TARGET_OUTCOME,
-      target_params:
-        TARGET_PARAMS,
-      tracker_is_match_source:
-        true,
-      direct_event_preflight:
-        true,
-      direct_preflight_endpoint:
-        "/preflight",
-      d1_auto_migration:
-        true,
-      matcher_lookup:
-        true,
-      matcher_used_for_matching:
-        false,
-      matcher_used_for_exact_odds:
-        true,
-      matcher_odds_endpoint:
-        "/live",
-      matcher_odds_event_lock:
-        "EXACT_EVENT_ID_ONLY",
-      fuzzy_fallback:
-        false,
-      direct_cloudbet_match_fallback:
-        false,
-      final_same_event_check:
-        true,
-      current_odds_refresh:
-        true,
-      persistent_pending_retry:
-        true,
-      odds_event_max_retries:
-        ODDS_EVENT_MAX_RETRIES,
-      odds_event_retry_delay_ms:
-        ODDS_EVENT_RETRY_DELAY_MS,
-      retry_same_event:
-        true,
-      retry_same_market:
-        true,
-      retry_same_line:
-        true,
-      account_preflight:
-        true,
-      account_endpoint:
-        "/account-test",
-      handoff_only:
-        true,
-      real_bet_post:
-        false
+      stake_eur: BET_STAKE_EUR,
+      handoff_currency: BET_CURRENCY,
+      handoff_stake: BET_STAKE,
+      trading_endpoint: TRADING_STRAIGHT_ENDPOINT,
+      market: BET_MARKET,
+      selection: BET_SELECTION,
+      target_market: TARGET_MARKET,
+      target_submarket: TARGET_SUBMARKET,
+      target_outcome: TARGET_OUTCOME,
+      target_params: TARGET_PARAMS,
+      tracker_is_match_source: true,
+      direct_event_preflight: true,
+      direct_preflight_endpoint: "/preflight",
+      d1_auto_migration: true,
+      matcher_lookup: true,
+      matcher_used_for_matching: false,
+      matcher_used_for_exact_odds: true,
+      matcher_odds_endpoint: "/live",
+      matcher_odds_event_lock: "EXACT_EVENT_ID_ONLY",
+      fuzzy_fallback: false,
+      direct_cloudbet_match_fallback: false,
+      final_same_event_check: true,
+      current_odds_refresh: true,
+      persistent_pending_retry: true,
+      odds_event_max_retries: ODDS_EVENT_MAX_RETRIES,
+      odds_event_retry_delay_ms: ODDS_EVENT_RETRY_DELAY_MS,
+      retry_same_event: true,
+      retry_same_market: true,
+      retry_same_line: true,
+      account_preflight: true,
+      account_endpoint: "/account-test",
+      handoff_only: true,
+      real_bet_post: false
     },
 
     source: {
-      tracker:
-        "/entries",
-      cloudbet_event:
-        "/event?id=CLOUDBET_EVENT_ID",
+      tracker: "/entries",
+      cloudbet_event: "/event?id=CLOUDBET_EVENT_ID",
       current_odds:
         "MATCHER /live -> EXACT SAME EVENT_ID"
     },
 
     stats: {
-      tracker_signals:
-        trackerSignals.length,
-      hunter_signals:
-        hunterSignals.length,
-      tracker_ready:
-        trackerReady,
-      ready_to_bet:
-        refreshedReady,
-      pending:
-        targetPending,
-      skipped:
-        skipped.length,
-      errors:
-        errors.length
+      tracker_signals: trackerSignals.length,
+      hunter_signals: hunterSignals.length,
+      tracker_ready: trackerReady,
+      ready_to_bet: refreshedReady,
+      pending: targetPending,
+      skipped: skipped.length,
+      errors: errors.length
     },
 
     account,
-    pending_retry:
-      pendingResult,
+    pending_retry: pendingResult,
     ready,
     pending,
     skipped,
     errors,
 
-    processing_ms:
-      Date.now() -
-      started
+    processing_ms: Date.now() - started
   };
 }
-
-// ============================================================
-// DIAGNOSTIC
-// ============================================================
 
 async function runDiagnostic(
   env: Env
 ): Promise<any> {
-  const started =
-    Date.now();
+  const started = Date.now();
 
   const tracker =
     await fetchServiceJSON(
@@ -5818,26 +5619,17 @@ async function runDiagnostic(
     );
 
   return {
-    success:
-      tracker.ok,
-    worker:
-      "cloudbet-bet-worker",
-    version:
-      VERSION,
-    mode:
-      MODE,
-    betting_enabled:
-      BETTING_ENABLED,
-    handoff_enabled:
-      HANDOFF_ENABLED,
-    action:
-      "DIAGNOSTIC",
+    success: tracker.ok,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    mode: MODE,
+    betting_enabled: BETTING_ENABLED,
+    handoff_enabled: HANDOFF_ENABLED,
+    action: "DIAGNOSTIC",
 
     architecture: {
-      match_source:
-        "TRACKER V6.7+",
-      tracker_endpoint:
-        "/entries",
+      match_source: "TRACKER V6.7+",
+      tracker_endpoint: "/entries",
       required_tracker_fields: [
         "cloudbet.event_id"
       ],
@@ -5848,83 +5640,51 @@ async function runDiagnostic(
         "cloudbet.match",
         "cloudbet.matcher_score"
       ],
-      matcher_lookup:
-        true,
-      matcher_purpose:
-        "EXACT_ODDS_ONLY",
-      matcher_name_matching:
-        false,
-      matcher_event_selection:
-        false,
-      matcher_odds_endpoint:
-        "/live",
-      matcher_event_lock:
-        "EXACT_EVENT_ID_ONLY",
-      name_matching:
-        false,
-      fallback_to_other_event:
-        false,
+      matcher_lookup: true,
+      matcher_purpose: "EXACT_ODDS_ONLY",
+      matcher_name_matching: false,
+      matcher_event_selection: false,
+      matcher_odds_endpoint: "/live",
+      matcher_event_lock: "EXACT_EVENT_ID_ONLY",
+      name_matching: false,
+      fallback_to_other_event: false,
       final_verification:
         "/event?id=SAME_CLOUDBET_EVENT_ID",
       current_odds_source:
         "MATCHER /live EXACT SAME EVENT_ID",
-      final_handoff:
-        true,
-      real_bet_post:
-        false
+      final_handoff: true,
+      real_bet_post: false
     },
 
     target: {
-      market:
-        TARGET_MARKET,
-      submarket:
-        TARGET_SUBMARKET,
-      outcome:
-        TARGET_OUTCOME,
-      params:
-        TARGET_PARAMS
+      market: TARGET_MARKET,
+      submarket: TARGET_SUBMARKET,
+      outcome: TARGET_OUTCOME,
+      params: TARGET_PARAMS
     },
 
     handoff: {
-      enabled:
-        HANDOFF_ENABLED,
-      currency:
-        BET_CURRENCY,
-      stake:
-        BET_STAKE,
-      endpoint:
-        TRADING_STRAIGHT_ENDPOINT,
-      sent:
-        false
+      enabled: HANDOFF_ENABLED,
+      currency: BET_CURRENCY,
+      stake: BET_STAKE,
+      endpoint: TRADING_STRAIGHT_ENDPOINT,
+      sent: false
     },
 
     tracker: {
-      ok:
-        tracker.ok,
-      status:
-        tracker.status,
-      latency_ms:
-        tracker.latency_ms,
-      signals:
-        trackerSignals.length,
-      raw:
-        tracker.data,
-      error:
-        tracker.error ||
-        null
+      ok: tracker.ok,
+      status: tracker.status,
+      latency_ms: tracker.latency_ms,
+      signals: trackerSignals.length,
+      raw: tracker.data,
+      error: tracker.error || null
     },
 
     diagnostics,
 
-    processing_ms:
-      Date.now() -
-      started
+    processing_ms: Date.now() - started
   };
 }
-
-// ============================================================
-// PUBLIC TRACKER PROXY
-// ============================================================
 
 async function runEntriesProxy(
   env: Env
@@ -5937,117 +5697,68 @@ async function runEntriesProxy(
     );
 
   return {
-    success:
-      result.ok,
-    worker:
-      "cloudbet-bet-worker",
-    version:
-      VERSION,
-    proxy:
-      "TRACKER",
-    endpoint:
-      "/entries",
-    status:
-      result.status,
-    latency_ms:
-      result.latency_ms,
-    data:
-      result.data,
-    error:
-      result.error ||
-      null
+    success: result.ok,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    proxy: "TRACKER",
+    endpoint: "/entries",
+    status: result.status,
+    latency_ms: result.latency_ms,
+    data: result.data,
+    error: result.error || null
   };
 }
-
-// ============================================================
-// HEALTH
-// ============================================================
 
 function healthResponse():
   Response {
   return json({
-    success:
-      true,
-    worker:
-      "cloudbet-bet-worker",
-    version:
-      VERSION,
-    mode:
-      MODE,
-    dry_run:
-      DRY_RUN,
-    betting_enabled:
-      BETTING_ENABLED,
-    handoff_enabled:
-      HANDOFF_ENABLED,
-    status:
-      "OK",
+    success: true,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    mode: MODE,
+    dry_run: DRY_RUN,
+    betting_enabled: BETTING_ENABLED,
+    handoff_enabled: HANDOFF_ENABLED,
+    status: "OK",
 
     target: {
-      market:
-        BET_MARKET,
-      selection:
-        TARGET_SELECTION,
-      market_key:
-        TARGET_MARKET,
-      submarket_key:
-        TARGET_SUBMARKET,
-      outcome:
-        TARGET_OUTCOME,
-      params:
-        TARGET_PARAMS
+      market: BET_MARKET,
+      selection: TARGET_SELECTION,
+      market_key: TARGET_MARKET,
+      submarket_key: TARGET_SUBMARKET,
+      outcome: TARGET_OUTCOME,
+      params: TARGET_PARAMS
     },
 
     architecture: {
-      tracker_match_source:
-        true,
-      direct_event_preflight:
-        true,
-      direct_preflight_endpoint:
-        "/preflight",
-      matcher_lookup:
-        true,
-      matcher_used_for_matching:
-        false,
-      matcher_used_for_exact_odds:
-        true,
-      matcher_odds_endpoint:
-        "/live",
-      fuzzy_matching:
-        false,
-      cloudbet_fallback:
-        false,
-      exact_event_lock:
-        true,
-      final_event_refresh:
-        true,
+      tracker_match_source: true,
+      direct_event_preflight: true,
+      direct_preflight_endpoint: "/preflight",
+      matcher_lookup: true,
+      matcher_used_for_matching: false,
+      matcher_used_for_exact_odds: true,
+      matcher_odds_endpoint: "/live",
+      fuzzy_matching: false,
+      cloudbet_fallback: false,
+      exact_event_lock: true,
+      final_event_refresh: true,
       current_odds_source:
         "MATCHER /live EXACT EVENT_ID",
-      final_handoff:
-        true,
-      real_bet_post:
-        false
+      final_handoff: true,
+      real_bet_post: false
     },
 
     cloudbet: {
       event_endpoint:
         "/event?id=CLOUDBET_EVENT_ID",
-      persistent_retry:
-        true,
-      max_retries:
-        ODDS_EVENT_MAX_RETRIES,
-      retry_delay_ms:
-        ODDS_EVENT_RETRY_DELAY_MS,
-      retry_same_event:
-        true,
-      retry_same_market:
-        true,
-      retry_same_line:
-        true,
-      trading_endpoint:
-        TRADING_STRAIGHT_ENDPOINT,
-      handoff_only:
-        true
+      persistent_retry: true,
+      max_retries: ODDS_EVENT_MAX_RETRIES,
+      retry_delay_ms: ODDS_EVENT_RETRY_DELAY_MS,
+      retry_same_event: true,
+      retry_same_market: true,
+      retry_same_line: true,
+      trading_endpoint: TRADING_STRAIGHT_ENDPOINT,
+      handoff_only: true
     },
 
     endpoints: [
@@ -6065,10 +5776,6 @@ function healthResponse():
     ]
   });
 }
-
-// ============================================================
-// FETCH ROUTER
-// ============================================================
 
 export default {
   async fetch(
@@ -6089,22 +5796,14 @@ export default {
         path === ""
       ) {
         return json({
-          success:
-            true,
-          worker:
-            "cloudbet-bet-worker",
-          version:
-            VERSION,
-          mode:
-            MODE,
-          dry_run:
-            DRY_RUN,
-          betting_enabled:
-            BETTING_ENABLED,
-          handoff_enabled:
-            HANDOFF_ENABLED,
-          status:
-            "ONLINE",
+          success: true,
+          worker: "cloudbet-bet-worker",
+          version: VERSION,
+          mode: MODE,
+          dry_run: DRY_RUN,
+          betting_enabled: BETTING_ENABLED,
+          handoff_enabled: HANDOFF_ENABLED,
+          status: "ONLINE",
 
           flow: [
             "TRACKER /entries OR DIRECT /preflight",
@@ -6126,52 +5825,32 @@ export default {
           ],
 
           target: {
-            market:
-              TARGET_MARKET,
-            submarket:
-              TARGET_SUBMARKET,
-            outcome:
-              TARGET_OUTCOME,
-            params:
-              TARGET_PARAMS
+            market: TARGET_MARKET,
+            submarket: TARGET_SUBMARKET,
+            outcome: TARGET_OUTCOME,
+            params: TARGET_PARAMS
           },
 
           handoff: {
-            currency:
-              BET_CURRENCY,
-            stake:
-              BET_STAKE,
-            endpoint:
-              TRADING_STRAIGHT_ENDPOINT,
-            enabled:
-              HANDOFF_ENABLED,
-            real_post:
-              false
+            currency: BET_CURRENCY,
+            stake: BET_STAKE,
+            endpoint: TRADING_STRAIGHT_ENDPOINT,
+            enabled: HANDOFF_ENABLED,
+            real_post: false
           },
 
           safety: {
-            matcher_inside_bet_worker:
-              true,
-            matcher_purpose:
-              "EXACT_ODDS_ONLY",
-            matcher_name_matching:
-              false,
-            matcher_event_selection:
-              false,
-            fuzzy_name_matching:
-              false,
-            alternative_event_fallback:
-              false,
-            same_event_only:
-              true,
-            real_betting:
-              false,
-            one_shot_real_test:
-              REAL_TEST_ENABLED,
-            one_shot_test_stake:
-              REAL_TEST_STAKE,
-            v4_payload_schema_fixed:
-              true
+            matcher_inside_bet_worker: true,
+            matcher_purpose: "EXACT_ODDS_ONLY",
+            matcher_name_matching: false,
+            matcher_event_selection: false,
+            fuzzy_name_matching: false,
+            alternative_event_fallback: false,
+            same_event_only: true,
+            real_betting: false,
+            one_shot_real_test: REAL_TEST_ENABLED,
+            one_shot_test_stake: REAL_TEST_STAKE,
+            v4_payload_schema_fixed: true
           },
 
           endpoints: [
@@ -6191,17 +5870,11 @@ export default {
         });
       }
 
-      if (
-        path ===
-        "/health"
-      ) {
+      if (path === "/health") {
         return healthResponse();
       }
 
-      if (
-        path ===
-        "/entries"
-      ) {
+      if (path === "/entries") {
         return json(
           await runEntriesProxy(
             env
@@ -6209,10 +5882,7 @@ export default {
         );
       }
 
-      if (
-        path ===
-        "/diagnostic"
-      ) {
+      if (path === "/diagnostic") {
         return json(
           await runDiagnostic(
             env
@@ -6220,26 +5890,15 @@ export default {
         );
       }
 
-      if (
-        path ===
-        "/preflight"
-      ) {
-        if (
-          request.method !==
-          "POST"
-        ) {
+      if (path === "/preflight") {
+        if (request.method !== "POST") {
           return json(
             {
-              success:
-                false,
-              worker:
-                "cloudbet-bet-worker",
-              version:
-                VERSION,
-              error:
-                "METHOD_NOT_ALLOWED",
-              expected_method:
-                "POST"
+              success: false,
+              worker: "cloudbet-bet-worker",
+              version: VERSION,
+              error: "METHOD_NOT_ALLOWED",
+              expected_method: "POST"
             },
             405
           );
@@ -6254,14 +5913,10 @@ export default {
         } catch {
           return json(
             {
-              success:
-                false,
-              worker:
-                "cloudbet-bet-worker",
-              version:
-                VERSION,
-              error:
-                "INVALID_JSON_BODY"
+              success: false,
+              worker: "cloudbet-bet-worker",
+              version: VERSION,
+              error: "INVALID_JSON_BODY"
             },
             400
           );
@@ -6275,23 +5930,14 @@ export default {
         );
       }
 
-      if (
-        path ===
-        "/real-test-status"
-      ) {
+      if (path === "/real-test-status") {
         return json(
           await realTestStatus(env)
         );
       }
 
-      if (
-        path ===
-        "/trading-diagnostic"
-      ) {
-        if (
-          request.method !==
-          "GET"
-        ) {
+      if (path === "/trading-diagnostic") {
+        if (request.method !== "GET") {
           return json(
             {
               success: false,
@@ -6309,10 +5955,7 @@ export default {
         );
       }
 
-      if (
-        path ===
-        "/graphql-diagnostic"
-      ) {
+      if (path === "/graphql-diagnostic") {
         if (request.method !== "GET") {
           return json(
             {
@@ -6330,10 +5973,7 @@ export default {
         );
       }
 
-      if (
-        path ===
-        "/auth-matrix"
-      ) {
+      if (path === "/auth-matrix") {
         if (request.method !== "GET") {
           return json(
             {
@@ -6351,10 +5991,7 @@ export default {
         );
       }
 
-      if (
-        path ===
-        "/rest-post-diagnostic"
-      ) {
+      if (path === "/rest-post-diagnostic") {
         if (request.method !== "GET") {
           return json(
             {
@@ -6372,19 +6009,13 @@ export default {
         );
       }
 
-      if (
-        path ===
-        "/trading-payload-preview"
-      ) {
+      if (path === "/trading-payload-preview") {
         return json(
           v4StraightPayloadPreview()
         );
       }
 
-      if (
-        path ===
-        "/run"
-      ) {
+      if (path === "/run") {
         return json(
           await runWorker(
             env
@@ -6394,29 +6025,22 @@ export default {
 
       return json(
         {
-          success:
-            false,
-          worker:
-            "cloudbet-bet-worker",
-          version:
-            VERSION,
-          error:
-            "Not found",
+          success: false,
+          worker: "cloudbet-bet-worker",
+          version: VERSION,
+          error: "Not found",
           path
         },
         404
       );
     } catch (
-    error
+      error
     ) {
       return json(
         {
-          success:
-            false,
-          worker:
-            "cloudbet-bet-worker",
-          version:
-            VERSION,
+          success: false,
+          worker: "cloudbet-bet-worker",
+          version: VERSION,
           error:
             error instanceof Error
               ? error.message
@@ -6428,3 +6052,4 @@ export default {
     }
   }
 };
+
