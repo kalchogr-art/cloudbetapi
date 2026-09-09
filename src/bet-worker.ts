@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.5.0 GRAPHQL DIAGNOSTIC";
+  "V7.5.1 GRAPHQL PLACEBET ONE-SHOT";
 
 const MODE =
   "DRY_RUN";
@@ -102,7 +102,7 @@ const TRADING_STRAIGHT_ENDPOINT =
 // read balance is below 100 USDT, with partial stake disabled.
 const REAL_TEST_ENABLED = true;
 const REAL_TEST_STAKE = 100;
-const REAL_TEST_KEY = "V7.4.3_ONE_SHOT_100_USDT_OFFICIAL_V4";
+const REAL_TEST_KEY = "V7.5.1_GRAPHQL_ONE_SHOT_100_USDT";
 
 // Legacy display/archive value preserved from V7.0.2.
 const BET_STAKE_EUR =
@@ -4135,7 +4135,7 @@ async function oneShotRealBetTest(
     return { attempted: false, reason: "BALANCE_UNAVAILABLE" };
   }
 
-  // Hard safety: never send the test if 100 USDT could be fully funded.
+  // Hard safety: this diagnostic must be impossible to fund.
   if (balance >= REAL_TEST_STAKE) {
     return {
       attempted: false,
@@ -4150,14 +4150,14 @@ async function oneShotRealBetTest(
     return { attempted: false, reason: "CLOUDBET_API_KEY_MISSING" };
   }
 
-  if (!handoff?.body?.selection?.eventId || !handoff?.body?.selection?.marketUrl) {
+  const selection = handoff?.body?.selection ?? null;
+  if (!selection?.eventId || !selection?.marketUrl || !selection?.price) {
     return { attempted: false, reason: "HANDOFF_INCOMPLETE" };
   }
 
   await ensureRealTestTable(env);
   const now = nowISO();
 
-  // Atomic one-shot claim. Only the first READY request can win this insert.
   const claim = await env.DB.prepare(`
     INSERT OR IGNORE INTO real_bet_test_guard
       (test_key, status, event_id, stake, balance, created_at, updated_at)
@@ -4188,46 +4188,66 @@ async function oneShotRealBetTest(
     };
   }
 
-  const payload = {
-    ...handoff.body,
-    referenceId: crypto.randomUUID(),
+  const referenceId = crypto.randomUUID();
+
+  // Official Cloudbet GraphQL PlaceBetInput shape.
+  const input = {
+    referenceId,
+    eventId: safe(eventId),
+    price: String(selection.price),
     currency: BET_CURRENCY,
-    stake: String(REAL_TEST_STAKE),
-    acceptPartialStake: false,
-    priceChange: {
-      value: "BETTER"
-    },
-    selection: {
-      ...handoff.body.selection,
-      eventId
-    }
+    marketUrl: safe(selection.marketUrl),
+    stake: String(REAL_TEST_STAKE)
   };
+
+  const query = `
+    mutation PlaceBet($input: PlaceBetInput!) {
+      placeBet(input: $input) {
+        referenceId
+        eventId
+        marketUrl
+        currency
+        price
+        stake
+        betStatus
+        side
+        betErrorCode
+      }
+    }
+  `;
 
   let httpStatus = 0;
   let responseBody: any = null;
 
   try {
-    const response = await fetch(TRADING_STRAIGHT_ENDPOINT, {
+    const response = await fetch(GRAPHQL_ENDPOINT, {
       method: "POST",
       headers: {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "X-API-Key": apiKey
+        "X-API-KEY": apiKey
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify({
+        query,
+        variables: { input }
+      }),
+      redirect: "manual"
     });
 
     httpStatus = response.status;
-    const text = await response.text();
+    const raw = await response.text();
+
     try {
-      responseBody = text ? JSON.parse(text) : null;
+      responseBody = raw ? JSON.parse(raw) : null;
     } catch {
-      responseBody = text ? { raw: text.slice(0, 2000) } : null;
+      responseBody = raw ? { raw: raw.slice(0, 3000) } : null;
     }
 
     const stored = JSON.stringify({
+      transport: "GRAPHQL",
       ok: response.ok,
       status: httpStatus,
+      headers: diagnosticHeaders(response.headers),
       body: responseBody
     }).slice(0, 12000);
 
@@ -4240,34 +4260,50 @@ async function oneShotRealBetTest(
     return {
       attempted: true,
       one_shot_consumed: true,
+      transport: "GRAPHQL",
       request: {
+        endpoint: GRAPHQL_ENDPOINT,
+        operation: "PlaceBet",
+        reference_id: referenceId,
         event_id: eventId,
         currency: BET_CURRENCY,
         stake: REAL_TEST_STAKE,
-        accept_partial_stake: false,
-        price_change: { value: "BETTER" },
-        market_url: payload.selection.marketUrl,
-        price: payload.selection.price,
+        market_url: input.marketUrl,
+        price: input.price,
         balance_before_request: balance
       },
       response: {
         ok: response.ok,
         status: httpStatus,
+        headers: diagnosticHeaders(response.headers),
         body: responseBody
       }
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+
     await env.DB.prepare(`
       UPDATE real_bet_test_guard
       SET status = 'REQUEST_ERROR', response_json = ?, updated_at = ?
       WHERE test_key = ?
-    `).bind(JSON.stringify({ error: message }).slice(0, 12000), nowISO(), REAL_TEST_KEY).run();
+    `).bind(
+      JSON.stringify({
+        transport: "GRAPHQL",
+        error: message
+      }).slice(0, 12000),
+      nowISO(),
+      REAL_TEST_KEY
+    ).run();
 
     return {
       attempted: true,
       one_shot_consumed: true,
-      response: { ok: false, status: httpStatus, error: message }
+      transport: "GRAPHQL",
+      response: {
+        ok: false,
+        status: httpStatus,
+        error: message
+      }
     };
   }
 }
