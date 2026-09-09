@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.5.2 AUTH MATRIX DIAGNOSTIC";
+  "V7.6.0 REST POST PATH DIAGNOSTIC";
 
 const MODE =
   "DRY_RUN";
@@ -4759,6 +4759,176 @@ async function authMatrixDiagnostic(env: Env): Promise<any> {
   };
 }
 
+async function restPostPathDiagnostic(env: Env): Promise<any> {
+  const started = Date.now();
+  const key = safe(env.CLOUDBET_API_KEY);
+
+  if (!key) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "REST_POST_PATH_DIAGNOSTIC",
+      safe_read_only: true,
+      wager_sent: false,
+      api_key_present: false,
+      error: "CLOUDBET_API_KEY_MISSING"
+    };
+  }
+
+  async function probe(
+    name: string,
+    url: string,
+    init: RequestInit
+  ): Promise<any> {
+    try {
+      const response = await fetch(url, {
+        ...init,
+        redirect: "manual"
+      });
+
+      const raw = await response.text();
+      let body: any = null;
+      let bodyType = "EMPTY";
+
+      if (raw) {
+        try {
+          body = JSON.parse(raw);
+          bodyType = "JSON";
+        } catch {
+          bodyType =
+            /<html|<!doctype html/i.test(raw)
+              ? "HTML"
+              : "TEXT";
+          body = { raw: raw.slice(0, 2500) };
+        }
+      }
+
+      const cfBlocked =
+        response.status === 403 &&
+        bodyType === "HTML" &&
+        /cloudflare|sorry,\s*you have been blocked|attention required/i.test(raw);
+
+      return {
+        name,
+        ok: response.ok,
+        http_status: response.status,
+        body_type: bodyType,
+        cloudflare_block_detected: cfBlocked,
+        headers: diagnosticHeaders(response.headers),
+        body
+      };
+    } catch (error: any) {
+      return {
+        name,
+        ok: false,
+        error: String(error?.message ?? error ?? "REQUEST_FAILED")
+      };
+    }
+  }
+
+  const headers = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "X-API-Key": key
+  };
+
+  // IMPORTANT:
+  // No valid wager is included anywhere in this diagnostic.
+  // These requests intentionally omit the required betting fields.
+  const malformedBody = JSON.stringify({
+    diagnostic: true
+  });
+
+  const getHistory = await probe(
+    "CONTROL_GET_TRADING_HISTORY",
+    "https://sports-api.cloudbet.com/pub/v4/bets?limit=1&offset=0",
+    {
+      method: "GET",
+      headers
+    }
+  );
+
+  const postCollection = await probe(
+    "POST_TRADING_COLLECTION_INVALID_BODY",
+    "https://sports-api.cloudbet.com/pub/v4/bets",
+    {
+      method: "POST",
+      headers,
+      body: malformedBody
+    }
+  );
+
+  const postPlaceRoot = await probe(
+    "POST_PLACE_ROOT_INVALID_BODY",
+    "https://sports-api.cloudbet.com/pub/v4/bets/place",
+    {
+      method: "POST",
+      headers,
+      body: malformedBody
+    }
+  );
+
+  const postStraight = await probe(
+    "POST_PLACE_STRAIGHT_INVALID_BODY",
+    "https://sports-api.cloudbet.com/pub/v4/bets/place/straight",
+    {
+      method: "POST",
+      headers,
+      body: malformedBody
+    }
+  );
+
+  const probes = {
+    control_get_trading_history: getHistory,
+    post_trading_collection_invalid_body: postCollection,
+    post_place_root_invalid_body: postPlaceRoot,
+    post_place_straight_invalid_body: postStraight
+  };
+
+  let interpretation = "REST_POST_PATH_MIXED_RESULT";
+
+  if (
+    getHistory?.http_status === 200 &&
+    postStraight?.cloudflare_block_detected === true &&
+    postCollection?.cloudflare_block_detected !== true &&
+    postPlaceRoot?.cloudflare_block_detected !== true
+  ) {
+    interpretation =
+      "WAF_BLOCK_SPECIFIC_TO_PLACE_STRAIGHT_PATH";
+  } else if (
+    getHistory?.http_status === 200 &&
+    postCollection?.cloudflare_block_detected === true &&
+    postPlaceRoot?.cloudflare_block_detected === true &&
+    postStraight?.cloudflare_block_detected === true
+  ) {
+    interpretation =
+      "WAF_BLOCKS_TRADING_POST_METHOD_OR_POST_FAMILY";
+  } else if (
+    getHistory?.http_status === 200 &&
+    postStraight?.body_type === "JSON" &&
+    postStraight?.cloudflare_block_detected !== true
+  ) {
+    interpretation =
+      "PLACE_STRAIGHT_REACHES_API_WITH_INVALID_BODY";
+  }
+
+  return {
+    success: true,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    action: "REST_POST_PATH_DIAGNOSTIC",
+    safe_read_only: true,
+    wager_sent: false,
+    real_test_enabled: REAL_TEST_ENABLED,
+    api_key_present: true,
+    invalid_payload_only: true,
+    probes,
+    interpretation,
+    processing_ms: Date.now() - started
+  };
+}
+
 function v4StraightPayloadPreview(): any {
   return {
     success: true,
@@ -5888,6 +6058,7 @@ function healthResponse():
       "/trading-diagnostic",
       "/graphql-diagnostic",
       "/auth-matrix",
+      "/rest-post-diagnostic",
       "/trading-payload-preview",
       "/diagnostic",
       "/entries"
@@ -6012,6 +6183,7 @@ export default {
             "/trading-diagnostic",
             "/graphql-diagnostic",
             "/auth-matrix",
+            "/rest-post-diagnostic",
             "/trading-payload-preview",
             "/diagnostic",
             "/entries"
@@ -6176,6 +6348,27 @@ export default {
 
         return json(
           await authMatrixDiagnostic(env)
+        );
+      }
+
+      if (
+        path ===
+        "/rest-post-diagnostic"
+      ) {
+        if (request.method !== "GET") {
+          return json(
+            {
+              success: false,
+              worker: "cloudbet-bet-worker",
+              version: VERSION,
+              error: "METHOD_NOT_ALLOWED"
+            },
+            405
+          );
+        }
+
+        return json(
+          await restPostPathDiagnostic(env)
         );
       }
 
