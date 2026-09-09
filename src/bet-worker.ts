@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.4.0 ONE-SHOT REAL TEST";
+  "V7.4.1 TRADING GET DIAGNOSTIC";
 
 const MODE =
   "DRY_RUN";
@@ -4268,6 +4268,133 @@ async function oneShotRealBetTest(
   }
 }
 
+const TRADING_DIAGNOSTIC_ENDPOINT =
+  "https://sports-api.cloudbet.com/pub/v4/bets?limit=1&offset=0";
+
+function diagnosticHeaders(
+  headers: Headers
+): Record<string, string | null> {
+  return {
+    server: headers.get("server"),
+    cf_ray: headers.get("cf-ray"),
+    content_type: headers.get("content-type"),
+    content_length: headers.get("content-length"),
+    cache_control: headers.get("cache-control"),
+    date: headers.get("date"),
+    location: headers.get("location"),
+    via: headers.get("via")
+  };
+}
+
+async function tradingDiagnostic(
+  env: Env
+): Promise<any> {
+  const started = Date.now();
+  const apiKey = safe(env.CLOUDBET_API_KEY);
+
+  if (!apiKey) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "TRADING_GET_DIAGNOSTIC",
+      safe_read_only: true,
+      wager_sent: false,
+      api_key_present: false,
+      error: "CLOUDBET_API_KEY_MISSING",
+      processing_ms: Date.now() - started
+    };
+  }
+
+  try {
+    const response = await fetch(
+      TRADING_DIAGNOSTIC_ENDPOINT,
+      {
+        method: "GET",
+        headers: {
+          "Accept": "application/json",
+          "X-API-Key": apiKey
+        },
+        redirect: "manual"
+      }
+    );
+
+    const contentType =
+      response.headers.get("content-type") || "";
+    const text = await response.text();
+
+    let body: any = null;
+    let bodyType = "EMPTY";
+
+    if (text) {
+      try {
+        body = JSON.parse(text);
+        bodyType = "JSON";
+      } catch {
+        body = {
+          raw: text.slice(0, 3000)
+        };
+        bodyType =
+          /<html|<!doctype html/i.test(text)
+            ? "HTML"
+            : "TEXT";
+      }
+    }
+
+    const cloudflareBlock =
+      response.status === 403 &&
+      bodyType === "HTML" &&
+      /cloudflare|sorry, you have been blocked|attention required/i
+        .test(text);
+
+    return {
+      success: true,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "TRADING_GET_DIAGNOSTIC",
+      safe_read_only: true,
+      wager_sent: false,
+      api_key_present: true,
+      request: {
+        method: "GET",
+        endpoint: TRADING_DIAGNOSTIC_ENDPOINT
+      },
+      response: {
+        ok: response.ok,
+        http_status: response.status,
+        body_type: bodyType,
+        cloudflare_block_detected: cloudflareBlock,
+        headers: diagnosticHeaders(response.headers),
+        body
+      },
+      interpretation:
+        cloudflareBlock
+          ? "TRADING_API_BLOCKED_AT_CLOUDFLARE_EDGE"
+          : response.ok
+            ? "TRADING_GET_REACHED_API_SUCCESSFULLY"
+            : bodyType === "JSON"
+              ? "TRADING_GET_REACHED_API_AND_RETURNED_API_ERROR"
+              : "TRADING_GET_FAILED_NON_JSON",
+      processing_ms: Date.now() - started
+    };
+  } catch (error) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "TRADING_GET_DIAGNOSTIC",
+      safe_read_only: true,
+      wager_sent: false,
+      api_key_present: true,
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error),
+      processing_ms: Date.now() - started
+    };
+  }
+}
+
 async function realTestStatus(env: Env): Promise<any> {
   await ensureRealTestTable(env);
   const row = await env.DB.prepare(`
@@ -5364,6 +5491,7 @@ function healthResponse():
       "/health",
       "/run",
       "/preflight",
+      "/trading-diagnostic",
       "/diagnostic",
       "/entries"
     ]
@@ -5484,6 +5612,7 @@ export default {
             "/run",
             "/preflight",
             "/real-test-status",
+            "/trading-diagnostic",
             "/diagnostic",
             "/entries"
           ]
@@ -5580,6 +5709,31 @@ export default {
       ) {
         return json(
           await realTestStatus(env)
+        );
+      }
+
+      if (
+        path ===
+        "/trading-diagnostic"
+      ) {
+        if (
+          request.method !==
+          "GET"
+        ) {
+          return json(
+            {
+              success: false,
+              worker: "cloudbet-bet-worker",
+              version: VERSION,
+              error: "METHOD_NOT_ALLOWED",
+              expected_method: "GET"
+            },
+            405
+          );
+        }
+
+        return json(
+          await tradingDiagnostic(env)
         );
       }
 
