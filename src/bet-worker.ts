@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.3.1 GRAPHQL PAYLOAD PREVIEW FIX";
+  "V7.6.4 GRAPHQL SAFE VALIDATION";
 
 const MODE =
   "DRY_RUN";
@@ -4018,6 +4018,281 @@ function graphqlTradingPayloadPreview(): any {
   };
 }
 
+
+// ============================================================
+// V7.6.4 — SAFE GRAPHQL PLACEBET VALIDATION
+//
+// Purpose:
+// - locks to one REAL Cloudbet event id
+// - refreshes REAL current odds for the exact 1H O0.5 selection
+// - sends the real eventId / marketUrl / price to GraphQL placeBet
+// - deliberately sends a NON-NUMERIC stake so no valid wager exists
+// - never uses BET_STAKE / REAL_TEST_STAKE
+//
+// This is NOT a read-only HTTP request: it does call the placeBet resolver.
+// It is intentionally non-wagering because the stake is invalid by design.
+// ============================================================
+
+const GRAPHQL_VALIDATION_INVALID_STAKE =
+  "INVALID_DIAGNOSTIC_STAKE";
+
+function graphqlErrorMessages(body: any): string[] {
+  if (!Array.isArray(body?.errors)) {
+    return [];
+  }
+
+  return body.errors
+    .map((item: any) => safe(item?.message))
+    .filter(Boolean);
+}
+
+function classifyGraphqlValidationResponse(
+  status: number,
+  body: any
+): string {
+  const messages = graphqlErrorMessages(body);
+  const joined = messages.join(" | ").toLowerCase();
+
+  if (status === 401 || status === 403) {
+    return "GRAPHQL_AUTH_REJECTED";
+  }
+
+  if (
+    joined.includes("stake") ||
+    joined.includes("invalid") ||
+    joined.includes("amount") ||
+    joined.includes("number") ||
+    joined.includes("numeric") ||
+    joined.includes("scalar")
+  ) {
+    return "PLACEBET_INPUT_OR_BUSINESS_VALIDATION_REACHED";
+  }
+
+  const placeBet = body?.data?.placeBet ?? null;
+
+  if (placeBet?.betErrorCode) {
+    return "PLACEBET_BUSINESS_VALIDATION_REACHED";
+  }
+
+  if (placeBet) {
+    return "UNEXPECTED_PLACEBET_DATA_RETURNED_REVIEW_IMMEDIATELY";
+  }
+
+  if (status >= 200 && status < 500 && messages.length > 0) {
+    return "GRAPHQL_VALIDATION_PATH_REACHED";
+  }
+
+  return "GRAPHQL_VALIDATION_MIXED_RESULT";
+}
+
+async function runGraphqlSafeValidation(
+  env: Env,
+  eventIdInput: any
+): Promise<any> {
+  const started = Date.now();
+  const eventId = normalizeEventId(eventIdInput);
+
+  if (!eventId) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "GRAPHQL_SAFE_VALIDATION",
+      valid_wager_sent: false,
+      placebet_request_sent: false,
+      error: "EVENT_ID_REQUIRED",
+      example: "/graphql-validation-test?event_id=36197593",
+      processing_ms: Date.now() - started
+    };
+  }
+
+  const apiKey = safe(env.CLOUDBET_API_KEY);
+
+  if (!apiKey) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "GRAPHQL_SAFE_VALIDATION",
+      event_id: eventId,
+      valid_wager_sent: false,
+      placebet_request_sent: false,
+      error: "CLOUDBET_API_KEY_MISSING",
+      processing_ms: Date.now() - started
+    };
+  }
+
+  // Reuse the existing SAME-EVENT + exact 1H O0.5 verification path.
+  const current = await verifySameEventAndOdds(env, eventId);
+
+  if (!current?.success) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "GRAPHQL_SAFE_VALIDATION",
+      event_id: eventId,
+      valid_wager_sent: false,
+      placebet_request_sent: false,
+      error: current?.error || "TARGET_ODDS_NOT_AVAILABLE",
+      current,
+      processing_ms: Date.now() - started
+    };
+  }
+
+  const marketUrl = safe(current?.market_url);
+  const price = numberOrNull(current?.current_odds);
+
+  if (!marketUrl || price === null || price <= 1) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "GRAPHQL_SAFE_VALIDATION",
+      event_id: eventId,
+      valid_wager_sent: false,
+      placebet_request_sent: false,
+      error: "CURRENT_SELECTION_NOT_READY",
+      current_odds: price,
+      market_url: marketUrl || null,
+      current,
+      processing_ms: Date.now() - started
+    };
+  }
+
+  const referenceId = crypto.randomUUID();
+
+  const input = {
+    referenceId,
+    eventId,
+    price: String(price),
+    currency: BET_CURRENCY,
+    marketUrl,
+    // CRITICAL SAFETY GUARD: never replace this with a number here.
+    stake: GRAPHQL_VALIDATION_INVALID_STAKE
+  };
+
+  // Defense in depth: refuse to send if the diagnostic stake ever becomes numeric.
+  if (/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)$/.test(safe(input.stake))) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "GRAPHQL_SAFE_VALIDATION",
+      event_id: eventId,
+      valid_wager_sent: false,
+      placebet_request_sent: false,
+      error: "SAFETY_GUARD_BLOCKED_NUMERIC_DIAGNOSTIC_STAKE",
+      processing_ms: Date.now() - started
+    };
+  }
+
+  const query = `
+    mutation V764SafeValidation($input: PlaceBetInput!) {
+      placeBet(input: $input) {
+        referenceId
+        eventId
+        marketUrl
+        currency
+        price
+        stake
+        betStatus
+        side
+        betErrorCode
+      }
+    }
+  `;
+
+  let httpStatus = 0;
+  let responseBody: any = null;
+
+  try {
+    const response = await fetch(GRAPHQL_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-API-KEY": apiKey
+      },
+      body: JSON.stringify({
+        query,
+        variables: { input }
+      }),
+      redirect: "manual"
+    });
+
+    httpStatus = response.status;
+    const raw = await response.text();
+
+    try {
+      responseBody = raw ? JSON.parse(raw) : null;
+    } catch {
+      responseBody = raw ? { raw: raw.slice(0, 3000) } : null;
+    }
+
+    const interpretation = classifyGraphqlValidationResponse(
+      httpStatus,
+      responseBody
+    );
+
+    return {
+      success: true,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "GRAPHQL_SAFE_VALIDATION",
+      safe_non_wagering_test: true,
+      valid_wager_sent: false,
+      placebet_request_sent: true,
+      betting_enabled: BETTING_ENABLED,
+      real_test_enabled: REAL_TEST_ENABLED,
+      transport: "GRAPHQL",
+      endpoint: GRAPHQL_ENDPOINT,
+      event_id: eventId,
+      current_odds: price,
+      market_url: marketUrl,
+      currency: BET_CURRENCY,
+      diagnostic_stake: GRAPHQL_VALIDATION_INVALID_STAKE,
+      safety: {
+        real_stake_used: false,
+        bet_stake_constant_used: false,
+        real_test_stake_used: false,
+        diagnostic_stake_is_numeric: false
+      },
+      request: {
+        operation: "V764SafeValidation",
+        reference_id: referenceId,
+        event_id: eventId,
+        price: String(price),
+        currency: BET_CURRENCY,
+        market_url: marketUrl,
+        stake: GRAPHQL_VALIDATION_INVALID_STAKE
+      },
+      response: {
+        ok: response.ok,
+        http_status: httpStatus,
+        headers: diagnosticHeaders(response.headers),
+        body: responseBody
+      },
+      interpretation,
+      current,
+      processing_ms: Date.now() - started
+    };
+  } catch (error) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "GRAPHQL_SAFE_VALIDATION",
+      safe_non_wagering_test: true,
+      valid_wager_sent: false,
+      placebet_request_sent: false,
+      event_id: eventId,
+      error: error instanceof Error ? error.message : String(error),
+      processing_ms: Date.now() - started
+    };
+  }
+}
+
 // ============================================================
 // V7.3.1 — DIRECT SINGLE EVENT PREFLIGHT
 // ============================================================
@@ -6094,6 +6369,16 @@ export default {
 
         return json(
           await restPostPathDiagnostic(env)
+        );
+      }
+
+      if (path === "/graphql-validation-test") {
+        const eventId = url.searchParams.get("event_id");
+        return json(
+          await runGraphqlSafeValidation(
+            env,
+            eventId
+          )
         );
       }
 
