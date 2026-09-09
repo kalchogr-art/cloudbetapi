@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.7 ONE-SHOT 0.10 USDT";
+  "V7.6.8 HARD SAFETY GATES 0.10 USDT";
 
 const MODE =
   "DRY_RUN";
@@ -103,9 +103,9 @@ const TRADING_TRANSPORT =
 // ONE-SHOT REAL API TEST. This does not enable normal betting.
 // Dedicated one-shot real API test. Normal betting remains disabled.
 // Exactly one 0.10 USDT request can be sent through the explicit confirmed route.
-const REAL_TEST_ENABLED = true;
+const REAL_TEST_ENABLED = false;
 const REAL_TEST_STAKE = 0.10;
-const REAL_TEST_KEY = "V7.6.7_GRAPHQL_ONE_SHOT_0_10_USDT";
+const REAL_TEST_KEY = "V7.6.7_GRAPHQL_ONE_SHOT_0_10_USDT"; // keep consumed key; real test disabled
 const REAL_TEST_CONFIRM = "PLACE_0_10_USDT_ONCE";
 
 // Legacy display/archive value preserved from V7.0.2.
@@ -1181,128 +1181,39 @@ function eventStillValidForTarget(
   period: string;
   minute: number | null;
 } {
-  const score =
-    cloudbetScore(
-      event
-    );
+  const score = cloudbetScore(event);
+  const period = cloudbetPeriod(event);
+  const minute = cloudbetMinute(event);
 
-  if (
-    score.known &&
-    !(
-      score.home === 0 &&
-      score.away === 0
-    )
-  ) {
-    return {
-      valid:
-        false,
-      reason:
-        "SCORE_NOT_0_0",
-      score,
-      period:
-        cloudbetPeriod(
-          event
-        ),
-      minute:
-        cloudbetMinute(
-          event
-        )
-    };
+  // HARD GATE #1 — score must be explicitly known and exactly 0:0.
+  if (!score.known) {
+    return { valid: false, reason: "SCORE_UNKNOWN", score, period, minute };
   }
 
-  const period =
-    cloudbetPeriod(
-      event
-    );
+  if (score.home !== 0 || score.away !== 0) {
+    return { valid: false, reason: "SCORE_NOT_0_0", score, period, minute };
+  }
 
-  const secondHalfHints = [
-    "2p",
-    "2h",
-    "second",
-    "second_half",
-    "second half"
+  // HARD GATE #2 — event must explicitly be in the first half.
+  // Unknown/ambiguous periods are rejected instead of being treated as valid.
+  const firstHalfHints = [
+    "1p", "1h", "first", "first_half", "first half"
   ];
 
-  if (
-    secondHalfHints.some(
-      hint =>
-        period.includes(
-          hint
-        )
-    )
-  ) {
-    return {
-      valid:
-        false,
-      reason:
-        "NOT_FIRST_HALF",
-      score,
-      period,
-      minute:
-        cloudbetMinute(
-          event
-        )
-    };
+  if (!firstHalfHints.some(hint => period.includes(hint))) {
+    return { valid: false, reason: "FIRST_HALF_NOT_CONFIRMED", score, period, minute };
   }
 
-  const terminalHints = [
-    "finished",
-    "ended",
-    "settled",
-    "closed"
-  ];
-
-  if (
-    terminalHints.some(
-      hint =>
-        period.includes(
-          hint
-        )
-    )
-  ) {
-    return {
-      valid:
-        false,
-      reason:
-        "EVENT_FINISHED",
-      score,
-      period,
-      minute:
-        cloudbetMinute(
-          event
-        )
-    };
+  // HARD GATE #3 — minute must be known and inside Hunter window 10–42.
+  if (minute === null) {
+    return { valid: false, reason: "MINUTE_UNKNOWN", score, period, minute };
   }
 
-  const minute =
-    cloudbetMinute(
-      event
-    );
-
-  if (
-    minute !== null &&
-    minute > 45
-  ) {
-    return {
-      valid:
-        false,
-      reason:
-        "MINUTE_OVER_45",
-      score,
-      period,
-      minute
-    };
+  if (minute < 10 || minute > 42) {
+    return { valid: false, reason: "OUTSIDE_HUNTER_MINUTE_WINDOW", score, period, minute };
   }
 
-  return {
-    valid:
-      true,
-    reason:
-      "EVENT_VALID",
-    score,
-    period,
-    minute
-  };
+  return { valid: true, reason: "EVENT_VALID", score, period, minute };
 }
 
 // ============================================================
@@ -2085,6 +1996,34 @@ async function verifySameEventAndOdds(
       };
     }
 
+    // HARD GATE #4 — exact market/selection/odds must match the intended bet.
+    const exactMarketUrl = safe(matcherOdds.market_url) === TARGET_MARKET_URL;
+    const selectionEnabled = safe(matcherOdds.selection_status) === "SELECTION_ENABLED";
+    const livePrice = numberOrNull(matcherOdds.current_odds);
+
+    if (!exactMarketUrl || !selectionEnabled || livePrice === null || livePrice <= 1) {
+      return {
+        success: false,
+        event_id: expectedEventId,
+        current_odds: livePrice,
+        max_stake: matcherOdds.max_stake,
+        min_stake: matcherOdds.min_stake,
+        selection_status: matcherOdds.selection_status,
+        market_url: matcherOdds.market_url,
+        event,
+        validation: {
+          ...validation,
+          exact_event_id: true,
+          exact_market_url: exactMarketUrl,
+          selection_enabled: selectionEnabled,
+          odds_source: "MATCHER_LIVE_EXACT_EVENT_ID"
+        },
+        error: !exactMarketUrl
+          ? "EXACT_MARKET_URL_MISMATCH"
+          : (!selectionEnabled ? "SELECTION_NOT_ENABLED" : "CURRENT_ODDS_INVALID")
+      };
+    }
+
     return {
       success:
         true,
@@ -2473,9 +2412,10 @@ function buildTradingHandoff(
 
   if (
     !eventId ||
-    !marketUrl ||
+    marketUrl !== TARGET_MARKET_URL ||
     price === null ||
-    price <= 1
+    price <= 1 ||
+    safe(BET_STAKE) !== "0.10"
   ) {
     return null;
   }
@@ -4559,6 +4499,43 @@ function buildDirectSignal(
   };
 }
 
+// ============================================================
+// HARD GATE #5 — REAL BET DUPLICATE PROTECTION
+// One real bet max per Cloudbet event + exact target market URL.
+// This table is separate from the archive because archive rows can exist in DRY_RUN.
+// ============================================================
+
+async function ensureRealBetGuardTable(env: Env): Promise<void> {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS real_bet_guard (
+      guard_key TEXT PRIMARY KEY,
+      event_id TEXT NOT NULL,
+      market_url TEXT NOT NULL,
+      stake TEXT NOT NULL,
+      status TEXT NOT NULL,
+      reference_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `).run();
+}
+
+function realBetGuardKey(eventId: string, marketUrl: string): string {
+  return `${eventId}|${marketUrl}|${BET_CURRENCY}`;
+}
+
+async function realBetAlreadyClaimed(
+  env: Env,
+  eventId: string,
+  marketUrl: string
+): Promise<boolean> {
+  await ensureRealBetGuardTable(env);
+  const row = await env.DB.prepare(`
+    SELECT guard_key FROM real_bet_guard WHERE guard_key = ? LIMIT 1
+  `).bind(realBetGuardKey(eventId, marketUrl)).first<any>();
+  return !!row;
+}
+
 async function runExplicitOneShot010(
   env: Env,
   eventIdInput: any,
@@ -4594,6 +4571,17 @@ async function runExplicitOneShot010(
       error: "LIVE_SELECTION_OR_STAKE_VALIDATION_FAILED",
       event_id: eventId, current_odds: price, min_stake: minStake, max_stake: maxStake,
       selection_status: current?.selection_status ?? null, market_url: marketUrl || null
+    };
+  }
+
+  if (await realBetAlreadyClaimed(env, eventId, marketUrl)) {
+    return {
+      success: false,
+      action: "REAL_ONE_SHOT_0_10",
+      attempted: false,
+      error: "DUPLICATE_REAL_BET_BLOCKED",
+      event_id: eventId,
+      market_url: marketUrl
     };
   }
 
@@ -6145,7 +6133,14 @@ async function runWorker(
       account_preflight: true,
       account_endpoint: "/account-test",
       handoff_only: true,
-      real_bet_post: false
+      real_bet_post: false,
+      hard_safety_gates: true,
+      require_known_score_0_0: true,
+      require_explicit_first_half: true,
+      hunter_minute_window: "10-42",
+      exact_market_url_lock: TARGET_MARKET_URL,
+      fixed_stake: BET_STAKE,
+      duplicate_real_bet_guard: true
     },
 
     source: {
