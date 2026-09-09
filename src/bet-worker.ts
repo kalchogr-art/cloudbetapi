@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.4.2 V4 STRAIGHT PAYLOAD FIX";
+  "V7.4.3 OFFICIAL V4 RETEST";
 
 const MODE =
   "DRY_RUN";
@@ -102,7 +102,7 @@ const TRADING_STRAIGHT_ENDPOINT =
 // read balance is below 100 USDT, with partial stake disabled.
 const REAL_TEST_ENABLED = true;
 const REAL_TEST_STAKE = 100;
-const REAL_TEST_KEY = "V7.4.0_ONE_SHOT_100_USDT";
+const REAL_TEST_KEY = "V7.4.3_ONE_SHOT_100_USDT_OFFICIAL_V4";
 
 // Legacy display/archive value preserved from V7.0.2.
 const BET_STAKE_EUR =
@@ -2553,10 +2553,13 @@ function buildTradingHandoff(
       stake:
         BET_STAKE,
 
-      // Cloudbet Trading API v4 straight-bet schema:
-      // priceChange is the enum value itself, not { value: "BETTER" }.
-      priceChange:
-        "BETTER",
+      acceptPartialStake:
+        false,
+
+      priceChange: {
+        value:
+          "BETTER"
+      },
 
       selection: {
         eventId,
@@ -4190,7 +4193,10 @@ async function oneShotRealBetTest(
     referenceId: crypto.randomUUID(),
     currency: BET_CURRENCY,
     stake: String(REAL_TEST_STAKE),
-    priceChange: "BETTER",
+    acceptPartialStake: false,
+    priceChange: {
+      value: "BETTER"
+    },
     selection: {
       ...handoff.body.selection,
       eventId
@@ -4238,7 +4244,8 @@ async function oneShotRealBetTest(
         event_id: eventId,
         currency: BET_CURRENCY,
         stake: REAL_TEST_STAKE,
-        price_change: "BETTER",
+        accept_partial_stake: false,
+        price_change: { value: "BETTER" },
         market_url: payload.selection.marketUrl,
         price: payload.selection.price,
         balance_before_request: balance
@@ -4404,19 +4411,21 @@ function v4StraightPayloadPreview(): any {
       referenceId: "<UUID>",
       currency: BET_CURRENCY,
       stake: "<STAKE>",
-      priceChange: "BETTER",
+      acceptPartialStake: false,
+      priceChange: {
+        value: "BETTER"
+      },
       selection: {
         eventId: "<EXACT_CLOUDBET_EVENT_ID>",
         marketUrl: "<EXACT_MARKET_URL>",
         price: "<CURRENT_PRICE>"
       }
     },
-    removed_from_v7_4_0: [
-      "acceptPartialStake",
-      "priceChange.value wrapper"
-    ],
-    one_shot_rearmed: false,
-    one_shot_key: REAL_TEST_KEY
+    contract: "CLOUDBET_OFFICIAL_V4_JULY_22_2026",
+    one_shot_rearmed: true,
+    one_shot_key: REAL_TEST_KEY,
+    test_stake: REAL_TEST_STAKE,
+    hard_balance_safety: "NO POST IF BALANCE >= TEST STAKE"
   };
 }
 
