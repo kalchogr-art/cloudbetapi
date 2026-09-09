@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.2 POST AUTH DIAGNOSTIC FIX";
+  "V7.6.3 GRAPHQL TRADING PATH";
 
 const MODE =
   "DRY_RUN";
@@ -97,12 +97,15 @@ const BET_STAKE =
 const TRADING_STRAIGHT_ENDPOINT =
   "https://sports-api.cloudbet.com/pub/v4/bets/place/straight";
 
+const TRADING_TRANSPORT =
+  "GRAPHQL";
+
 // ONE-SHOT REAL API TEST. This does not enable normal betting.
 // It can send exactly one 100 USDT request, only when the freshly
 // read balance is below 100 USDT, with partial stake disabled.
 const REAL_TEST_ENABLED = false;
 const REAL_TEST_STAKE = 100;
-const REAL_TEST_KEY = "V7.5.1_GRAPHQL_ONE_SHOT_100_USDT";
+const REAL_TEST_KEY = "V7.6.3_GRAPHQL_ONE_SHOT_100_USDT";
 
 // Legacy display/archive value preserved from V7.0.2.
 const BET_STAKE_EUR =
@@ -2439,16 +2442,13 @@ function buildTradingHandoff(
     CurrentOddsResult,
   account: AccountSnapshot
 ): any | null {
-  if (
-    !HANDOFF_ENABLED
-  ) {
+  if (!HANDOFF_ENABLED) {
     return null;
   }
 
   const eventId =
     normalizeEventId(
-      bet?.cloudbet
-        ?.event_id ??
+      bet?.cloudbet?.event_id ??
       current?.event_id ??
       null
     );
@@ -2456,17 +2456,14 @@ function buildTradingHandoff(
   const marketUrl =
     safe(
       current?.market_url ??
-      bet?.cloudbet
-        ?.market_url ??
+      bet?.cloudbet?.market_url ??
       ""
     );
 
   const price =
     numberOrNull(
-      current
-        ?.current_odds ??
-      bet?.odds
-        ?.current_odds ??
+      current?.current_odds ??
+      bet?.odds?.current_odds ??
       null
     );
 
@@ -2485,11 +2482,41 @@ function buildTradingHandoff(
       current
     );
 
+  const referenceId =
+    crypto.randomUUID();
+
+  const input = {
+    referenceId,
+    eventId,
+    price: String(price),
+    currency: BET_CURRENCY,
+    marketUrl,
+    stake: BET_STAKE
+  };
+
+  const query = `
+    mutation PlaceBet($input: PlaceBetInput!) {
+      placeBet(input: $input) {
+        referenceId
+        eventId
+        marketUrl
+        currency
+        price
+        stake
+        betStatus
+        side
+        betErrorCode
+      }
+    }
+  `;
+
   return {
     ready_to_send:
       preflight.ready_to_send,
     sent:
       false,
+    transport:
+      TRADING_TRANSPORT,
     block_reason:
       preflight.block_reason,
     preflight,
@@ -2498,41 +2525,35 @@ function buildTradingHandoff(
       "POST",
 
     endpoint:
-      TRADING_STRAIGHT_ENDPOINT,
+      GRAPHQL_ENDPOINT,
 
     headers: {
       "Accept":
         "application/json",
       "Content-Type":
         "application/json",
-      "X-API-Key":
+      "X-API-KEY":
         "<CLOUDBET_API_KEY>"
     },
 
+    operation:
+      "PlaceBet",
+
+    graphql_input:
+      input,
+
     body: {
-      referenceId:
-        crypto.randomUUID(),
-
-      currency:
-        BET_CURRENCY,
-
-      stake:
-        BET_STAKE,
-
-      acceptPartialStake:
-        false,
-
-      priceChange: {
-        value:
-          "BETTER"
-      },
-
-      selection: {
-        eventId,
-        marketUrl,
-        price:
-          String(price)
+      query,
+      variables: {
+        input
       }
+    },
+
+    // Compatibility snapshot only. Never transmitted by V7.6.3.
+    legacy_rest_selection: {
+      eventId,
+      marketUrl,
+      price: String(price)
     }
   };
 }
@@ -3958,6 +3979,42 @@ async function processPending(
 }
 
 
+function graphqlTradingPayloadPreview(): any {
+  const exampleInput = {
+    referenceId: "<UUID>",
+    eventId: "<EVENT_ID>",
+    price: "<CURRENT_ODDS>",
+    currency: BET_CURRENCY,
+    marketUrl: TARGET_MARKET_URL,
+    stake: BET_STAKE
+  };
+
+  return {
+    success: true,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    action: "GRAPHQL_TRADING_PAYLOAD_PREVIEW",
+    safe_read_only: true,
+    wager_sent: false,
+    betting_enabled: BETTING_ENABLED,
+    real_test_enabled: REAL_TEST_ENABLED,
+    transport: TRADING_TRANSPORT,
+    endpoint: GRAPHQL_ENDPOINT,
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "X-API-KEY": "<CLOUDBET_API_KEY>"
+    },
+    body: {
+      query: `mutation PlaceBet($input: PlaceBetInput!) { placeBet(input: $input) { referenceId eventId marketUrl currency price stake betStatus side betErrorCode } }`,
+      variables: {
+        input: exampleInput
+      }
+    }
+  };
+}
+
 // ============================================================
 // V7.3.1 — DIRECT SINGLE EVENT PREFLIGHT
 // ============================================================
@@ -4095,7 +4152,12 @@ async function oneShotRealBetTest(
     return { attempted: false, reason: "CLOUDBET_API_KEY_MISSING" };
   }
 
-  const selection = handoff?.body?.selection ?? null;
+  const selection =
+    handoff?.graphql_input ??
+    handoff?.body?.variables?.input ??
+    handoff?.body?.selection ??
+    null;
+
   if (!selection?.eventId || !selection?.marketUrl || !selection?.price) {
     return { attempted: false, reason: "HANDOFF_INCOMPLETE" };
   }
@@ -6029,6 +6091,12 @@ export default {
 
         return json(
           await restPostPathDiagnostic(env)
+        );
+      }
+
+      if (path === "/graphql-trading-payload-preview") {
+        return json(
+          graphqlTradingPayloadPreview()
         );
       }
 
