@@ -1,7 +1,15 @@
 // ============================================================
-// CLOUDBET BET WORKER V7.3.1
+// CLOUDBET BET WORKER V7.3.2
 // DRY RUN · TRACKER READY CANDIDATE · EXACT MATCHER ODDS REFRESH
 // EXACT 1H TOTAL GOALS OVER 0.5
+//
+// V7.3.2:
+// - SAFE AUTOMATIC D1 SCHEMA MIGRATION
+// - fixes old pending_odds / bet_archive schemas without deleting data
+// - adds missing columns with ALTER TABLE ADD COLUMN
+// - creates missing tables/indexes when needed
+// - migration is idempotent and tolerates concurrent duplicate-column races
+// - direct /preflight and existing /run both ensure schema before DB work
 //
 // V7.3.1:
 // - DIRECT /preflight endpoint for ONE Tracker event_id
@@ -50,7 +58,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.3.1 DIRECT EVENT PREFLIGHT";
+  "V7.3.2 D1 AUTO MIGRATION";
 
 const MODE =
   "DRY_RUN";
@@ -2541,6 +2549,404 @@ function buildTradingHandoff(
   };
 }
 
+
+// ============================================================
+// V7.3.2 — SAFE D1 AUTO MIGRATION
+//
+// Existing databases may have older pending_odds / bet_archive schemas.
+// This migration:
+// - never drops a table
+// - never deletes rows
+// - never renames existing columns
+// - creates missing tables
+// - adds only missing columns
+// - is safe to run repeatedly
+// ============================================================
+
+interface D1ColumnInfo {
+  cid?: number;
+  name?: string;
+  type?: string;
+  notnull?: number;
+  dflt_value?: any;
+  pk?: number;
+}
+
+interface SchemaMigrationResult {
+  success: boolean;
+  migrated: boolean;
+  created_tables: string[];
+  added_columns: string[];
+  indexes_checked: string[];
+  error?: string;
+}
+
+const PENDING_ODDS_COLUMNS:
+  Record<string, string> = {
+    archive_key:
+      "TEXT",
+    execution_id:
+      "TEXT",
+    signal_match_id:
+      "TEXT",
+    cloudbet_id:
+      "TEXT",
+    match:
+      "TEXT",
+    home:
+      "TEXT",
+    away:
+      "TEXT",
+    entry_minute:
+      "REAL",
+    market:
+      "TEXT",
+    selection:
+      "TEXT",
+    stake_eur:
+      "REAL",
+    mode:
+      "TEXT",
+    status:
+      "TEXT",
+    retry_count:
+      "INTEGER DEFAULT 0",
+    missing_count:
+      "INTEGER DEFAULT 0",
+    payload_json:
+      "TEXT",
+    created_at:
+      "TEXT",
+    updated_at:
+      "TEXT",
+    next_check_at:
+      "TEXT"
+  };
+
+const BET_ARCHIVE_COLUMNS:
+  Record<string, string> = {
+    execution_id:
+      "TEXT",
+    timestamp:
+      "TEXT",
+    cloudbet_id:
+      "TEXT",
+    home:
+      "TEXT",
+    away:
+      "TEXT",
+    odds:
+      "REAL",
+    stake_eur:
+      "REAL",
+    market:
+      "TEXT",
+    selection:
+      "TEXT",
+    payload_json:
+      "TEXT"
+  };
+
+function isDuplicateColumnError(
+  error: any
+): boolean {
+  const message =
+    String(
+      error instanceof Error
+        ? error.message
+        : error
+    ).toLowerCase();
+
+  return (
+    message.includes(
+      "duplicate column"
+    ) ||
+    message.includes(
+      "already exists"
+    )
+  );
+}
+
+async function tableColumns(
+  env: Env,
+  tableName: string
+): Promise<Set<string>> {
+  const result =
+    await env.DB
+      .prepare(
+        `PRAGMA table_info(${tableName})`
+      )
+      .all<D1ColumnInfo>();
+
+  const columns =
+    new Set<string>();
+
+  for (
+    const row
+    of result.results || []
+  ) {
+    const name =
+      safe(
+        row?.name
+      );
+
+    if (name) {
+      columns.add(
+        name.toLowerCase()
+      );
+    }
+  }
+
+  return columns;
+}
+
+async function addMissingColumns(
+  env: Env,
+  tableName: string,
+  definitions:
+    Record<string, string>
+): Promise<string[]> {
+  const added:
+    string[] = [];
+
+  let columns =
+    await tableColumns(
+      env,
+      tableName
+    );
+
+  for (
+    const [
+      columnName,
+      sqlType
+    ]
+    of Object.entries(
+      definitions
+    )
+  ) {
+    if (
+      columns.has(
+        columnName.toLowerCase()
+      )
+    ) {
+      continue;
+    }
+
+    try {
+      await env.DB
+        .prepare(
+          `ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${sqlType}`
+        )
+        .run();
+
+      added.push(
+        `${tableName}.${columnName}`
+      );
+
+      columns.add(
+        columnName.toLowerCase()
+      );
+    } catch (
+      error
+    ) {
+      // Two requests can migrate at the same time.
+      // If the other request added the same column first,
+      // re-read the table and continue safely.
+      if (
+        isDuplicateColumnError(
+          error
+        )
+      ) {
+        columns =
+          await tableColumns(
+            env,
+            tableName
+          );
+
+        if (
+          columns.has(
+            columnName.toLowerCase()
+          )
+        ) {
+          continue;
+        }
+      }
+
+      throw error;
+    }
+  }
+
+  return added;
+}
+
+async function ensureDatabaseSchema(
+  env: Env
+): Promise<SchemaMigrationResult> {
+  const createdTables:
+    string[] = [];
+
+  const addedColumns:
+    string[] = [];
+
+  const indexesChecked:
+    string[] = [];
+
+  try {
+    // --------------------------------------------------------
+    // pending_odds
+    // --------------------------------------------------------
+    await env.DB
+      .prepare(`
+        CREATE TABLE IF NOT EXISTS pending_odds (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          archive_key TEXT,
+          execution_id TEXT,
+          signal_match_id TEXT,
+          cloudbet_id TEXT,
+          match TEXT,
+          home TEXT,
+          away TEXT,
+          entry_minute REAL,
+          market TEXT,
+          selection TEXT,
+          stake_eur REAL,
+          mode TEXT,
+          status TEXT,
+          retry_count INTEGER DEFAULT 0,
+          missing_count INTEGER DEFAULT 0,
+          payload_json TEXT,
+          created_at TEXT,
+          updated_at TEXT,
+          next_check_at TEXT
+        )
+      `)
+      .run();
+
+    createdTables.push(
+      "pending_odds"
+    );
+
+    addedColumns.push(
+      ...await addMissingColumns(
+        env,
+        "pending_odds",
+        PENDING_ODDS_COLUMNS
+      )
+    );
+
+    // --------------------------------------------------------
+    // bet_archive
+    // --------------------------------------------------------
+    await env.DB
+      .prepare(`
+        CREATE TABLE IF NOT EXISTS bet_archive (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          execution_id TEXT,
+          timestamp TEXT,
+          cloudbet_id TEXT,
+          home TEXT,
+          away TEXT,
+          odds REAL,
+          stake_eur REAL,
+          market TEXT,
+          selection TEXT,
+          payload_json TEXT
+        )
+      `)
+      .run();
+
+    createdTables.push(
+      "bet_archive"
+    );
+
+    addedColumns.push(
+      ...await addMissingColumns(
+        env,
+        "bet_archive",
+        BET_ARCHIVE_COLUMNS
+      )
+    );
+
+    // --------------------------------------------------------
+    // Indexes
+    // --------------------------------------------------------
+    await env.DB
+      .prepare(`
+        CREATE INDEX IF NOT EXISTS
+        idx_pending_odds_cloudbet_id
+        ON pending_odds(cloudbet_id)
+      `)
+      .run();
+
+    indexesChecked.push(
+      "idx_pending_odds_cloudbet_id"
+    );
+
+    await env.DB
+      .prepare(`
+        CREATE INDEX IF NOT EXISTS
+        idx_pending_odds_next_check
+        ON pending_odds(next_check_at)
+      `)
+      .run();
+
+    indexesChecked.push(
+      "idx_pending_odds_next_check"
+    );
+
+    await env.DB
+      .prepare(`
+        CREATE INDEX IF NOT EXISTS
+        idx_bet_archive_cloudbet_market_selection
+        ON bet_archive(
+          cloudbet_id,
+          market,
+          selection
+        )
+      `)
+      .run();
+
+    indexesChecked.push(
+      "idx_bet_archive_cloudbet_market_selection"
+    );
+
+    return {
+      success:
+        true,
+      migrated:
+        addedColumns.length >
+        0,
+      created_tables:
+        createdTables,
+      added_columns:
+        addedColumns,
+      indexes_checked:
+        indexesChecked
+    };
+  } catch (
+    error
+  ) {
+    return {
+      success:
+        false,
+      migrated:
+        addedColumns.length >
+        0,
+      created_tables:
+        createdTables,
+      added_columns:
+        addedColumns,
+      indexes_checked:
+        indexesChecked,
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error)
+    };
+  }
+}
+
+
 // ============================================================
 // D1 — PENDING ODDS
 // ============================================================
@@ -3468,6 +3874,38 @@ async function runDirectPreflight(
     };
   }
 
+  const schema =
+    await ensureDatabaseSchema(
+      env
+    );
+
+  if (
+    !schema.success
+  ) {
+    return {
+      success:
+        false,
+      worker:
+        "cloudbet-bet-worker",
+      version:
+        VERSION,
+      action:
+        "DIRECT_PREFLIGHT",
+      ready:
+        false,
+      event_id:
+        eventId,
+      reason:
+        "DATABASE_SCHEMA_MIGRATION_FAILED",
+      database_schema:
+        schema,
+      processing_ms:
+        Date.now() -
+        started
+    };
+  }
+
+
   const signal =
     buildDirectSignal(
       input
@@ -3724,6 +4162,39 @@ async function runWorker(
 
   const executionId =
     crypto.randomUUID();
+
+  const schema =
+    await ensureDatabaseSchema(
+      env
+    );
+
+  if (
+    !schema.success
+  ) {
+    return {
+      success:
+        false,
+      worker:
+        "cloudbet-bet-worker",
+      version:
+        VERSION,
+      mode:
+        MODE,
+      betting_enabled:
+        BETTING_ENABLED,
+      action:
+        "RUN",
+      execution_id:
+        executionId,
+      error:
+        "DATABASE_SCHEMA_MIGRATION_FAILED",
+      database_schema:
+        schema,
+      processing_ms:
+        Date.now() -
+        started
+    };
+  }
 
   const account =
     await fetchAccountSnapshot(
@@ -4075,6 +4546,8 @@ async function runWorker(
         true,
       direct_preflight_endpoint:
         "/preflight",
+      d1_auto_migration:
+        true,
       matcher_lookup:
         true,
       matcher_used_for_matching:
