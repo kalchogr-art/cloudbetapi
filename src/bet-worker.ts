@@ -75,7 +75,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.10 TELEGRAM TEST + BET ARCHIVE 0.10 USDT";
+  "V7.6.11 AUTO E2E ONE-SHOT TEST 0.10 USDT";
 
 const MODE =
   "DRY_RUN";
@@ -109,6 +109,13 @@ const REAL_TEST_ENABLED = false;
 const REAL_TEST_STAKE = 0.10;
 const REAL_TEST_KEY = "V7.6.7_GRAPHQL_ONE_SHOT_0_10_USDT"; // keep consumed key; real test disabled
 const REAL_TEST_CONFIRM = "PLACE_0_10_USDT_ONCE";
+
+// V7.6.11 — automatic end-to-end proof test.
+// Normal betting stays OFF. Exactly one automatic real 0.10 USDT request
+// may be sent from the normal Hunter -> /run flow after ALL safety gates pass.
+const AUTO_E2E_TEST_ENABLED = true;
+const AUTO_E2E_TEST_STAKE = "0.10";
+const AUTO_E2E_TEST_KEY = "V7.6.11_AUTO_E2E_ONE_SHOT_0_10_USDT";
 
 // Legacy display/archive value preserved from V7.0.2.
 const BET_STAKE_EUR =
@@ -4776,6 +4783,214 @@ async function realBetAlreadyClaimed(
   return !!row;
 }
 
+// ============================================================
+// V7.6.11 — AUTOMATIC END-TO-END ONE-SHOT TEST
+// Triggered only from the normal /run Hunter flow.
+// It re-checks SAME event + 0:0 + 1H + minute 10-42 + exact 1H O0.5,
+// refreshes account/odds immediately before POST, then atomically consumes
+// one global D1 test key. Normal betting remains disabled.
+// ============================================================
+
+async function ensureAutoE2ETestTable(env: Env): Promise<void> {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS auto_e2e_test_guard (
+      test_key TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      event_id TEXT,
+      reference_id TEXT,
+      stake TEXT,
+      odds TEXT,
+      http_status INTEGER,
+      response_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `).run();
+}
+
+async function autoE2ETestStatus(env: Env): Promise<any> {
+  await ensureAutoE2ETestTable(env);
+  const row = await env.DB.prepare(`
+    SELECT test_key, status, event_id, reference_id, stake, odds,
+           http_status, response_json, created_at, updated_at
+    FROM auto_e2e_test_guard
+    WHERE test_key = ?
+    LIMIT 1
+  `).bind(AUTO_E2E_TEST_KEY).first<any>();
+  return {
+    success: true,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    action: "AUTO_E2E_TEST_STATUS",
+    enabled: AUTO_E2E_TEST_ENABLED,
+    normal_betting_enabled: BETTING_ENABLED,
+    max_real_bets: 1,
+    stake: AUTO_E2E_TEST_STAKE,
+    currency: BET_CURRENCY,
+    consumed: !!row,
+    test: row ?? null
+  };
+}
+
+async function archiveRealBetAttemptExists(env: Env, eventId: string, marketUrl: string): Promise<boolean> {
+  await ensureRealBetArchiveTable(env);
+  const row = await env.DB.prepare(`
+    SELECT reference_id FROM real_bet_archive
+    WHERE event_id = ? AND market_url = ?
+    LIMIT 1
+  `).bind(eventId, marketUrl).first<any>();
+  return !!row;
+}
+
+async function runAutoE2EOneShot(env: Env, signal: any, eventIdInput: any): Promise<any> {
+  const eventId = normalizeEventId(eventIdInput);
+
+  if (!AUTO_E2E_TEST_ENABLED) return { attempted: false, consumed: false, reason: "AUTO_E2E_TEST_DISABLED" };
+  if (BETTING_ENABLED) return { attempted: false, consumed: false, reason: "SAFETY_BLOCK_NORMAL_BETTING_MUST_REMAIN_DISABLED" };
+  if (safe(AUTO_E2E_TEST_STAKE) !== "0.10" || safe(BET_STAKE) !== "0.10") {
+    return { attempted: false, consumed: false, reason: "SAFETY_BLOCK_STAKE_NOT_EXACT_0_10" };
+  }
+  if (!eventId) return { attempted: false, consumed: false, reason: "EVENT_ID_MISSING" };
+
+  const current = await verifySameEventAndOdds(env, eventId);
+  if (!current?.success) {
+    return { attempted: false, consumed: false, reason: current?.error || "FINAL_EVENT_REFRESH_FAILED", event_id: eventId, current };
+  }
+
+  const marketUrl = safe(current?.market_url);
+  const price = numberOrNull(current?.current_odds);
+  const minStake = numberOrNull(current?.min_stake);
+  const maxStake = numberOrNull(current?.max_stake);
+  const stake = Number(AUTO_E2E_TEST_STAKE);
+
+  if (marketUrl !== TARGET_MARKET_URL || safe(current?.selection_status) !== "SELECTION_ENABLED" ||
+      price === null || price <= 1 || minStake === null || stake < minStake ||
+      (maxStake !== null && stake > maxStake)) {
+    return {
+      attempted: false, consumed: false, reason: "FINAL_MARKET_OR_STAKE_VALIDATION_FAILED",
+      event_id: eventId, current_odds: price, min_stake: minStake, max_stake: maxStake,
+      market_url: marketUrl, selection_status: current?.selection_status ?? null
+    };
+  }
+
+  const account = await fetchAccountSnapshot(env);
+  const preflight = buildAccountPreflight(account, current);
+  if (preflight?.ready_to_send !== true) {
+    return { attempted: false, consumed: false, reason: preflight?.block_reason || "ACCOUNT_PREFLIGHT_FAILED", event_id: eventId, account, preflight };
+  }
+
+  const apiKey = safe(env.CLOUDBET_API_KEY);
+  if (!apiKey) return { attempted: false, consumed: false, reason: "CLOUDBET_API_KEY_MISSING" };
+
+  if (await realBetAlreadyClaimed(env, eventId, marketUrl) || await archiveRealBetAttemptExists(env, eventId, marketUrl)) {
+    return { attempted: false, consumed: false, reason: "DUPLICATE_REAL_BET_BLOCKED", event_id: eventId, market_url: marketUrl };
+  }
+
+  await ensureAutoE2ETestTable(env);
+  await ensureRealBetGuardTable(env);
+  const now = nowISO();
+  const referenceId = crypto.randomUUID();
+
+  const globalClaim = await env.DB.prepare(`
+    INSERT OR IGNORE INTO auto_e2e_test_guard
+      (test_key, status, event_id, reference_id, stake, odds, created_at, updated_at)
+    VALUES (?, 'CLAIMED', ?, ?, ?, ?, ?, ?)
+  `).bind(AUTO_E2E_TEST_KEY, eventId, referenceId, AUTO_E2E_TEST_STAKE, String(price), now, now).run();
+
+  if (Number((globalClaim as any)?.meta?.changes ?? 0) !== 1) {
+    const status = await autoE2ETestStatus(env);
+    return { attempted: false, consumed: true, reason: "AUTO_E2E_TEST_ALREADY_CONSUMED", existing: status.test };
+  }
+
+  const guardClaim = await env.DB.prepare(`
+    INSERT OR IGNORE INTO real_bet_guard
+      (guard_key, event_id, market_url, stake, status, reference_id, created_at, updated_at)
+    VALUES (?, ?, ?, ?, 'CLAIMED', ?, ?, ?)
+  `).bind(realBetGuardKey(eventId, marketUrl), eventId, marketUrl, AUTO_E2E_TEST_STAKE, referenceId, now, now).run();
+
+  if (Number((guardClaim as any)?.meta?.changes ?? 0) !== 1) {
+    await env.DB.prepare(`UPDATE auto_e2e_test_guard SET status = 'BLOCKED_DUPLICATE', updated_at = ? WHERE test_key = ?`)
+      .bind(nowISO(), AUTO_E2E_TEST_KEY).run();
+    return { attempted: false, consumed: true, reason: "DUPLICATE_REAL_BET_BLOCKED_ATOMIC", event_id: eventId, market_url: marketUrl };
+  }
+
+  const input = { referenceId, eventId, price: String(price), currency: BET_CURRENCY, marketUrl, stake: AUTO_E2E_TEST_STAKE };
+  const query = `
+    mutation PlaceBet($input: PlaceBetInput!) {
+      placeBet(input: $input) {
+        referenceId eventId marketUrl currency price stake betStatus side betErrorCode
+      }
+    }
+  `;
+
+  let httpStatus = 0;
+  let responseBody: any = null;
+
+  try {
+    const response = await fetch(GRAPHQL_ENDPOINT, {
+      method: "POST",
+      headers: { "Accept": "application/json", "Content-Type": "application/json", "X-API-KEY": apiKey },
+      body: JSON.stringify({ query, variables: { input } }),
+      redirect: "manual"
+    });
+
+    httpStatus = response.status;
+    const raw = await response.text();
+    try { responseBody = raw ? JSON.parse(raw) : null; }
+    catch { responseBody = raw ? { raw: raw.slice(0, 3000) } : null; }
+
+    const placeBet = responseBody?.data?.placeBet ?? null;
+    const betStatus = safe(placeBet?.betStatus) || (response.ok ? "UNKNOWN" : "HTTP_ERROR");
+    const betErrorCode = safe(placeBet?.betErrorCode) || null;
+
+    await env.DB.prepare(`
+      UPDATE auto_e2e_test_guard
+      SET status = 'COMPLETED', http_status = ?, response_json = ?, updated_at = ?
+      WHERE test_key = ?
+    `).bind(httpStatus, JSON.stringify(responseBody ?? null).slice(0, 12000), nowISO(), AUTO_E2E_TEST_KEY).run();
+
+    await env.DB.prepare(`
+      UPDATE real_bet_guard SET status = ?, reference_id = ?, updated_at = ? WHERE guard_key = ?
+    `).bind(betStatus, safe(placeBet?.referenceId || referenceId), nowISO(), realBetGuardKey(eventId, marketUrl)).run();
+
+    const teams = cloudbetEventTeams(current?.event);
+    const archiveNotification = await archiveAndNotifyRealBet(env, {
+      reference_id: safe(placeBet?.referenceId || referenceId),
+      event_id: safe(placeBet?.eventId || eventId),
+      match: teams.match || signalMatch(signal),
+      home: teams.home || signalHome(signal),
+      away: teams.away || signalAway(signal),
+      market_url: safe(placeBet?.marketUrl || marketUrl),
+      currency: safe(placeBet?.currency || BET_CURRENCY),
+      stake: placeBet?.stake ?? AUTO_E2E_TEST_STAKE,
+      odds: placeBet?.price ?? price,
+      bet_status: betStatus,
+      bet_error_code: betErrorCode,
+      http_status: httpStatus,
+      transport: "GRAPHQL",
+      source: "AUTO_E2E_ONE_SHOT_0_10",
+      response: responseBody
+    });
+
+    return {
+      attempted: true, consumed: true, max_real_bets: 1, event_id: eventId,
+      match: teams.match || signalMatch(signal),
+      request: { endpoint: GRAPHQL_ENDPOINT, operation: "PlaceBet", reference_id: referenceId, event_id: eventId,
+                 market_url: marketUrl, price: String(price), stake: AUTO_E2E_TEST_STAKE, currency: BET_CURRENCY,
+                 balance_before_request: account.balance },
+      response: { ok: response.ok, status: httpStatus, body: responseBody },
+      archive_notification: archiveNotification
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await env.DB.prepare(`UPDATE auto_e2e_test_guard SET status = 'REQUEST_ERROR', response_json = ?, updated_at = ? WHERE test_key = ?`)
+      .bind(JSON.stringify({ error: message }), nowISO(), AUTO_E2E_TEST_KEY).run();
+    await env.DB.prepare(`UPDATE real_bet_guard SET status = 'REQUEST_ERROR', updated_at = ? WHERE guard_key = ?`)
+      .bind(nowISO(), realBetGuardKey(eventId, marketUrl)).run();
+    return { attempted: true, consumed: true, max_real_bets: 1, event_id: eventId, error: message };
+  }
+}
+
 async function runExplicitOneShot010(
   env: Env,
   eventIdInput: any,
@@ -4864,7 +5079,8 @@ async function oneShotRealBetTest(
   env: Env,
   eventId: string,
   handoff: any,
-  account: AccountSnapshot
+  account: AccountSnapshot,
+  current: any
 ): Promise<any> {
   if (!REAL_TEST_ENABLED) {
     return { attempted: false, reason: "REAL_TEST_DISABLED" };
@@ -6210,6 +6426,11 @@ async function runWorker(
   let trackerReady = 0;
   let refreshedReady = 0;
   let targetPending = 0;
+  let autoE2ETest: any = {
+    attempted: false,
+    consumed: false,
+    reason: AUTO_E2E_TEST_ENABLED ? "WAITING_FOR_READY_HUNTER" : "AUTO_E2E_TEST_DISABLED"
+  };
 
   for (const signal of hunterSignals) {
     try {
@@ -6313,6 +6534,15 @@ async function runWorker(
 
       refreshedReady++;
 
+      if (
+        AUTO_E2E_TEST_ENABLED &&
+        handoff?.ready_to_send === true &&
+        autoE2ETest?.consumed !== true &&
+        autoE2ETest?.attempted !== true
+      ) {
+        autoE2ETest = await runAutoE2EOneShot(env, signal, cloudbetId);
+      }
+
       ready.push({
         execution_id: bet.execution_id,
         action: "READY_TO_BET",
@@ -6396,7 +6626,10 @@ async function runWorker(
       account_preflight: true,
       account_endpoint: "/account-test",
       handoff_only: true,
-      real_bet_post: false,
+      real_bet_post: "AUTO_E2E_ONE_SHOT_ONLY",
+      auto_e2e_test_enabled: AUTO_E2E_TEST_ENABLED,
+      auto_e2e_max_real_bets: 1,
+      auto_e2e_stake: AUTO_E2E_TEST_STAKE,
       hard_safety_gates: true,
       require_known_score_0_0: true,
       require_explicit_first_half: true,
@@ -6429,6 +6662,7 @@ async function runWorker(
     pending,
     skipped,
     errors,
+    auto_e2e_test: autoE2ETest,
 
     processing_ms: Date.now() - started
   };
@@ -6502,7 +6736,10 @@ async function runDiagnostic(
       current_odds_source:
         "MATCHER /live EXACT SAME EVENT_ID",
       final_handoff: true,
-      real_bet_post: false
+      real_bet_post: "AUTO_E2E_ONE_SHOT_ONLY",
+      auto_e2e_test_enabled: AUTO_E2E_TEST_ENABLED,
+      auto_e2e_max_real_bets: 1,
+      auto_e2e_stake: AUTO_E2E_TEST_STAKE
     },
 
     target: {
@@ -6617,6 +6854,7 @@ function healthResponse():
       "/preflight",
       "/real-test-010",
       "/real-bets",
+      "/auto-test-status",
       "/telegram-test",
       "/trading-diagnostic",
       "/graphql-diagnostic",
@@ -6673,7 +6911,7 @@ export default {
             "ACCOUNT SNAPSHOT /account-test",
             "BALANCE + MIN/MAX STAKE PREFLIGHT",
             "BUILD TRADING API HANDOFF",
-            "STOP — NO REAL POST"
+            "AUTO TEST — AT MOST ONE REAL 0.10 USDT POST AFTER ALL GATES"
           ],
 
           target: {
@@ -6700,6 +6938,9 @@ export default {
             alternative_event_fallback: false,
             same_event_only: true,
             real_betting: false,
+            auto_e2e_one_shot_enabled: AUTO_E2E_TEST_ENABLED,
+            auto_e2e_max_real_bets: 1,
+            auto_e2e_stake: AUTO_E2E_TEST_STAKE,
             one_shot_real_test: REAL_TEST_ENABLED,
             one_shot_test_stake: REAL_TEST_STAKE,
             real_bet_archive: true,
@@ -6717,6 +6958,7 @@ export default {
             "/real-test-status",
             "/real-test-010",
             "/real-bets",
+            "/auto-test-status",
             "/telegram-test",
             "/trading-diagnostic",
             "/graphql-diagnostic",
@@ -6793,6 +7035,13 @@ export default {
         return json(
           await realTestStatus(env)
         );
+      }
+
+      if (path === "/auto-test-status") {
+        if (request.method !== "GET") {
+          return json({ success: false, worker: "cloudbet-bet-worker", version: VERSION, error: "METHOD_NOT_ALLOWED", expected_method: "GET" }, 405);
+        }
+        return json(await autoE2ETestStatus(env));
       }
 
       if (path === "/real-bets") {
