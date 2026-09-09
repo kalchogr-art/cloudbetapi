@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.5 GRAPHQL ZERO-STAKE VALIDATION";
+  "V7.6.6 REAL-PAYLOAD DRY RUN";
 
 const MODE =
   "DRY_RUN";
@@ -4300,6 +4300,172 @@ async function runGraphqlSafeValidation(
   }
 }
 
+
+// ============================================================
+// V7.6.6 — REAL-PAYLOAD DRY RUN
+// Builds the exact real-value GraphQL placeBet payload with BET_STAKE=0.10,
+// but NEVER transmits it to Cloudbet. No placeBet fetch() occurs here.
+// ============================================================
+
+async function runGraphqlRealPayloadDryRun(
+  env: Env,
+  eventIdInput: any
+): Promise<any> {
+  const started = Date.now();
+  const eventId = normalizeEventId(eventIdInput);
+
+  if (!eventId) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "GRAPHQL_REAL_PAYLOAD_DRY_RUN",
+      wager_sent: false,
+      placebet_request_sent: false,
+      error: "EVENT_ID_REQUIRED",
+      example: "/graphql-real-dry-run?event_id=36196339",
+      processing_ms: Date.now() - started
+    };
+  }
+
+  const current = await verifySameEventAndOdds(env, eventId);
+
+  if (!current?.success) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "GRAPHQL_REAL_PAYLOAD_DRY_RUN",
+      event_id: eventId,
+      wager_sent: false,
+      placebet_request_sent: false,
+      error: current?.error || "TARGET_ODDS_NOT_AVAILABLE",
+      current,
+      processing_ms: Date.now() - started
+    };
+  }
+
+  const marketUrl = safe(current?.market_url);
+  const price = numberOrNull(current?.current_odds);
+  const minStake = numberOrNull(current?.min_stake);
+  const maxStake = numberOrNull(current?.max_stake);
+  const stake = numberOrNull(BET_STAKE);
+
+  if (!marketUrl || price === null || price <= 1) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "GRAPHQL_REAL_PAYLOAD_DRY_RUN",
+      event_id: eventId,
+      wager_sent: false,
+      placebet_request_sent: false,
+      error: "CURRENT_SELECTION_NOT_READY",
+      current,
+      processing_ms: Date.now() - started
+    };
+  }
+
+  if (stake === null || stake <= 0) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "GRAPHQL_REAL_PAYLOAD_DRY_RUN",
+      event_id: eventId,
+      wager_sent: false,
+      placebet_request_sent: false,
+      error: "BET_STAKE_INVALID",
+      configured_stake: BET_STAKE,
+      processing_ms: Date.now() - started
+    };
+  }
+
+  const stakeAboveOrEqualMin = minStake !== null ? stake >= minStake : null;
+  const stakeBelowOrEqualMax = maxStake !== null ? stake <= maxStake : null;
+  const selectionEnabled = safe(current?.selection_status) === "SELECTION_ENABLED";
+  const payloadReady =
+    selectionEnabled &&
+    stakeAboveOrEqualMin === true &&
+    stakeBelowOrEqualMax !== false;
+
+  const referenceId = crypto.randomUUID();
+
+  const query = `
+    mutation V766RealPayloadDryRun($input: PlaceBetInput!) {
+      placeBet(input: $input) {
+        referenceId
+        eventId
+        marketUrl
+        currency
+        price
+        stake
+        betStatus
+        side
+        betErrorCode
+      }
+    }
+  `;
+
+  const input = {
+    referenceId,
+    eventId,
+    price: String(price),
+    currency: BET_CURRENCY,
+    marketUrl,
+    stake: BET_STAKE
+  };
+
+  return {
+    success: true,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    action: "GRAPHQL_REAL_PAYLOAD_DRY_RUN",
+    safe_read_only: true,
+    wager_sent: false,
+    placebet_request_sent: false,
+    betting_enabled: BETTING_ENABLED,
+    real_test_enabled: REAL_TEST_ENABLED,
+    transport: "GRAPHQL",
+    endpoint: GRAPHQL_ENDPOINT,
+    event_id: eventId,
+    current_odds: price,
+    market_url: marketUrl,
+    currency: BET_CURRENCY,
+    configured_stake: BET_STAKE,
+    min_stake: minStake,
+    max_stake: maxStake,
+    selection_status: current?.selection_status ?? null,
+    validation: {
+      selection_enabled: selectionEnabled,
+      stake_numeric: true,
+      stake_positive: stake > 0,
+      stake_at_or_above_min: stakeAboveOrEqualMin,
+      stake_at_or_below_max: stakeBelowOrEqualMax,
+      payload_ready_for_real_submission: payloadReady
+    },
+    safety: {
+      fetch_to_placebet_executed: false,
+      valid_wager_transmitted: false,
+      this_endpoint_can_place_bet: false
+    },
+    request_preview: {
+      method: "POST",
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-API-KEY": "<CLOUDBET_API_KEY>"
+      },
+      body: {
+        query,
+        variables: { input }
+      }
+    },
+    current,
+    processing_ms: Date.now() - started
+  };
+}
+
 // ============================================================
 // V7.3.1 — DIRECT SINGLE EVENT PREFLIGHT
 // ============================================================
@@ -6383,6 +6549,16 @@ export default {
         const eventId = url.searchParams.get("event_id");
         return json(
           await runGraphqlSafeValidation(
+            env,
+            eventId
+          )
+        );
+      }
+
+      if (path === "/graphql-real-dry-run") {
+        const eventId = url.searchParams.get("event_id");
+        return json(
+          await runGraphqlRealPayloadDryRun(
             env,
             eventId
           )
