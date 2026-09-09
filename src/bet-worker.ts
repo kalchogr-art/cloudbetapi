@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.3 GRAPHQL TRADING PATH";
+  "V7.6.3.1 GRAPHQL PAYLOAD PREVIEW FIX";
 
 const MODE =
   "DRY_RUN";
@@ -131,6 +131,9 @@ const TARGET_PARAMS =
 
 const TARGET_SELECTION =
   "OVER 0.5";
+
+const TARGET_MARKET_URL =
+  `${TARGET_MARKET}/${TARGET_OUTCOME}?${TARGET_PARAMS}`;
 
 const CLOUDBET_EVENT_PATH =
   "/event?id=";
