@@ -73,7 +73,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.5.1 GRAPHQL PLACEBET ONE-SHOT";
+  "V7.5.2 AUTH MATRIX DIAGNOSTIC";
 
 const MODE =
   "DRY_RUN";
@@ -100,7 +100,7 @@ const TRADING_STRAIGHT_ENDPOINT =
 // ONE-SHOT REAL API TEST. This does not enable normal betting.
 // It can send exactly one 100 USDT request, only when the freshly
 // read balance is below 100 USDT, with partial stake disabled.
-const REAL_TEST_ENABLED = true;
+const REAL_TEST_ENABLED = false;
 const REAL_TEST_STAKE = 100;
 const REAL_TEST_KEY = "V7.5.1_GRAPHQL_ONE_SHOT_100_USDT";
 
@@ -4594,6 +4594,171 @@ async function graphqlDiagnostic(env: Env): Promise<any> {
   }
 }
 
+async function authMatrixDiagnostic(env: Env): Promise<any> {
+  const started = Date.now();
+  const key = safe(env.CLOUDBET_API_KEY);
+
+  if (!key) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "AUTH_MATRIX_DIAGNOSTIC",
+      safe_read_only: true,
+      wager_sent: false,
+      api_key_present: false,
+      error: "CLOUDBET_API_KEY_MISSING"
+    };
+  }
+
+  async function probe(
+    name: string,
+    url: string,
+    init: RequestInit
+  ): Promise<any> {
+    try {
+      const response = await fetch(url, {
+        ...init,
+        redirect: "manual"
+      });
+      const raw = await response.text();
+      let body: any = null;
+      let bodyType = "EMPTY";
+
+      if (raw) {
+        try {
+          body = JSON.parse(raw);
+          bodyType = "JSON";
+        } catch {
+          bodyType = /<html|<!doctype html/i.test(raw) ? "HTML" : "TEXT";
+          body = { raw: raw.slice(0, 2000) };
+        }
+      }
+
+      return {
+        name,
+        ok: response.ok,
+        http_status: response.status,
+        body_type: bodyType,
+        headers: diagnosticHeaders(response.headers),
+        body
+      };
+    } catch (error: any) {
+      return {
+        name,
+        ok: false,
+        error: String(error?.message ?? error ?? "REQUEST_FAILED")
+      };
+    }
+  }
+
+  const commonHeaders = {
+    "Accept": "application/json",
+    "Content-Type": "application/json",
+    "X-API-Key": key
+  };
+
+  const graphqlQuery = `
+    query AuthMatrix($limit: Int) {
+      accountBalances {
+        currency
+        amount
+      }
+      bets(limit: $limit) {
+        referenceId
+        eventId
+        currency
+        price
+        stake
+        betStatus
+        betErrorCode
+      }
+    }
+  `;
+
+  const [restCurrencies, restBalance, restBets, graphql] =
+    await Promise.all([
+      probe(
+        "REST_ACCOUNT_CURRENCIES",
+        "https://sports-api.cloudbet.com/pub/v1/account/currencies",
+        { method: "GET", headers: commonHeaders }
+      ),
+      probe(
+        "REST_ACCOUNT_USDT_BALANCE",
+        "https://sports-api.cloudbet.com/pub/v1/account/currencies/USDT/balance",
+        { method: "GET", headers: commonHeaders }
+      ),
+      probe(
+        "REST_TRADING_BETS",
+        "https://sports-api.cloudbet.com/pub/v4/bets?limit=1&offset=0",
+        { method: "GET", headers: commonHeaders }
+      ),
+      probe(
+        "GRAPHQL_ACCOUNT_AND_BETS",
+        GRAPHQL_ENDPOINT,
+        {
+          method: "POST",
+          headers: commonHeaders,
+          body: JSON.stringify({
+            query: graphqlQuery,
+            variables: { limit: 1 }
+          })
+        }
+      )
+    ]);
+
+  const gqlErrors =
+    Array.isArray(graphql?.body?.errors)
+      ? graphql.body.errors
+      : [];
+
+  let interpretation = "AUTH_MATRIX_MIXED_RESULT";
+
+  if (
+    restCurrencies?.http_status === 200 &&
+    restBalance?.http_status === 200 &&
+    restBets?.http_status === 200 &&
+    graphql?.http_status === 200 &&
+    gqlErrors.length === 0
+  ) {
+    interpretation = "REST_AND_GRAPHQL_AUTH_OK";
+  } else if (
+    restCurrencies?.http_status === 200 &&
+    restBalance?.http_status === 200 &&
+    restBets?.http_status === 200 &&
+    graphql?.http_status === 200 &&
+    gqlErrors.length > 0
+  ) {
+    interpretation =
+      "REST_ACCOUNT_AND_TRADING_AUTH_OK_GRAPHQL_RESOLVER_AUTH_FAILED";
+  } else if (
+    restBets?.http_status === 200 &&
+    (restCurrencies?.http_status !== 200 || restBalance?.http_status !== 200)
+  ) {
+    interpretation =
+      "REST_TRADING_HISTORY_OK_ACCOUNT_API_AUTH_OR_ACCOUNT_SCOPE_FAILED";
+  }
+
+  return {
+    success: true,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    action: "AUTH_MATRIX_DIAGNOSTIC",
+    safe_read_only: true,
+    wager_sent: false,
+    real_test_enabled: REAL_TEST_ENABLED,
+    api_key_present: true,
+    probes: {
+      rest_account_currencies: restCurrencies,
+      rest_account_usdt_balance: restBalance,
+      rest_trading_bets: restBets,
+      graphql_account_and_bets: graphql
+    },
+    interpretation,
+    processing_ms: Date.now() - started
+  };
+}
+
 function v4StraightPayloadPreview(): any {
   return {
     success: true,
@@ -5722,6 +5887,7 @@ function healthResponse():
       "/preflight",
       "/trading-diagnostic",
       "/graphql-diagnostic",
+      "/auth-matrix",
       "/trading-payload-preview",
       "/diagnostic",
       "/entries"
@@ -5845,6 +6011,7 @@ export default {
             "/real-test-status",
             "/trading-diagnostic",
             "/graphql-diagnostic",
+            "/auth-matrix",
             "/trading-payload-preview",
             "/diagnostic",
             "/entries"
@@ -5988,6 +6155,27 @@ export default {
 
         return json(
           await graphqlDiagnostic(env)
+        );
+      }
+
+      if (
+        path ===
+        "/auth-matrix"
+      ) {
+        if (request.method !== "GET") {
+          return json(
+            {
+              success: false,
+              worker: "cloudbet-bet-worker",
+              version: VERSION,
+              error: "METHOD_NOT_ALLOWED"
+            },
+            405
+          );
+        }
+
+        return json(
+          await authMatrixDiagnostic(env)
         );
       }
 
