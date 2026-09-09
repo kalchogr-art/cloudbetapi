@@ -75,7 +75,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.11 AUTO E2E ONE-SHOT TEST 0.10 USDT";
+  "V7.6.12 PENDING ODDS AUTO BET FIX 0.10 USDT";
 
 const MODE =
   "DRY_RUN";
@@ -85,6 +85,12 @@ const DRY_RUN =
 
 const BETTING_ENABLED =
   false;
+
+const BET_MINUTE_FROM =
+  10;
+
+const BET_MINUTE_TO =
+  42;
 
 // Handoff only. Does NOT transmit wager.
 const HANDOFF_ENABLED =
@@ -115,7 +121,7 @@ const REAL_TEST_CONFIRM = "PLACE_0_10_USDT_ONCE";
 // may be sent from the normal Hunter -> /run flow after ALL safety gates pass.
 const AUTO_E2E_TEST_ENABLED = true;
 const AUTO_E2E_TEST_STAKE = "0.10";
-const AUTO_E2E_TEST_KEY = "V7.6.11_AUTO_E2E_ONE_SHOT_0_10_USDT";
+const AUTO_E2E_TEST_KEY = "V7.6.12_AUTO_E2E_ONE_SHOT_0_10_USDT";
 
 // Legacy display/archive value preserved from V7.0.2.
 const BET_STAKE_EUR =
@@ -1213,12 +1219,12 @@ function eventStillValidForTarget(
     return { valid: false, reason: "FIRST_HALF_NOT_CONFIRMED", score, period, minute };
   }
 
-  // HARD GATE #3 — minute must be known and inside Hunter window 10–42.
+  // HARD GATE #3 — minute must be known and inside configured betting window.
   if (minute === null) {
     return { valid: false, reason: "MINUTE_UNKNOWN", score, period, minute };
   }
 
-  if (minute < 10 || minute > 42) {
+  if (minute < BET_MINUTE_FROM || minute > BET_MINUTE_TO) {
     return { valid: false, reason: "OUTSIDE_HUNTER_MINUTE_WINDOW", score, period, minute };
   }
 
@@ -3679,6 +3685,13 @@ async function processPending(
         0,
       missing:
         0,
+      auto_e2e_test: {
+        attempted: false,
+        consumed: false,
+        reason: AUTO_E2E_TEST_ENABLED
+          ? "NO_PENDING_ODDS"
+          : "AUTO_E2E_TEST_DISABLED"
+      },
       results:
         []
     };
@@ -3698,6 +3711,18 @@ async function processPending(
 
   const results:
     any[] = [];
+
+  // V7.6.12 — if a signal originally entered PENDING_ODDS and odds later
+  // become available, the same one-shot E2E test is allowed to execute here.
+  // This closes the READY-via-pending gap. The global D1 one-shot guard still
+  // guarantees at most one real 0.10 USDT attempt.
+  let autoE2ETest: any = {
+    attempted: false,
+    consumed: false,
+    reason: AUTO_E2E_TEST_ENABLED
+      ? "WAITING_FOR_PENDING_ODDS_READY"
+      : "AUTO_E2E_TEST_DISABLED"
+  };
 
   for (
     const row
@@ -3892,6 +3917,21 @@ async function processPending(
         account
       );
 
+    // V7.6.12 FIX — READY after PENDING_ODDS must follow the same real-test
+    // execution path as an immediately READY Hunter signal.
+    if (
+      AUTO_E2E_TEST_ENABLED &&
+      handoff?.ready_to_send === true &&
+      autoE2ETest?.consumed !== true &&
+      autoE2ETest?.attempted !== true
+    ) {
+      autoE2ETest = await runAutoE2EOneShot(
+        env,
+        signal,
+        cloudbetId
+      );
+    }
+
     await env.DB
       .prepare(`
         DELETE FROM pending_odds
@@ -3928,6 +3968,7 @@ async function processPending(
     rescheduled,
     expired,
     missing,
+    auto_e2e_test: autoE2ETest,
     results
   };
 }
@@ -4786,7 +4827,7 @@ async function realBetAlreadyClaimed(
 // ============================================================
 // V7.6.11 — AUTOMATIC END-TO-END ONE-SHOT TEST
 // Triggered only from the normal /run Hunter flow.
-// It re-checks SAME event + 0:0 + 1H + minute 10-42 + exact 1H O0.5,
+// It re-checks SAME event + 0:0 + 1H + configured minute window + exact 1H O0.5,
 // refreshes account/odds immediately before POST, then atomically consumes
 // one global D1 test key. Normal betting remains disabled.
 // ============================================================
@@ -6426,11 +6467,17 @@ async function runWorker(
   let trackerReady = 0;
   let refreshedReady = 0;
   let targetPending = 0;
-  let autoE2ETest: any = {
-    attempted: false,
-    consumed: false,
-    reason: AUTO_E2E_TEST_ENABLED ? "WAITING_FOR_READY_HUNTER" : "AUTO_E2E_TEST_DISABLED"
-  };
+  // V7.6.12 — carry the pending-odds one-shot result into the same /run cycle.
+  // If a pending signal already consumed/attempted the one-shot, an immediately
+  // READY signal cannot send another wager in this run.
+  let autoE2ETest: any =
+    pendingResult?.auto_e2e_test ?? {
+      attempted: false,
+      consumed: false,
+      reason: AUTO_E2E_TEST_ENABLED
+        ? "WAITING_FOR_READY_HUNTER"
+        : "AUTO_E2E_TEST_DISABLED"
+    };
 
   for (const signal of hunterSignals) {
     try {
@@ -6633,7 +6680,9 @@ async function runWorker(
       hard_safety_gates: true,
       require_known_score_0_0: true,
       require_explicit_first_half: true,
-      hunter_minute_window: "10-42",
+      hunter_minute_window: `${BET_MINUTE_FROM}-${BET_MINUTE_TO}`,
+      bet_minute_from: BET_MINUTE_FROM,
+      bet_minute_to: BET_MINUTE_TO,
       exact_market_url_lock: TARGET_MARKET_URL,
       fixed_stake: BET_STAKE,
       duplicate_real_bet_guard: true
