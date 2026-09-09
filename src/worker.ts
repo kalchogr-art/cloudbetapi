@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7.6.3
+// CLOUDBET MATCH MATCHER V7.6.4
 // CANDIDATE RANKING + D1 DIAGNOSTICS + SEPARATE ODDS LOOKUP
 // LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
 // V27 SERVICE BINDING + DIRECT CLOUDBET PUBLIC SPORTS API
@@ -26,6 +26,16 @@
 //
 // - /diagnostic
 //   -> light V27 + Cloudbet diagnostic
+//
+// V7.6.4 FIXES:
+// - STRONG EVENT RECOVERY when the normal +/-5 minute window has zero candidates
+// - recovery NEVER widens the normal minute filter globally
+// - recovery scans only already eligible Cloudbet LIVE + 1H + 0:0 events
+// - requires very strong two-sided team identity + compatible categories
+// - requires competition context and a unique, clearly separated best candidate
+// - maximum recovery minute difference is capped
+// - ambiguous recovery candidates remain UNMATCHED
+// - diagnostics preserve recovery candidate, score and minute difference
 //
 // V7.6.3 FIXES:
 // - reserve-team marker normalization: 2 / II / Reserve / Reserves are category markers, not club identity
@@ -55,7 +65,7 @@ interface Env {
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.6.3-RESERVE-TEAM-NORMALIZATION";
+  "V7.6.4-STRONG-EVENT-RECOVERY";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -86,6 +96,23 @@ const COUNTRY_BONUS =
 
 const MATCH_MINUTE_TOLERANCE =
   5;
+
+// V7.6.4 recovery is deliberately separate from the normal minute window.
+// It is used ONLY when the normal window contains zero candidates.
+const STRONG_RECOVERY_MAX_MINUTE_DIFFERENCE =
+  15;
+
+const STRONG_RECOVERY_MIN_SIDE_SCORE =
+  0.90;
+
+const STRONG_RECOVERY_MIN_TOTAL_SCORE =
+  0.92;
+
+const STRONG_RECOVERY_MIN_COMPETITION_SCORE =
+  0.35;
+
+const STRONG_RECOVERY_MIN_SCORE_GAP =
+  0.15;
 
 // V7.5 candidate ranking protection.
 // A confident name match is accepted only when the best candidate
@@ -3471,6 +3498,136 @@ function findHunterTargetMatch(
     ranked.length === 0
   ) {
 
+    if (
+      minuteCandidates === 0
+    ) {
+      const recovery =
+        strongRecoveryForSignal(
+          signal,
+          target,
+          cloudbet
+        );
+
+      if (
+        recovery?.accepted &&
+        recovery.best
+      ) {
+        const recovered =
+          recovery.best;
+
+        return {
+          found:
+            true,
+          best:
+            recovered.cb,
+          second:
+            recovery.second?.cb ??
+            null,
+          detail:
+            recovered.detail,
+          secondDetail:
+            recovery.second?.detail ??
+            null,
+          classification:
+            "CONFIDENT_MATCH",
+          reason:
+            "STRONG_EVENT_RECOVERY_CONFIDENT_MATCH",
+          matchMode:
+            "STRONG_EVENT_RECOVERY",
+          contextFallback: {
+            accepted:
+              false
+          },
+          strongRecovery: {
+            accepted:
+              true,
+            candidates:
+              recovery.candidates,
+            max_minute_difference:
+              STRONG_RECOVERY_MAX_MINUTE_DIFFERENCE,
+            minute_difference:
+              recovered.minuteDifference,
+            competition_score:
+              Number(
+                recovered.detail.competitionScore.toFixed(3)
+              ),
+            home_score:
+              Number(
+                recovered.detail.homeScore.toFixed(3)
+              ),
+            away_score:
+              Number(
+                recovered.detail.awayScore.toFixed(3)
+              ),
+            total_score:
+              Number(
+                recovered.detail.total.toFixed(3)
+              ),
+            score_gap:
+              recovery.scoreGap
+          },
+          candidateEvaluations:
+            candidateEvaluations +
+            recovery.candidates,
+          candidates:
+            candidates.length,
+          minuteCandidates:
+            0,
+          targetMinute,
+          bestMinute:
+            recovered.minute,
+          bestMinuteDifference:
+            recovered.minuteDifference,
+          scoreGap:
+            recovery.scoreGap,
+          topCandidates: [
+            candidateDiagnosticRecord(
+              recovered.cb,
+              recovered.detail,
+              signal
+            )
+          ]
+        };
+      }
+
+      if (
+        recovery &&
+        recovery.accepted === false &&
+        recovery.reason === "STRONG_RECOVERY_AMBIGUOUS"
+      ) {
+        const result =
+          emptyResult(
+            "STRONG_RECOVERY_AMBIGUOUS",
+            targetMinute,
+            candidates.length,
+            0,
+            candidateEvaluations
+          );
+
+        return {
+          ...result,
+          matchMode:
+            "STRONG_EVENT_RECOVERY_REJECTED",
+          strongRecovery: {
+            accepted:
+              false,
+            reason:
+              recovery.reason,
+            candidates:
+              recovery.candidates,
+            score_gap:
+              recovery.scoreGap,
+            best_minute_difference:
+              recovery.best?.minuteDifference ??
+              null,
+            second_minute_difference:
+              recovery.second?.minuteDifference ??
+              null
+          }
+        };
+      }
+    }
+
     return emptyResult(
       minuteCandidates === 0
         ? "NO_CLOUDBET_CANDIDATE_WITHIN_MINUTE_WINDOW"
@@ -3616,6 +3773,210 @@ function findHunterTargetMatch(
     bestMinuteDifference: finalBest.minuteDifference,
     scoreGap: finalScoreGap,
     topCandidates
+  };
+}
+
+
+
+// ============================================================
+// V7.6.4 STRONG EVENT RECOVERY
+// ============================================================
+
+function strongRecoveryForSignal(
+  signal: AnyObj,
+  target: PreparedMatch,
+  cloudbet: PreparedMatch[]
+): AnyObj | null {
+
+  const targetMinute =
+    hunterReferenceMinute(
+      signal
+    );
+
+  if (
+    targetMinute === null
+  ) {
+    return null;
+  }
+
+  const ranked:
+    {
+      cb: PreparedMatch;
+      detail: AnyObj;
+      score: number;
+      minute: number | null;
+      minuteDifference: number;
+    }[] = [];
+
+  for (
+    const cb
+    of cloudbet
+  ) {
+
+    if (
+      !cb ||
+      !cb.raw
+    ) {
+      continue;
+    }
+
+    const diff =
+      minuteDifference(
+        signal,
+        cb.raw
+      );
+
+    // Normal +/-5 minute candidates are handled by the strict matcher.
+    // Recovery is ONLY for candidates outside that window, with a hard cap.
+    if (
+      diff === null ||
+      diff <= MATCH_MINUTE_TOLERANCE ||
+      diff > STRONG_RECOVERY_MAX_MINUTE_DIFFERENCE
+    ) {
+      continue;
+    }
+
+    if (
+      !categoryCompatible(
+        target.home,
+        cb.home
+      ) ||
+      !categoryCompatible(
+        target.away,
+        cb.away
+      )
+    ) {
+      continue;
+    }
+
+    const detail =
+      detailedMatchScore(
+        target.raw,
+        cb.raw
+      );
+
+    const normalStrong =
+      detail.direction === "NORMAL" &&
+      detail.homeScore >= STRONG_RECOVERY_MIN_SIDE_SCORE &&
+      detail.awayScore >= STRONG_RECOVERY_MIN_SIDE_SCORE;
+
+    const reversedStrong =
+      detail.direction === "REVERSED" &&
+      detail.reverseHomeScore >= STRONG_RECOVERY_MIN_SIDE_SCORE &&
+      detail.reverseAwayScore >= STRONG_RECOVERY_MIN_SIDE_SCORE;
+
+    if (
+      !normalStrong &&
+      !reversedStrong
+    ) {
+      continue;
+    }
+
+    if (
+      detail.total < STRONG_RECOVERY_MIN_TOTAL_SCORE
+    ) {
+      continue;
+    }
+
+    // Competition must agree when both providers expose it.
+    // This blocks same-name fixtures from unrelated competitions.
+    const targetCompetition =
+      competitionText(
+        target.raw
+      );
+
+    const cbCompetition =
+      competitionText(
+        cb.raw
+      );
+
+    if (
+      targetCompetition &&
+      cbCompetition &&
+      detail.competitionScore < STRONG_RECOVERY_MIN_COMPETITION_SCORE
+    ) {
+      continue;
+    }
+
+    ranked.push({
+      cb,
+      detail,
+      score:
+        detail.total,
+      minute:
+        cloudbetMinute(
+          cb.raw
+        ),
+      minuteDifference:
+        diff
+    });
+  }
+
+  ranked.sort(
+    (a, b) => {
+      if (
+        b.score !== a.score
+      ) {
+        return b.score - a.score;
+      }
+
+      return (
+        a.minuteDifference -
+        b.minuteDifference
+      );
+    }
+  );
+
+  if (
+    ranked.length === 0
+  ) {
+    return null;
+  }
+
+  const best =
+    ranked[0];
+
+  const second =
+    ranked.length > 1
+      ? ranked[1]
+      : null;
+
+  const scoreGap =
+    second
+      ? Math.max(
+          0,
+          best.score -
+          second.score
+        )
+      : 1;
+
+  if (
+    second &&
+    scoreGap < STRONG_RECOVERY_MIN_SCORE_GAP
+  ) {
+    return {
+      accepted:
+        false,
+      reason:
+        "STRONG_RECOVERY_AMBIGUOUS",
+      best,
+      second,
+      scoreGap,
+      candidates:
+        ranked.length
+    };
+  }
+
+  return {
+    accepted:
+      true,
+    reason:
+      "STRONG_EVENT_RECOVERY_CONFIDENT_MATCH",
+    best,
+    second,
+    scoreGap,
+    candidates:
+      ranked.length
   };
 }
 
