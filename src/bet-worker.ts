@@ -75,7 +75,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.9 BET ARCHIVE + TELEGRAM 0.10 USDT";
+  "V7.6.10 TELEGRAM TEST + BET ARCHIVE 0.10 USDT";
 
 const MODE =
   "DRY_RUN";
@@ -4628,6 +4628,34 @@ function realBetTelegramText(ctx: any): string {
   return lines.join("\n");
 }
 
+
+async function runTelegramTest(env: Env): Promise<any> {
+  const message = [
+    "🧪 TELEGRAM TEST",
+    "",
+    "✅ cloudbet-bet-worker can send Telegram notifications.",
+    `🧩 Version: ${VERSION}`,
+    `💰 Real bet stake: ${BET_STAKE} ${BET_CURRENCY}`,
+    "🔒 No Cloudbet request was sent.",
+    `🕐 ${nowISO()}`
+  ].join("\n");
+
+  const telegram = await sendTelegramMessage(env, message);
+
+  return {
+    success: telegram.sent === true,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    action: "TELEGRAM_TEST",
+    safe_read_only: true,
+    cloudbet_request_sent: false,
+    wager_sent: false,
+    telegram_bot_token_present: !!safe(env.TELEGRAM_BOT_TOKEN),
+    telegram_chat_id_present: !!safe(env.TELEGRAM_CHAT_ID),
+    telegram
+  };
+}
+
 async function archiveAndNotifyRealBet(env: Env, ctx: any): Promise<any> {
   await ensureRealBetArchiveTable(env);
 
@@ -6589,6 +6617,7 @@ function healthResponse():
       "/preflight",
       "/real-test-010",
       "/real-bets",
+      "/telegram-test",
       "/trading-diagnostic",
       "/graphql-diagnostic",
       "/auth-matrix",
@@ -6687,6 +6716,8 @@ export default {
             "/preflight",
             "/real-test-status",
             "/real-test-010",
+            "/real-bets",
+            "/telegram-test",
             "/trading-diagnostic",
             "/graphql-diagnostic",
             "/auth-matrix",
@@ -6769,6 +6800,22 @@ export default {
           return json({ success: false, worker: "cloudbet-bet-worker", version: VERSION, error: "METHOD_NOT_ALLOWED", expected_method: "GET" }, 405);
         }
         return json(await listRealBets(env, url.searchParams.get("limit")));
+      }
+
+      if (path === "/telegram-test") {
+        if (request.method !== "GET") {
+          return json({
+            success: false,
+            worker: "cloudbet-bet-worker",
+            version: VERSION,
+            action: "TELEGRAM_TEST",
+            error: "METHOD_NOT_ALLOWED",
+            expected_method: "GET",
+            cloudbet_request_sent: false,
+            wager_sent: false
+          }, 405);
+        }
+        return json(await runTelegramTest(env));
       }
 
       if (path === "/trading-diagnostic") {
