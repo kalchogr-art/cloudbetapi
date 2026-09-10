@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7.6.8
+// CLOUDBET MATCH MATCHER V7.6.9
 // CANDIDATE RANKING + D1 DIAGNOSTICS + SEPARATE ODDS LOOKUP
 // LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
 // V27 SERVICE BINDING + DIRECT CLOUDBET PUBLIC SPORTS API
@@ -26,6 +26,19 @@
 //
 // - /diagnostic
 //   -> light V27 + Cloudbet diagnostic
+//
+// V7.6.9 FIXES:
+// - category is now a profile instead of one mutually-exclusive label
+// - independently preserves YOUTH (U17/U18/U19/U20/U21/U23...), WOMEN and RESERVE
+// - Uxx tokens are removed from team identity before name similarity scoring
+// - provider word order no longer matters: "Spain U20 W", "Spain Women U20", "Spain U20 (W)"
+// - youth age mismatch is blocked (e.g. U20 != U21)
+// - youth vs senior is blocked
+// - women vs non-women is blocked
+// - reserve vs non-reserve is blocked
+// - team identity can therefore compare "Spain" vs "Spain" and "New Caledonia" vs "New Caledonia"
+// - all V7.6.8 RAW LIVE recovery and existing two-sided/minute/competition protections remain
+// - no global similarity threshold reduction and no betting logic
 //
 // V7.6.8 FIXES:
 // - adds a second RAW LIVE recovery pool for events hidden by missing Cloudbet period and/or score
@@ -107,7 +120,7 @@ interface Env {
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.6.8-RAW-LIVE-STATE-UNKNOWN-RECOVERY";
+  "V7.6.9-NATIONAL-YOUTH-GENDER-CATEGORY-NORMALIZATION";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -645,6 +658,9 @@ function normalizeTeam(
           ) &&
           !TEAM_CATEGORY_TOKENS.has(
             token
+          ) &&
+          !/^u\d{2}$/.test(
+            token
           )
       );
 
@@ -695,56 +711,95 @@ function sharedDistinctiveToken(
 
 
 // ============================================================
-// CATEGORY PROTECTION
+// CATEGORY PROTECTION — V7.6.9 PROFILE MODEL
 // ============================================================
 
-function teamCategory(
+interface TeamCategoryProfile {
+  youth: string | null;
+  women: boolean;
+  reserve: boolean;
+}
+
+
+function teamCategoryProfile(
   value: any
-): string {
+): TeamCategoryProfile {
 
   const s =
     normalizeText(
       value
     );
 
-  if (
-    /\bu\s*\d{2}\b/.test(
-      s
-    )
-  ) {
-    return (
-      s.match(
-        /\bu\s*(\d{2})\b/
-      )?.[1] ??
-      ""
-    )
-      ? "U" +
-        (
-          s.match(
-            /\bu\s*(\d{2})\b/
-          )?.[1] ??
-          ""
-        )
-      : "";
-  }
+  const youthMatch =
+    s.match(
+      /\bu\s*(\d{2})\b/
+    );
 
-  if (
-    /\bwomen\b|\bw\b/.test(
-      s
-    )
-  ) {
-    return "WOMEN";
-  }
+  const youth =
+    youthMatch?.[1]
+      ? "U" + youthMatch[1]
+      : null;
 
-  if (
+  const women =
+    /\bwomen\b|\bwoman\b|\bladies\b|\bfemale\b|\bfemenil\b|\bfemenino\b|\bfeminino\b|\bfeminina\b|\bw\b/.test(
+      s
+    );
+
+  const reserve =
     /\breserve\b|\breserves\b|\bii\b|\b2\b/.test(
       s
-    )
+    );
+
+  return {
+    youth,
+    women,
+    reserve
+  };
+}
+
+
+// Kept for diagnostics/backward compatibility.
+// Unlike the old function, this is only a readable summary.
+// Matching safety is controlled by categoryCompatible().
+function teamCategory(
+  value: any
+): string {
+
+  const p =
+    teamCategoryProfile(
+      value
+    );
+
+  const parts: string[] =
+    [];
+
+  if (
+    p.youth
   ) {
-    return "RESERVE";
+    parts.push(
+      p.youth
+    );
   }
 
-  return "SENIOR";
+  if (
+    p.women
+  ) {
+    parts.push(
+      "WOMEN"
+    );
+  }
+
+  if (
+    p.reserve
+  ) {
+    parts.push(
+      "RESERVE"
+    );
+  }
+
+  return parts.length
+    ? parts.join("+")
+    : "SENIOR";
 }
 
 
@@ -753,24 +808,42 @@ function categoryCompatible(
   b: any
 ): boolean {
 
-  const ca =
-    teamCategory(
+  const A =
+    teamCategoryProfile(
       a
     );
 
-  const cb =
-    teamCategory(
+  const B =
+    teamCategoryProfile(
       b
     );
 
+  // Youth age is a hard identity dimension.
+  // U20 must not match U21 and youth must not match senior.
   if (
-    ca === "SENIOR" ||
-    cb === "SENIOR"
+    A.youth !==
+    B.youth
   ) {
-    return true;
+    return false;
   }
 
-  return ca === cb;
+  // Women's teams must not match men's/unspecified senior variants.
+  if (
+    A.women !==
+    B.women
+  ) {
+    return false;
+  }
+
+  // Reserve/second teams must stay separate from first teams.
+  if (
+    A.reserve !==
+    B.reserve
+  ) {
+    return false;
+  }
+
+  return true;
 }
 
 
