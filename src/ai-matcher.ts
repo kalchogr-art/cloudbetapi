@@ -17,9 +17,11 @@ type AnyObj = Record<string, any>;
 
 interface Env {
   AI: any;
+  DB: any;
+  TRACKER: any;
 }
 
-const VERSION = "AI-MATCHER-V1.2-GET-DYNAMIC-MATCH";
+const VERSION = "AI-MATCHER-V1.3-D1-DASHBOARD-AUTO-SCAN";
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 const CLOUDBET_BASE = "https://www.cloudbet.com";
@@ -626,6 +628,425 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
   };
 }
 
+
+// ============================================================
+// TRACKER + D1 HISTORY
+// ============================================================
+
+const HISTORY_LIMIT = 30;
+const TRACKER_TIMEOUT_MS = 8000;
+const MAX_SIGNALS_PER_SCAN = 5;
+
+function html(body: string, status = 200): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=UTF-8",
+      "cache-control": "no-store, max-age=0"
+    }
+  });
+}
+
+function escapeHtml(value: any): string {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+async function ensureSchema(env: Env): Promise<void> {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS ai_match_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      signal_key TEXT NOT NULL UNIQUE,
+      signal_id TEXT,
+      match_id TEXT,
+      hunter_match TEXT NOT NULL,
+      hunter_home TEXT NOT NULL,
+      hunter_away TEXT NOT NULL,
+      competition TEXT,
+      hunter_minute INTEGER,
+      hunter_score REAL,
+      ai_matched INTEGER NOT NULL DEFAULT 0,
+      ai_accepted INTEGER NOT NULL DEFAULT 0,
+      cloudbet_event_id TEXT,
+      cloudbet_match TEXT,
+      confidence REAL NOT NULL DEFAULT 0,
+      reason TEXT,
+      cloudbet_period TEXT,
+      cloudbet_minute INTEGER,
+      raw_events INTEGER,
+      usable_candidates INTEGER,
+      ai_calls INTEGER,
+      processing_ms INTEGER,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `).run();
+
+  await env.DB.prepare(
+    `CREATE INDEX IF NOT EXISTS idx_ai_match_history_created_at
+     ON ai_match_history(created_at DESC)`
+  ).run();
+}
+
+function trackerEntries(data: any): AnyObj[] {
+  if (!data) return [];
+  if (Array.isArray(data.entries)) return data.entries;
+  if (Array.isArray(data.results)) return data.results;
+  if (Array.isArray(data.signals)) return data.signals;
+  if (Array.isArray(data.data?.entries)) return data.data.entries;
+  if (Array.isArray(data.data?.signals)) return data.data.signals;
+  return [];
+}
+
+function trackerSignalEligible(raw: AnyObj): boolean {
+  const signal = normalizeSignal(raw);
+  if (!signalValid(signal)) return false;
+
+  const status = str(raw?.status ?? raw?.state ?? "").toUpperCase();
+  if (status && !["ENTRY", "TRACKING", "ACTIVE", "SIGNAL", "HUNTER"].includes(status)) {
+    return false;
+  }
+
+  return true;
+}
+
+function signalKey(raw: AnyObj, signal: AnyObj): string {
+  const explicit = str(raw?.id ?? raw?.signal_id ?? "");
+  if (explicit) return `id:${explicit}`;
+
+  const matchId = str(raw?.match_id ?? signal?.id ?? "");
+  const entryMinute = parseMinute(raw?.entry_minute ?? signal?.minute ?? null);
+  const entryTime = str(raw?.entry_time ?? raw?.created_at ?? raw?.timestamp ?? "");
+
+  if (matchId) {
+    return `match:${matchId}:${entryMinute ?? "x"}:${entryTime || "x"}`;
+  }
+
+  return [
+    "fixture",
+    str(signal?.home).toLowerCase(),
+    str(signal?.away).toLowerCase(),
+    str(signal?.competition).toLowerCase(),
+    String(entryMinute ?? "x"),
+    entryTime || "x"
+  ].join("|");
+}
+
+async function fetchTrackerEntries(env: Env): Promise<AnyObj[]> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TRACKER_TIMEOUT_MS);
+
+  try {
+    const response = await env.TRACKER.fetch("https://tracker.internal/entries", {
+      method: "GET",
+      signal: controller.signal,
+      headers: { accept: "application/json" }
+    });
+
+    if (!response.ok) {
+      throw new Error(`TRACKER_HTTP_${response.status}`);
+    }
+
+    const data = await response.json();
+    return trackerEntries(data);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function historyHasKey(env: Env, key: string): Promise<boolean> {
+  const row = await env.DB.prepare(
+    "SELECT id FROM ai_match_history WHERE signal_key = ? LIMIT 1"
+  ).bind(key).first();
+
+  return Boolean(row);
+}
+
+async function storeHistory(
+  env: Env,
+  rawSignal: AnyObj,
+  signal: AnyObj,
+  result: AnyObj,
+  processingMs: number,
+  forcedKey?: string
+): Promise<void> {
+  const key = forcedKey || signalKey(rawSignal, signal);
+  const candidate = result?.candidate ?? null;
+  const diagnostics = result?.diagnostics ?? {};
+
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO ai_match_history (
+      signal_key,
+      signal_id,
+      match_id,
+      hunter_match,
+      hunter_home,
+      hunter_away,
+      competition,
+      hunter_minute,
+      hunter_score,
+      ai_matched,
+      ai_accepted,
+      cloudbet_event_id,
+      cloudbet_match,
+      confidence,
+      reason,
+      cloudbet_period,
+      cloudbet_minute,
+      raw_events,
+      usable_candidates,
+      ai_calls,
+      processing_ms
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    key,
+    str(rawSignal?.id ?? rawSignal?.signal_id ?? "") || null,
+    str(rawSignal?.match_id ?? signal?.id ?? "") || null,
+    signal?.match ?? `${signal?.home ?? ""} - ${signal?.away ?? ""}`,
+    signal?.home,
+    signal?.away,
+    signal?.competition ?? null,
+    signal?.minute ?? null,
+    signal?.hunter_score ?? null,
+    result?.matched ? 1 : 0,
+    result?.accepted ? 1 : 0,
+    result?.event_id ?? null,
+    result?.cloudbet_match ?? null,
+    boundedConfidence(result?.confidence),
+    str(result?.reason ?? result?.ai_reason ?? "") || null,
+    candidate?.period ?? null,
+    candidate?.minute ?? null,
+    diagnostics?.raw_events ?? null,
+    diagnostics?.usable_candidates ?? null,
+    diagnostics?.ai_calls ?? null,
+    processingMs
+  ).run();
+
+  await env.DB.prepare(`
+    DELETE FROM ai_match_history
+    WHERE id NOT IN (
+      SELECT id FROM ai_match_history
+      ORDER BY id DESC
+      LIMIT ?
+    )
+  `).bind(HISTORY_LIMIT).run();
+}
+
+async function getHistory(env: Env, limit = HISTORY_LIMIT): Promise<AnyObj[]> {
+  const safeLimit = Math.max(1, Math.min(HISTORY_LIMIT, Math.floor(limit)));
+  const result = await env.DB.prepare(`
+    SELECT *
+    FROM ai_match_history
+    ORDER BY id DESC
+    LIMIT ?
+  `).bind(safeLimit).all();
+
+  return Array.isArray(result?.results) ? result.results as AnyObj[] : [];
+}
+
+async function processOneSignal(env: Env, rawSignal: AnyObj, forcedKey?: string): Promise<AnyObj> {
+  const signal = normalizeSignal(rawSignal);
+  if (!signalValid(signal)) {
+    return {
+      processed: false,
+      reason: "INVALID_SIGNAL",
+      signal
+    };
+  }
+
+  const started = Date.now();
+  const rawEvents = await getRawCloudbetLive();
+  const result = await matchWithAi(env, signal, rawEvents);
+  const processingMs = Date.now() - started;
+
+  await storeHistory(env, rawSignal, signal, result, processingMs, forcedKey);
+
+  return {
+    processed: true,
+    signal,
+    result,
+    processing_ms: processingMs
+  };
+}
+
+async function scanTracker(env: Env): Promise<AnyObj> {
+  await ensureSchema(env);
+
+  if (!env.AI) throw new Error("AI_BINDING_MISSING");
+  if (!env.TRACKER) throw new Error("TRACKER_BINDING_MISSING");
+
+  const entries = await fetchTrackerEntries(env);
+  const eligible = entries.filter(trackerSignalEligible);
+
+  const unseen: Array<{ raw: AnyObj; signal: AnyObj; key: string }> = [];
+
+  for (const raw of eligible) {
+    const signal = normalizeSignal(raw);
+    const key = signalKey(raw, signal);
+    if (await historyHasKey(env, key)) continue;
+    unseen.push({ raw, signal, key });
+  }
+
+  // Oldest first is safer when several ENTRY signals arrive between cron runs.
+  unseen.reverse();
+
+  const selected = unseen.slice(0, MAX_SIGNALS_PER_SCAN);
+  const processed: AnyObj[] = [];
+
+  for (const item of selected) {
+    try {
+      processed.push(await processOneSignal(env, item.raw, item.key));
+    } catch (error: any) {
+      processed.push({
+        processed: false,
+        signal: item.signal,
+        reason: "PROCESS_FAILED",
+        error: String(error?.message ?? error)
+      });
+    }
+  }
+
+  return {
+    success: true,
+    action: "TRACKER_AUTO_SCAN",
+    tracker_entries: entries.length,
+    eligible_entries: eligible.length,
+    unseen_entries: unseen.length,
+    processed_now: processed.length,
+    remaining_unseen: Math.max(0, unseen.length - processed.length),
+    max_per_scan: MAX_SIGNALS_PER_SCAN,
+    results: processed
+  };
+}
+
+function confidenceLabel(value: any): string {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "0%";
+  return `${Math.round(n * 100)}%`;
+}
+
+function dashboardPage(rows: AnyObj[]): string {
+  const tableRows = rows.map(row => {
+    const accepted = Number(row.ai_accepted) === 1;
+    const matched = Number(row.ai_matched) === 1;
+
+    const status = accepted
+      ? "✅ MATCH"
+      : matched
+        ? "⚠️ LOW CONF"
+        : "❌ NO MATCH";
+
+    const hunter = `${escapeHtml(row.hunter_home)} <span class="sep">vs</span> ${escapeHtml(row.hunter_away)}`;
+    const cloudbet = row.cloudbet_match
+      ? escapeHtml(row.cloudbet_match)
+      : '<span class="muted">—</span>';
+
+    const meta = [
+      row.competition ? escapeHtml(row.competition) : null,
+      row.hunter_minute !== null && row.hunter_minute !== undefined
+        ? `${escapeHtml(row.hunter_minute)}'`
+        : null,
+      row.hunter_score !== null && row.hunter_score !== undefined
+        ? `Hunter ${escapeHtml(row.hunter_score)}`
+        : null
+    ].filter(Boolean).join(" · ");
+
+    const cbMeta = [
+      row.cloudbet_period ? escapeHtml(row.cloudbet_period) : null,
+      row.cloudbet_minute !== null && row.cloudbet_minute !== undefined
+        ? `${escapeHtml(row.cloudbet_minute)}'`
+        : null
+    ].filter(Boolean).join(" · ");
+
+    return `
+      <tr>
+        <td class="time">${escapeHtml(row.created_at)}</td>
+        <td>
+          <div class="fixture">${hunter}</div>
+          <div class="meta">${meta || "—"}</div>
+        </td>
+        <td>
+          <div class="fixture">${cloudbet}</div>
+          <div class="meta">${cbMeta || "—"}</div>
+        </td>
+        <td class="center"><strong>${confidenceLabel(row.confidence)}</strong></td>
+        <td class="mono">${row.cloudbet_event_id ? escapeHtml(row.cloudbet_event_id) : "—"}</td>
+        <td class="status ${accepted ? "ok" : matched ? "warn" : "bad"}">${status}</td>
+        <td class="reason">${escapeHtml(row.reason ?? "—")}</td>
+      </tr>`;
+  }).join("");
+
+  return `<!doctype html>
+<html lang="bg">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="refresh" content="30">
+  <title>AI Matcher Watch</title>
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;background:#0b1020;color:#eef2ff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+    .wrap{max-width:1600px;margin:0 auto;padding:18px}
+    .top{display:flex;gap:14px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:14px}
+    h1{font-size:22px;margin:0}
+    .badge{background:#18213a;border:1px solid #2d395b;border-radius:999px;padding:7px 11px;font-size:13px;color:#cbd5e1}
+    .cards{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 14px}
+    .card{background:#11182b;border:1px solid #25304d;border-radius:12px;padding:10px 13px;font-size:13px;color:#cbd5e1}
+    .tablebox{overflow:auto;border:1px solid #25304d;border-radius:14px;background:#0f1628}
+    table{width:100%;border-collapse:collapse;min-width:1100px}
+    th{position:sticky;top:0;background:#18213a;color:#cbd5e1;text-align:left;font-size:12px;padding:11px;border-bottom:1px solid #2d395b}
+    td{padding:11px;border-bottom:1px solid #1f2942;vertical-align:top;font-size:13px}
+    tr:last-child td{border-bottom:0}
+    .fixture{font-weight:700;font-size:14px;white-space:nowrap}
+    .sep{font-weight:500;color:#64748b;padding:0 3px}
+    .meta,.muted{margin-top:4px;color:#94a3b8;font-size:12px}
+    .time{white-space:nowrap;color:#94a3b8}
+    .center{text-align:center;white-space:nowrap}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}
+    .status{font-weight:800;white-space:nowrap}
+    .ok{color:#4ade80}.warn{color:#facc15}.bad{color:#fb7185}
+    .reason{max-width:360px;color:#cbd5e1}
+    .empty{padding:28px;text-align:center;color:#94a3b8}
+    a{color:#93c5fd;text-decoration:none}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <h1>🤖 AI Matcher Watch</h1>
+      <div class="badge">${escapeHtml(VERSION)} · READ ONLY · Betting disabled</div>
+    </div>
+    <div class="cards">
+      <div class="card">Последни записи: <strong>${rows.length}/${HISTORY_LIMIT}</strong></div>
+      <div class="card">Auto refresh: <strong>30 sec</strong></div>
+      <div class="card"><a href="/scan">▶ Manual scan</a></div>
+      <div class="card"><a href="/api/history">JSON history</a></div>
+    </div>
+    <div class="tablebox">
+      ${rows.length ? `
+      <table>
+        <thead>
+          <tr>
+            <th>Време UTC</th>
+            <th>Hunter сигнал</th>
+            <th>AI намерен Cloudbet мач</th>
+            <th>Confidence</th>
+            <th>Event ID</th>
+            <th>Резултат</th>
+            <th>AI reason</th>
+          </tr>
+        </thead>
+        <tbody>${tableRows}</tbody>
+      </table>` : '<div class="empty">Още няма записани AI проверки. Cron или /scan ще добави първите.</div>'}
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
 // ============================================================
 // ROUTER
 // ============================================================
@@ -646,9 +1067,22 @@ export default {
     const url = new URL(request.url);
 
     // --------------------------------------------------------
-    // STATUS
+    // HTML DASHBOARD — LAST 30
     // --------------------------------------------------------
     if (url.pathname === "/" && request.method === "GET") {
+      try {
+        await ensureSchema(env);
+        const rows = await getHistory(env);
+        return html(dashboardPage(rows));
+      } catch (error: any) {
+        return html(`<!doctype html><html><body style="font-family:system-ui;padding:20px"><h2>AI Matcher</h2><p>Dashboard storage error: ${escapeHtml(String(error?.message ?? error))}</p><p>Check DB binding in ai-matcher.json.</p></body></html>`, 500);
+      }
+    }
+
+    // --------------------------------------------------------
+    // JSON STATUS
+    // --------------------------------------------------------
+    if (url.pathname === "/status" && request.method === "GET") {
       return json({
         success: true,
         worker: "ai-matcher",
@@ -656,21 +1090,18 @@ export default {
         mode: "READ_ONLY",
         betting: "DISABLED",
         ai_binding: Boolean(env.AI),
+        db_binding: Boolean(env.DB),
+        tracker_binding: Boolean(env.TRACKER),
         model: MODEL,
-        architecture: "HUNTER -> RAW CLOUDBET LIVE -> BATCHED AI IDENTITY MATCH -> VERIFIED EVENT_ID",
-        safety: {
-          no_betting_code: true,
-          no_name_filter_before_ai: true,
-          no_minute_filter_before_ai: true,
-          no_period_filter_before_ai: true,
-          no_score_filter_before_ai: true,
-          returned_event_id_must_exist_in_candidate_set: true,
-          accepted_confidence: AI_ACCEPT_CONFIDENCE
-        },
+        history_limit: HISTORY_LIMIT,
+        max_signals_per_scan: MAX_SIGNALS_PER_SCAN,
+        architecture: "TRACKER -> RAW CLOUDBET LIVE -> BATCHED AI IDENTITY MATCH -> D1 LAST 30 -> DASHBOARD",
         endpoints: {
-          status: "GET /",
+          dashboard: "GET /",
+          status: "GET /status",
+          scan: "GET /scan",
+          history: "GET /api/history",
           live_test: "GET /live-test",
-          como_test: "GET /test-como",
           match_get: "GET /match-get?home=...&away=...&competition=...&minute=...",
           match: "POST /match"
         }
@@ -678,8 +1109,52 @@ export default {
     }
 
     // --------------------------------------------------------
-    // RAW LIVE DIAGNOSTIC
-    // No AI call.
+    // MANUAL TRACKER SCAN
+    // --------------------------------------------------------
+    if (url.pathname === "/scan" && request.method === "GET") {
+      try {
+        return json({
+          worker: "ai-matcher",
+          version: VERSION,
+          ...(await scanTracker(env))
+        });
+      } catch (error: any) {
+        return json({
+          success: false,
+          worker: "ai-matcher",
+          version: VERSION,
+          error: "TRACKER_SCAN_FAILED",
+          message: String(error?.message ?? error)
+        }, 500);
+      }
+    }
+
+    // --------------------------------------------------------
+    // HISTORY JSON
+    // --------------------------------------------------------
+    if (url.pathname === "/api/history" && request.method === "GET") {
+      try {
+        await ensureSchema(env);
+        const rows = await getHistory(env);
+        return json({
+          success: true,
+          worker: "ai-matcher",
+          version: VERSION,
+          count: rows.length,
+          limit: HISTORY_LIMIT,
+          history: rows
+        });
+      } catch (error: any) {
+        return json({
+          success: false,
+          error: "HISTORY_FAILED",
+          message: String(error?.message ?? error)
+        }, 500);
+      }
+    }
+
+    // --------------------------------------------------------
+    // RAW LIVE DIAGNOSTIC — NO AI
     // --------------------------------------------------------
     if (url.pathname === "/live-test" && request.method === "GET") {
       try {
@@ -710,75 +1185,11 @@ export default {
     }
 
     // --------------------------------------------------------
-    // ONE-CLICK COMO TEST
-    // GET /test-como
-    // Identity test only. Current Cloudbet period/minute do not
-    // determine whether the fixture identity is the same.
-    // --------------------------------------------------------
-    if (url.pathname === "/test-como" && request.method === "GET") {
-      if (!env.AI) {
-        return json({
-          success: false,
-          worker: "ai-matcher",
-          version: VERSION,
-          error: "AI_BINDING_MISSING"
-        }, 500);
-      }
-
-      const signal = {
-        home: "Como U19",
-        away: "RB Leipzig U19",
-        competition: "UEFA Youth League",
-        minute: 40
-      };
-
-      const started = Date.now();
-
-      try {
-        const rawEvents = await getRawCloudbetLive();
-        const result = await matchWithAi(env, signal, rawEvents);
-
-        return json({
-          success: true,
-          worker: "ai-matcher",
-          version: VERSION,
-          action: "GET_COMO_AI_MATCH_TEST",
-          mode: "READ_ONLY",
-          betting: "DISABLED",
-          signal,
-          result,
-          processing_ms: Date.now() - started
-        });
-      } catch (error: any) {
-        return json({
-          success: false,
-          worker: "ai-matcher",
-          version: VERSION,
-          action: "GET_COMO_AI_MATCH_TEST",
-          mode: "READ_ONLY",
-          betting: "DISABLED",
-          signal,
-          error: "AI_MATCH_FAILED",
-          message: String(error?.message ?? error),
-          processing_ms: Date.now() - started
-        }, 500);
-      }
-    }
-
-    // --------------------------------------------------------
-    // DYNAMIC ONE-CLICK AI MATCH TEST
-    // GET /match-get?home=Levski%20Sofia&away=CSKA%20Sofia
-    // Optional: competition, minute, period, hunter_score
-    // READ ONLY / NO BETTING
+    // DYNAMIC GET MATCH — ALSO STORED IN HISTORY
     // --------------------------------------------------------
     if (url.pathname === "/match-get" && request.method === "GET") {
       if (!env.AI) {
-        return json({
-          success: false,
-          worker: "ai-matcher",
-          version: VERSION,
-          error: "AI_BINDING_MISSING"
-        }, 500);
+        return json({ success: false, error: "AI_BINDING_MISSING" }, 500);
       }
 
       const signal = normalizeSignal({
@@ -793,21 +1204,16 @@ export default {
       if (!signalValid(signal)) {
         return json({
           success: false,
-          worker: "ai-matcher",
-          version: VERSION,
           error: "INVALID_SIGNAL",
           required_query_params: ["home", "away"],
-          optional_query_params: ["competition", "minute", "period", "hunter_score"],
-          example: "/match-get?home=Levski%20Sofia&away=CSKA%20Sofia&competition=Parva%20Liga&minute=31",
           received_signal: signal
         }, 400);
       }
 
-      const started = Date.now();
-
       try {
-        const rawEvents = await getRawCloudbetLive();
-        const result = await matchWithAi(env, signal, rawEvents);
+        await ensureSchema(env);
+        const forcedKey = `manual:${crypto.randomUUID()}`;
+        const processed = await processOneSignal(env, signal, forcedKey);
 
         return json({
           success: true,
@@ -816,75 +1222,40 @@ export default {
           action: "GET_DYNAMIC_AI_MATCH_TEST",
           mode: "READ_ONLY",
           betting: "DISABLED",
-          signal,
-          result,
-          processing_ms: Date.now() - started
+          ...processed
         });
       } catch (error: any) {
         return json({
           success: false,
-          worker: "ai-matcher",
-          version: VERSION,
-          action: "GET_DYNAMIC_AI_MATCH_TEST",
-          mode: "READ_ONLY",
-          betting: "DISABLED",
-          signal,
           error: "AI_MATCH_FAILED",
-          message: String(error?.message ?? error),
-          processing_ms: Date.now() - started
+          message: String(error?.message ?? error)
         }, 500);
       }
     }
 
     // --------------------------------------------------------
-    // REAL AI MATCH TEST
-    // POST JSON:
-    // {
-    //   "signal": {
-    //     "home": "Levski Sofia",
-    //     "away": "CSKA Sofia",
-    //     "competition": "Parva Liga",
-    //     "minute": 31
-    //   }
-    // }
+    // POST MATCH — ALSO STORED IN HISTORY
     // --------------------------------------------------------
     if (url.pathname === "/match" && request.method === "POST") {
       if (!env.AI) {
-        return json({
-          success: false,
-          worker: "ai-matcher",
-          version: VERSION,
-          error: "AI_BINDING_MISSING"
-        }, 500);
+        return json({ success: false, error: "AI_BINDING_MISSING" }, 500);
       }
 
       let body: AnyObj;
-
       try {
         body = (await request.json()) as AnyObj;
       } catch {
-        return json({
-          success: false,
-          error: "INVALID_JSON_BODY"
-        }, 400);
+        return json({ success: false, error: "INVALID_JSON_BODY" }, 400);
       }
 
       const signal = normalizeSignal(body);
-
       if (!signalValid(signal)) {
-        return json({
-          success: false,
-          error: "INVALID_SIGNAL",
-          required: ["home", "away"],
-          received_signal: signal
-        }, 400);
+        return json({ success: false, error: "INVALID_SIGNAL", received_signal: signal }, 400);
       }
 
-      const started = Date.now();
-
       try {
-        const rawEvents = await getRawCloudbetLive();
-        const result = await matchWithAi(env, signal, rawEvents);
+        await ensureSchema(env);
+        const processed = await processOneSignal(env, body);
 
         return json({
           success: true,
@@ -892,21 +1263,13 @@ export default {
           version: VERSION,
           mode: "READ_ONLY",
           betting: "DISABLED",
-          signal,
-          result,
-          processing_ms: Date.now() - started
+          ...processed
         });
       } catch (error: any) {
         return json({
           success: false,
-          worker: "ai-matcher",
-          version: VERSION,
-          mode: "READ_ONLY",
-          betting: "DISABLED",
-          signal,
           error: "AI_MATCH_FAILED",
-          message: String(error?.message ?? error),
-          processing_ms: Date.now() - started
+          message: String(error?.message ?? error)
         }, 500);
       }
     }
@@ -914,7 +1277,17 @@ export default {
     return json({
       success: false,
       error: "NOT_FOUND",
-      endpoints: ["GET /", "GET /live-test", "GET /test-como", "GET /match-get?home=...&away=...", "POST /match"]
+      endpoints: ["GET /", "GET /status", "GET /scan", "GET /api/history", "GET /live-test", "GET /match-get", "POST /match"]
     }, 404);
+  },
+
+  async scheduled(_controller: any, env: Env, ctx: any): Promise<void> {
+    ctx.waitUntil((async () => {
+      try {
+        await scanTracker(env);
+      } catch (error) {
+        console.error("AI_MATCHER_CRON_FAILED", error);
+      }
+    })());
   }
 };
