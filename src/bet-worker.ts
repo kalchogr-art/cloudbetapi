@@ -70,12 +70,20 @@ interface Env {
 
 type Obj = Record<string, any>;
 
+// V7.6.15:
+// - Cloudbet minute remains authoritative when present.
+// - Explicit Cloudbet minute outside 10–42 is still blocked.
+// - If Cloudbet minute is missing, the original Hunter ENTRY minute may be used
+//   only as a fallback, while SAME event_id + exact 1H O0.5 + selection state
+//   + score/period safety checks remain mandatory.
+// - No fuzzy event fallback and no betting threshold was lowered.
+
 // ============================================================
 // CONFIG
 // ============================================================
 
 const VERSION =
-  "V7.6.14 SCORE + PERIOD UNKNOWN ALLOWED 0.10 USDT";
+  "V7.6.15 SCORE + PERIOD + MINUTE UNKNOWN SAFE FALLBACK 0.10 USDT";
 
 const MODE =
   "DRY_RUN";
@@ -1188,7 +1196,8 @@ function cloudbetMinute(
 }
 
 function eventStillValidForTarget(
-  event: any
+  event: any,
+  hunterEntryMinute: number | null = null
 ): {
   valid: boolean;
   reason: string;
@@ -1235,16 +1244,67 @@ function eventStillValidForTarget(
   // Unknown / generic live period is allowed.
   // Exact first-half market + active selection remain mandatory downstream.
 
-  // HARD GATE #3 — minute must be known and inside configured betting window.
-  if (minute === null) {
-    return { valid: false, reason: "MINUTE_UNKNOWN", score, period, minute };
+  // HARD GATE #3 — Cloudbet minute is authoritative when present.
+  // If Cloudbet does not expose a usable minute, use the original Hunter ENTRY
+  // minute only as a constrained fallback. This does NOT relax the SAME event_id,
+  // exact 1H O0.5 market, selection, score or period protections.
+  if (minute !== null) {
+    if (minute < BET_MINUTE_FROM || minute > BET_MINUTE_TO) {
+      return {
+        valid: false,
+        reason: "OUTSIDE_HUNTER_MINUTE_WINDOW",
+        score,
+        period,
+        minute
+      };
+    }
+
+    return {
+      valid: true,
+      reason: "EVENT_VALID",
+      score,
+      period,
+      minute
+    };
   }
 
-  if (minute < BET_MINUTE_FROM || minute > BET_MINUTE_TO) {
-    return { valid: false, reason: "OUTSIDE_HUNTER_MINUTE_WINDOW", score, period, minute };
+  const fallbackMinute =
+    numberOrNull(
+      hunterEntryMinute
+    );
+
+  if (
+    fallbackMinute === null
+  ) {
+    return {
+      valid: false,
+      reason: "MINUTE_UNKNOWN",
+      score,
+      period,
+      minute
+    };
   }
 
-  return { valid: true, reason: "EVENT_VALID", score, period, minute };
+  if (
+    fallbackMinute < BET_MINUTE_FROM ||
+    fallbackMinute > BET_MINUTE_TO
+  ) {
+    return {
+      valid: false,
+      reason: "HUNTER_ENTRY_MINUTE_OUTSIDE_WINDOW",
+      score,
+      period,
+      minute
+    };
+  }
+
+  return {
+    valid: true,
+    reason: "EVENT_VALID_HUNTER_MINUTE_FALLBACK",
+    score,
+    period,
+    minute
+  };
 }
 
 // ============================================================
@@ -1915,7 +1975,8 @@ interface CurrentOddsResult {
 
 async function verifySameEventAndOdds(
   env: Env,
-  expectedEventId: string
+  expectedEventId: string,
+  hunterEntryMinute: number | null = null
 ): Promise<CurrentOddsResult> {
   try {
     const event =
@@ -1961,7 +2022,8 @@ async function verifySameEventAndOdds(
 
     const validation =
       eventStillValidForTarget(
-        event
+        event,
+        hunterEntryMinute
       );
 
     if (
@@ -2943,6 +3005,7 @@ interface PendingRow {
   id?: number;
   execution_id: string;
   cloudbet_id: string;
+  entry_minute?: any;
   payload_json: string;
   retry_count?: number;
   missing_count?: number;
@@ -3793,7 +3856,10 @@ async function processPending(
     const current =
       await verifySameEventAndOdds(
         env,
-        cloudbetId
+        cloudbetId,
+        numberOrNull(
+          row.entry_minute
+        )
       );
 
     if (
@@ -6520,7 +6586,11 @@ async function runWorker(
       const current =
         await verifySameEventAndOdds(
           env,
-          cloudbetId
+          cloudbetId,
+          numberOrNull(
+            signal?.entry_minute ??
+            signal?.minute
+          )
         );
 
       if (!current.success) {
