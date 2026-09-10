@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7.6.7
+// CLOUDBET MATCH MATCHER V7.6.8
 // CANDIDATE RANKING + D1 DIAGNOSTICS + SEPARATE ODDS LOOKUP
 // LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
 // V27 SERVICE BINDING + DIRECT CLOUDBET PUBLIC SPORTS API
@@ -26,6 +26,19 @@
 //
 // - /diagnostic
 //   -> light V27 + Cloudbet diagnostic
+//
+// V7.6.8 FIXES:
+// - adds a second RAW LIVE recovery pool for events hidden by missing Cloudbet period and/or score
+// - UNKNOWN state is no longer treated as FALSE in the recovery path
+// - explicit non-0:0 score is always rejected
+// - explicit 2H / HT / FT / finished state is always rejected
+// - known Cloudbet minute outside Hunter 10-42 is rejected
+// - missing Cloudbet minute may use the original Hunter minute only for recovery validation
+// - recovery still requires very strong two-sided identity + category compatibility
+// - competition agreement is required when both sides expose competition data
+// - ambiguous candidates remain UNMATCHED
+// - exact 1H Over 0.5 odds lookup remains separate and unchanged
+// - no betting logic and no global threshold reduction
 //
 // V7.6.7 FIXES:
 // - FAST_HUNTER no longer discards an otherwise valid LIVE + 1H + 0:0 event only because Cloudbet minute is missing
@@ -94,7 +107,7 @@ interface Env {
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.6.7-MINUTE-UNKNOWN-CLOCK-DRIFT-RECOVERY";
+  "V7.6.8-RAW-LIVE-STATE-UNKNOWN-RECOVERY";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -125,6 +138,14 @@ const COUNTRY_BONUS =
 
 const MATCH_MINUTE_TOLERANCE =
   5;
+
+// V7.6.8 RAW LIVE recovery safety window.
+// This mirrors the Hunter entry window and is NOT a looser matching threshold.
+const RAW_RECOVERY_HUNTER_FROM =
+  10;
+
+const RAW_RECOVERY_HUNTER_TO =
+  42;
 
 // V7.6.4 recovery is deliberately separate from the normal minute window.
 // It is used ONLY when the normal window contains zero candidates.
@@ -2334,6 +2355,261 @@ function isHunterEligibleCloudbetEvent(
 
 
 // ============================================================
+// V7.6.8 RAW LIVE STATE HELPERS
+// ============================================================
+
+function cloudbetPeriodState(
+  event: AnyObj
+): "FIRST_HALF" | "NOT_FIRST_HALF" | "UNKNOWN" {
+
+  const raw =
+    String(
+      event?.metadata
+        ?.eventStatus ??
+      event?.event_status ??
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+  if (!raw) {
+    return "UNKNOWN";
+  }
+
+  const firstHalfExact =
+    new Set([
+      "1p",
+      "1h",
+      "first",
+      "first_half",
+      "first half",
+      "firsthalf"
+    ]);
+
+  if (
+    firstHalfExact.has(
+      raw
+    )
+  ) {
+    return "FIRST_HALF";
+  }
+
+  const compact =
+    raw.replace(
+      /[\s_-]+/g,
+      ""
+    );
+
+  const blockedExact =
+    new Set([
+      "2p",
+      "2h",
+      "second",
+      "secondhalf",
+      "ht",
+      "halftime",
+      "ft",
+      "fulltime",
+      "finished",
+      "ended",
+      "final"
+    ]);
+
+  if (
+    blockedExact.has(
+      compact
+    )
+  ) {
+    return "NOT_FIRST_HALF";
+  }
+
+  return "UNKNOWN";
+}
+
+
+function cloudbetScoreState(
+  event: AnyObj
+): "ZERO_ZERO" | "NON_ZERO" | "UNKNOWN" {
+
+  const score =
+    cloudbetScore(
+      event?.metadata
+        ?.score
+    );
+
+  if (
+    score === null ||
+    score.home === null ||
+    score.away === null
+  ) {
+    return "UNKNOWN";
+  }
+
+  if (
+    score.home === 0 &&
+    score.away === 0
+  ) {
+    return "ZERO_ZERO";
+  }
+
+  return "NON_ZERO";
+}
+
+
+function rawLiveStateValidForRecovery(
+  signal: AnyObj,
+  event: AnyObj
+): {
+  valid: boolean;
+  reason: string;
+  periodState: string;
+  scoreState: string;
+  cloudbetMinute: number | null;
+  effectiveMinute: number | null;
+  minuteSource: "CLOUDBET" | "HUNTER_FALLBACK" | "NONE";
+} {
+
+  if (
+    !isCloudbetLive(
+      event
+    )
+  ) {
+    return {
+      valid: false,
+      reason: "RAW_NOT_LIVE",
+      periodState: "UNKNOWN",
+      scoreState: "UNKNOWN",
+      cloudbetMinute: null,
+      effectiveMinute: null,
+      minuteSource: "NONE"
+    };
+  }
+
+  const periodState =
+    cloudbetPeriodState(
+      event
+    );
+
+  if (
+    periodState ===
+      "NOT_FIRST_HALF"
+  ) {
+    return {
+      valid: false,
+      reason: "RAW_EXPLICIT_NOT_FIRST_HALF",
+      periodState,
+      scoreState:
+        cloudbetScoreState(
+          event
+        ),
+      cloudbetMinute:
+        cloudbetMinute(
+          event
+        ),
+      effectiveMinute: null,
+      minuteSource: "NONE"
+    };
+  }
+
+  const scoreState =
+    cloudbetScoreState(
+      event
+    );
+
+  if (
+    scoreState ===
+      "NON_ZERO"
+  ) {
+    return {
+      valid: false,
+      reason: "RAW_EXPLICIT_SCORE_NOT_0_0",
+      periodState,
+      scoreState,
+      cloudbetMinute:
+        cloudbetMinute(
+          event
+        ),
+      effectiveMinute: null,
+      minuteSource: "NONE"
+    };
+  }
+
+  const cbMinute =
+    cloudbetMinute(
+      event
+    );
+
+  if (
+    cbMinute !== null
+  ) {
+
+    if (
+      cbMinute <
+        RAW_RECOVERY_HUNTER_FROM ||
+      cbMinute >
+        RAW_RECOVERY_HUNTER_TO
+    ) {
+      return {
+        valid: false,
+        reason: "RAW_CLOUDBET_MINUTE_OUTSIDE_HUNTER_WINDOW",
+        periodState,
+        scoreState,
+        cloudbetMinute: cbMinute,
+        effectiveMinute: cbMinute,
+        minuteSource: "CLOUDBET"
+      };
+    }
+
+    return {
+      valid: true,
+      reason: "RAW_STATE_VALID",
+      periodState,
+      scoreState,
+      cloudbetMinute: cbMinute,
+      effectiveMinute: cbMinute,
+      minuteSource: "CLOUDBET"
+    };
+  }
+
+  const hunterMinute =
+    hunterReferenceMinute(
+      signal
+    );
+
+  if (
+    hunterMinute === null ||
+    hunterMinute <
+      RAW_RECOVERY_HUNTER_FROM ||
+    hunterMinute >
+      RAW_RECOVERY_HUNTER_TO
+  ) {
+    return {
+      valid: false,
+      reason: "RAW_HUNTER_FALLBACK_MINUTE_INVALID",
+      periodState,
+      scoreState,
+      cloudbetMinute: null,
+      effectiveMinute: hunterMinute,
+      minuteSource:
+        hunterMinute === null
+          ? "NONE"
+          : "HUNTER_FALLBACK"
+    };
+  }
+
+  return {
+    valid: true,
+    reason: "RAW_STATE_VALID_HUNTER_MINUTE_FALLBACK",
+    periodState,
+    scoreState,
+    cloudbetMinute: null,
+    effectiveMinute: hunterMinute,
+    minuteSource: "HUNTER_FALLBACK"
+  };
+}
+
+
+// ============================================================
 // V7.6.7 FAST_HUNTER DISCOVERY ELIGIBILITY
 // ============================================================
 //
@@ -3596,6 +3872,8 @@ function findHunterTargetMatch(
   signal: AnyObj,
   cloudbet:
     PreparedMatch[],
+  rawLiveCloudbet:
+    PreparedMatch[],
   tokenIndex:
     Map<string, number[]>,
   threshold: number
@@ -4066,6 +4344,169 @@ function findHunterTargetMatch(
       }
     }
 
+    // V7.6.8 — final READ-ONLY rescue against the RAW LIVE soccer pool.
+    // This catches events hidden by UNKNOWN score and/or period metadata.
+    const rawRecovery =
+      rawLiveRecoveryForSignal(
+        signal,
+        target,
+        rawLiveCloudbet
+      );
+
+    if (
+      rawRecovery?.accepted &&
+      rawRecovery.best
+    ) {
+      const recovered =
+        rawRecovery.best;
+
+      return {
+        found:
+          true,
+        best:
+          recovered.cb,
+        second:
+          rawRecovery.second?.cb ??
+          null,
+        detail:
+          recovered.detail,
+        secondDetail:
+          rawRecovery.second?.detail ??
+          null,
+        classification:
+          "CONFIDENT_MATCH",
+        reason:
+          "RAW_LIVE_RECOVERY_CONFIDENT_MATCH",
+        matchMode:
+          "RAW_LIVE_RECOVERY",
+        contextFallback: {
+          accepted:
+            false
+        },
+        minuteUnknownRecovery: {
+          accepted:
+            false
+        },
+        strongRecovery: {
+          accepted:
+            false
+        },
+        rawLiveRecovery: {
+          accepted:
+            true,
+          candidates:
+            rawRecovery.candidates,
+          period_state:
+            recovered.state.periodState,
+          score_state:
+            recovered.state.scoreState,
+          cloudbet_minute:
+            recovered.state.cloudbetMinute,
+          effective_minute:
+            recovered.state.effectiveMinute,
+          minute_source:
+            recovered.state.minuteSource,
+          competition_score:
+            Number(
+              recovered.detail.competitionScore.toFixed(3)
+            ),
+          home_score:
+            Number(
+              recovered.detail.homeScore.toFixed(3)
+            ),
+          away_score:
+            Number(
+              recovered.detail.awayScore.toFixed(3)
+            ),
+          reverse_home_score:
+            Number(
+              recovered.detail.reverseHomeScore.toFixed(3)
+            ),
+          reverse_away_score:
+            Number(
+              recovered.detail.reverseAwayScore.toFixed(3)
+            ),
+          direction:
+            recovered.detail.direction,
+          total_score:
+            Number(
+              recovered.detail.total.toFixed(3)
+            ),
+          score_gap:
+            rawRecovery.scoreGap
+        },
+        candidateEvaluations:
+          candidateEvaluations +
+          rawRecovery.candidates,
+        candidates:
+          candidates.length,
+        minuteCandidates,
+        targetMinute,
+        bestMinute:
+          recovered.state.cloudbetMinute,
+        bestMinuteDifference:
+          recovered.state.cloudbetMinute !== null
+            ? Math.abs(
+                targetMinute -
+                recovered.state.cloudbetMinute
+              )
+            : null,
+        scoreGap:
+          rawRecovery.scoreGap,
+        topCandidates: [
+          candidateDiagnosticRecord(
+            recovered.cb,
+            recovered.detail,
+            signal
+          )
+        ]
+      };
+    }
+
+    if (
+      rawRecovery &&
+      rawRecovery.accepted === false &&
+      rawRecovery.reason ===
+        "RAW_LIVE_RECOVERY_AMBIGUOUS"
+    ) {
+      const result =
+        emptyResult(
+          "RAW_LIVE_RECOVERY_AMBIGUOUS",
+          targetMinute,
+          candidates.length,
+          minuteCandidates,
+          candidateEvaluations
+        );
+
+      return {
+        ...result,
+        matchMode:
+          "RAW_LIVE_RECOVERY_REJECTED",
+        rawLiveRecovery: {
+          accepted:
+            false,
+          reason:
+            rawRecovery.reason,
+          candidates:
+            rawRecovery.candidates,
+          score_gap:
+            rawRecovery.scoreGap,
+          best_event_id:
+            rawRecovery.best
+              ? cloudbetEventId(
+                  rawRecovery.best.cb.raw
+                )
+              : null,
+          second_event_id:
+            rawRecovery.second
+              ? cloudbetEventId(
+                  rawRecovery.second.cb.raw
+                )
+              : null
+        }
+      };
+    }
+
     return emptyResult(
       minuteCandidates === 0
         ? "NO_CLOUDBET_CANDIDATE_WITHIN_MINUTE_WINDOW"
@@ -4214,6 +4655,202 @@ function findHunterTargetMatch(
   };
 }
 
+
+
+// ============================================================
+// V7.6.8 RAW LIVE STATE-UNKNOWN RECOVERY
+// ============================================================
+//
+// Used only after the normal eligible pool produced no usable match.
+// It scans RAW LIVE soccer events so missing Cloudbet score/period metadata
+// cannot hide an otherwise exact event.
+//
+// UNKNOWN != FALSE.
+// Explicitly contradictory state remains a hard rejection.
+//
+function rawLiveRecoveryForSignal(
+  signal: AnyObj,
+  target: PreparedMatch,
+  rawLiveCloudbet: PreparedMatch[]
+): AnyObj | null {
+
+  const ranked:
+    {
+      cb: PreparedMatch;
+      detail: AnyObj;
+      score: number;
+      state: AnyObj;
+    }[] = [];
+
+  for (
+    const cb
+    of rawLiveCloudbet
+  ) {
+
+    if (
+      !cb ||
+      !cb.raw
+    ) {
+      continue;
+    }
+
+    const state =
+      rawLiveStateValidForRecovery(
+        signal,
+        cb.raw
+      );
+
+    if (
+      !state.valid
+    ) {
+      continue;
+    }
+
+    const normalCategoryOk =
+      categoryCompatible(
+        target.home,
+        cb.home
+      ) &&
+      categoryCompatible(
+        target.away,
+        cb.away
+      );
+
+    const reversedCategoryOk =
+      categoryCompatible(
+        target.home,
+        cb.away
+      ) &&
+      categoryCompatible(
+        target.away,
+        cb.home
+      );
+
+    if (
+      !normalCategoryOk &&
+      !reversedCategoryOk
+    ) {
+      continue;
+    }
+
+    const detail =
+      detailedMatchScore(
+        target.raw,
+        cb.raw
+      );
+
+    const normalStrong =
+      normalCategoryOk &&
+      detail.direction === "NORMAL" &&
+      detail.homeScore >=
+        STRONG_RECOVERY_MIN_SIDE_SCORE &&
+      detail.awayScore >=
+        STRONG_RECOVERY_MIN_SIDE_SCORE;
+
+    const reversedStrong =
+      reversedCategoryOk &&
+      detail.direction === "REVERSED" &&
+      detail.reverseHomeScore >=
+        STRONG_RECOVERY_MIN_SIDE_SCORE &&
+      detail.reverseAwayScore >=
+        STRONG_RECOVERY_MIN_SIDE_SCORE;
+
+    if (
+      !normalStrong &&
+      !reversedStrong
+    ) {
+      continue;
+    }
+
+    if (
+      detail.total <
+        STRONG_RECOVERY_MIN_TOTAL_SCORE
+    ) {
+      continue;
+    }
+
+    const hunterCompetition =
+      competitionText(
+        target.raw
+      );
+
+    const cbCompetition =
+      competitionText(
+        cb.raw
+      );
+
+    if (
+      hunterCompetition &&
+      cbCompetition &&
+      detail.competitionScore <
+        STRONG_RECOVERY_MIN_COMPETITION_SCORE
+    ) {
+      continue;
+    }
+
+    ranked.push({
+      cb,
+      detail,
+      score:
+        detail.total,
+      state
+    });
+  }
+
+  ranked.sort(
+    (a, b) =>
+      b.score - a.score
+  );
+
+  if (
+    ranked.length === 0
+  ) {
+    return null;
+  }
+
+  const best =
+    ranked[0];
+
+  const second =
+    ranked.length > 1
+      ? ranked[1]
+      : null;
+
+  const scoreGap =
+    second
+      ? Math.max(
+          0,
+          best.score -
+          second.score
+        )
+      : 1;
+
+  if (
+    second &&
+    scoreGap <
+      STRONG_RECOVERY_MIN_SCORE_GAP
+  ) {
+    return {
+      accepted: false,
+      reason: "RAW_LIVE_RECOVERY_AMBIGUOUS",
+      best,
+      second,
+      scoreGap,
+      candidates:
+        ranked.length
+    };
+  }
+
+  return {
+    accepted: true,
+    reason: "RAW_LIVE_RECOVERY_CONFIDENT_MATCH",
+    best,
+    second,
+    scoreGap,
+    candidates:
+      ranked.length
+  };
+}
 
 
 // ============================================================
@@ -5056,6 +5693,18 @@ async function runFastHunter(
       prepareMatch
     );
 
+  // V7.6.8 RAW recovery pool.
+  // Still soccer + live because getDirectCloudbetLive(false) already requests
+  // live soccer; keep the explicit live check as an additional guard.
+  const rawLivePreparedCloudbet =
+    rawCloudbet
+      .filter(
+        isCloudbetLive
+      )
+      .map(
+        prepareMatch
+      );
+
   const tokenIndex =
     buildTokenIndex(
       preparedCloudbet
@@ -5092,6 +5741,7 @@ async function runFastHunter(
       findHunterTargetMatch(
         signal,
         preparedCloudbet,
+        rawLivePreparedCloudbet,
         tokenIndex,
         threshold
       );
