@@ -21,7 +21,7 @@ interface Env {
   TRACKER: any;
 }
 
-const VERSION = "AI-MATCHER-V1.3-D1-DASHBOARD-AUTO-SCAN";
+const VERSION = "AI-MATCHER-V1.3.1-COLLAPSIBLE-AI-REASON";
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 const CLOUDBET_BASE = "https://www.cloudbet.com";
@@ -975,7 +975,12 @@ function dashboardPage(rows: AnyObj[]): string {
         <td class="center"><strong>${confidenceLabel(row.confidence)}</strong></td>
         <td class="mono">${row.cloudbet_event_id ? escapeHtml(row.cloudbet_event_id) : "—"}</td>
         <td class="status ${accepted ? "ok" : matched ? "warn" : "bad"}">${status}</td>
-        <td class="reason">${escapeHtml(row.reason ?? "—")}</td>
+        <td class="reason">
+          <details class="reason-details">
+            <summary>🤖 Покажи причина</summary>
+            <div class="reason-text">${escapeHtml(row.reason ?? "—")}</div>
+          </details>
+        </td>
       </tr>`;
   }).join("");
 
@@ -1009,6 +1014,10 @@ function dashboardPage(rows: AnyObj[]): string {
     .status{font-weight:800;white-space:nowrap}
     .ok{color:#4ade80}.warn{color:#facc15}.bad{color:#fb7185}
     .reason{max-width:360px;color:#cbd5e1}
+    .reason-details{max-width:360px}
+    .reason-details summary{cursor:pointer;color:#93c5fd;font-weight:700;white-space:nowrap;user-select:none}
+    .reason-details summary:hover{color:#bfdbfe}
+    .reason-text{margin-top:8px;line-height:1.45;color:#cbd5e1;white-space:normal}
     .empty{padding:28px;text-align:center;color:#94a3b8}
     a{color:#93c5fd;text-decoration:none}
   </style>
