@@ -3,19 +3,28 @@
   "name": "ai-matcher",
   "main": "src/ai-matcher.ts",
   "compatibility_date": "2026-09-10",
-
   "observability": {
     "enabled": true
   },
-
   "ai": {
     "binding": "AI"
   },
-
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ai-matcher-db",
+      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+    }
+  ],
   "services": [
     {
-      "binding": "CLOUDBET",
-      "service": "cloudbet-match-matcher"
+      "binding": "TRACKER",
+      "service": "goal-watch-tracker"
     }
-  ]
+  ],
+  "triggers": {
+    "crons": [
+      "* * * * *"
+    ]
+  }
 }
