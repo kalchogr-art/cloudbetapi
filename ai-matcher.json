@@ -3,28 +3,30 @@
   "name": "ai-matcher",
   "main": "src/ai-matcher.ts",
   "compatibility_date": "2026-09-10",
+
   "observability": {
     "enabled": true
   },
+
   "ai": {
     "binding": "AI"
   },
+
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "ai-matcher-db",
-      "database_id": "d1_databases": [{
-    "binding": "DB",
-    "database_name": "ai-matcher-db",
-    "database_id": "b5714c60-5b1f-4952-a5e4-c3eac399cf89"
-   }
+      "database_id": "379c05b1-2779-4c26-b07e-f6cf05675d62"
+    }
   ],
+
   "services": [
     {
       "binding": "TRACKER",
       "service": "goal-watch-tracker"
     }
   ],
+
   "triggers": {
     "crons": [
       "* * * * *"
