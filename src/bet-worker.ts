@@ -70,7 +70,13 @@ interface Env {
 
 type Obj = Record<string, any>;
 
-// V7.6.15:
+// V7.6.16 FIX:
+// - DIRECT /preflight now passes Hunter entry_minute into verifySameEventAndOdds()
+// - If Cloudbet minute is unavailable, Hunter ENTRY minute may be used only inside 10-42
+// - SAME event_id, score, period, exact 1H O0.5, selection, odds, stake, balance and duplicate checks remain unchanged
+// - No matching thresholds or betting enablement changed
+//
+// // V7.6.15:
 // - Cloudbet minute remains authoritative when present.
 // - Explicit Cloudbet minute outside 10–42 is still blocked.
 // - If Cloudbet minute is missing, the original Hunter ENTRY minute may be used
@@ -83,7 +89,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.15 SCORE + PERIOD + MINUTE UNKNOWN SAFE FALLBACK 0.10 USDT";
+  "V7.6.16 DIRECT PREFLIGHT MINUTE FALLBACK FIX 0.10 USDT";
 
 const MODE =
   "DRY_RUN";
@@ -6371,7 +6377,15 @@ async function runDirectPreflight(
   }
 
   const account = await fetchAccountSnapshot(env);
-  const current = await verifySameEventAndOdds(env, eventId);
+  const current =
+    await verifySameEventAndOdds(
+      env,
+      eventId,
+      numberOrNull(
+        signal?.entry_minute ??
+        signal?.minute
+      )
+    );
 
   if (!current.success) {
     const pendingExecutionId = crypto.randomUUID();
