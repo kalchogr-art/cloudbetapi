@@ -1,4 +1,3 @@
-
 // ============================================================
 // AI MATCHER — V1.0
 // RAW CLOUDBET LIVE SOCCER -> WORKERS AI MATCH IDENTITY
@@ -20,7 +19,7 @@ interface Env {
   AI: any;
 }
 
-const VERSION = "AI-MATCHER-V1.0-RAW-LIVE-BATCHED-READ-ONLY";
+const VERSION = "AI-MATCHER-V1.1-GET-COMO-TEST";
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 const CLOUDBET_BASE = "https://www.cloudbet.com";
@@ -671,6 +670,7 @@ export default {
         endpoints: {
           status: "GET /",
           live_test: "GET /live-test",
+          como_test: "GET /test-como",
           match: "POST /match"
         }
       });
@@ -705,6 +705,62 @@ export default {
           error: "RAW_CLOUDBET_LIVE_FAILED",
           message: String(error?.message ?? error)
         }, 502);
+      }
+    }
+
+    // --------------------------------------------------------
+    // ONE-CLICK COMO TEST
+    // GET /test-como
+    // Identity test only. Current Cloudbet period/minute do not
+    // determine whether the fixture identity is the same.
+    // --------------------------------------------------------
+    if (url.pathname === "/test-como" && request.method === "GET") {
+      if (!env.AI) {
+        return json({
+          success: false,
+          worker: "ai-matcher",
+          version: VERSION,
+          error: "AI_BINDING_MISSING"
+        }, 500);
+      }
+
+      const signal = {
+        home: "Como U19",
+        away: "RB Leipzig U19",
+        competition: "UEFA Youth League",
+        minute: 40
+      };
+
+      const started = Date.now();
+
+      try {
+        const rawEvents = await getRawCloudbetLive();
+        const result = await matchWithAi(env, signal, rawEvents);
+
+        return json({
+          success: true,
+          worker: "ai-matcher",
+          version: VERSION,
+          action: "GET_COMO_AI_MATCH_TEST",
+          mode: "READ_ONLY",
+          betting: "DISABLED",
+          signal,
+          result,
+          processing_ms: Date.now() - started
+        });
+      } catch (error: any) {
+        return json({
+          success: false,
+          worker: "ai-matcher",
+          version: VERSION,
+          action: "GET_COMO_AI_MATCH_TEST",
+          mode: "READ_ONLY",
+          betting: "DISABLED",
+          signal,
+          error: "AI_MATCH_FAILED",
+          message: String(error?.message ?? error),
+          processing_ms: Date.now() - started
+        }, 500);
       }
     }
 
@@ -786,7 +842,7 @@ export default {
     return json({
       success: false,
       error: "NOT_FOUND",
-      endpoints: ["GET /", "GET /live-test", "POST /match"]
+      endpoints: ["GET /", "GET /live-test", "GET /test-como", "POST /match"]
     }, 404);
   }
 };
