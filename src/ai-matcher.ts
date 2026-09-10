@@ -19,7 +19,7 @@ interface Env {
   AI: any;
 }
 
-const VERSION = "AI-MATCHER-V1.1-GET-COMO-TEST";
+const VERSION = "AI-MATCHER-V1.2-GET-DYNAMIC-MATCH";
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 const CLOUDBET_BASE = "https://www.cloudbet.com";
@@ -671,6 +671,7 @@ export default {
           status: "GET /",
           live_test: "GET /live-test",
           como_test: "GET /test-como",
+          match_get: "GET /match-get?home=...&away=...&competition=...&minute=...",
           match: "POST /match"
         }
       });
@@ -765,6 +766,77 @@ export default {
     }
 
     // --------------------------------------------------------
+    // DYNAMIC ONE-CLICK AI MATCH TEST
+    // GET /match-get?home=Levski%20Sofia&away=CSKA%20Sofia
+    // Optional: competition, minute, period, hunter_score
+    // READ ONLY / NO BETTING
+    // --------------------------------------------------------
+    if (url.pathname === "/match-get" && request.method === "GET") {
+      if (!env.AI) {
+        return json({
+          success: false,
+          worker: "ai-matcher",
+          version: VERSION,
+          error: "AI_BINDING_MISSING"
+        }, 500);
+      }
+
+      const signal = normalizeSignal({
+        home: url.searchParams.get("home"),
+        away: url.searchParams.get("away"),
+        competition: url.searchParams.get("competition"),
+        minute: url.searchParams.get("minute"),
+        period: url.searchParams.get("period"),
+        hunter_score: url.searchParams.get("hunter_score")
+      });
+
+      if (!signalValid(signal)) {
+        return json({
+          success: false,
+          worker: "ai-matcher",
+          version: VERSION,
+          error: "INVALID_SIGNAL",
+          required_query_params: ["home", "away"],
+          optional_query_params: ["competition", "minute", "period", "hunter_score"],
+          example: "/match-get?home=Levski%20Sofia&away=CSKA%20Sofia&competition=Parva%20Liga&minute=31",
+          received_signal: signal
+        }, 400);
+      }
+
+      const started = Date.now();
+
+      try {
+        const rawEvents = await getRawCloudbetLive();
+        const result = await matchWithAi(env, signal, rawEvents);
+
+        return json({
+          success: true,
+          worker: "ai-matcher",
+          version: VERSION,
+          action: "GET_DYNAMIC_AI_MATCH_TEST",
+          mode: "READ_ONLY",
+          betting: "DISABLED",
+          signal,
+          result,
+          processing_ms: Date.now() - started
+        });
+      } catch (error: any) {
+        return json({
+          success: false,
+          worker: "ai-matcher",
+          version: VERSION,
+          action: "GET_DYNAMIC_AI_MATCH_TEST",
+          mode: "READ_ONLY",
+          betting: "DISABLED",
+          signal,
+          error: "AI_MATCH_FAILED",
+          message: String(error?.message ?? error),
+          processing_ms: Date.now() - started
+        }, 500);
+      }
+    }
+
+    // --------------------------------------------------------
     // REAL AI MATCH TEST
     // POST JSON:
     // {
@@ -842,7 +914,7 @@ export default {
     return json({
       success: false,
       error: "NOT_FOUND",
-      endpoints: ["GET /", "GET /live-test", "GET /test-como", "POST /match"]
+      endpoints: ["GET /", "GET /live-test", "GET /test-como", "GET /match-get?home=...&away=...", "POST /match"]
     }, 404);
   }
 };
