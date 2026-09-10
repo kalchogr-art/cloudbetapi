@@ -13,7 +13,11 @@
     {
       "binding": "DB",
       "database_name": "ai-matcher-db",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+      "database_id": ""d1_databases": [{
+    "binding": "DB",
+    "database_name": "d1-template-database",
+    "database_id": "379c05b1-2779-4c26-b07e-f6cf05675d62"
+ }]"
     }
   ],
   "services": [
