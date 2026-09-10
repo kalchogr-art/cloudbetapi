@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7.6.9
+// CLOUDBET MATCH MATCHER V7.6.10
 // CANDIDATE RANKING + D1 DIAGNOSTICS + SEPARATE ODDS LOOKUP
 // LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
 // V27 SERVICE BINDING + DIRECT CLOUDBET PUBLIC SPORTS API
@@ -26,6 +26,17 @@
 //
 // - /diagnostic
 //   -> light V27 + Cloudbet diagnostic
+//
+// V7.6.10 FIXES:
+// - youth marker may be missing on one provider side when the competition itself confirms a youth event
+// - conflicting youth ages remain blocked (U19 != U20)
+// - youth fallback never applies to a known senior competition
+// - women's and reserve protections remain hard category gates
+// - safe trailing club founding-year suffix normalization: "Como 1907" -> "Como"
+// - leading/core numeric club identities such as "1860 Munich" are NOT stripped
+// - contextual category compatibility is used inside the actual team score, not only in outer candidate filters
+// - V7.6.9 category profile + V7.6.8 RAW LIVE recovery remain enabled
+// - no global similarity threshold reduction and no betting logic
 //
 // V7.6.9 FIXES:
 // - category is now a profile instead of one mutually-exclusive label
@@ -120,7 +131,7 @@ interface Env {
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.6.9-NATIONAL-YOUTH-GENDER-CATEGORY-NORMALIZATION";
+  "V7.6.10-YOUTH-COMPETITION-FALLBACK-CLUB-YEAR-NORMALIZATION";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -622,14 +633,38 @@ function stripProviderGeoSuffix(
 }
 
 
+function stripSafeTrailingClubYear(
+  value: any
+): string {
+
+  const raw =
+    String(
+      value ?? ""
+    ).trim();
+
+  // Provider legal/brand form example:
+  //   Como 1907 -> Como
+  //
+  // Only a TRAILING 4-digit year in the 18xx/19xx/20xx range is removed,
+  // and only when an alphabetic club-name core precedes it.
+  // Therefore identities such as "1860 Munich" are untouched.
+  return raw.replace(
+    /(?<=[A-Za-zÀ-ÖØ-öø-ÿ])\s+(?:18|19|20)\d{2}\s*$/u,
+    ""
+  ).trim();
+}
+
+
 function normalizeTeam(
   value: any
 ): string {
 
   let s =
     normalizeText(
-      stripProviderGeoSuffix(
-        value
+      stripSafeTrailingClubYear(
+        stripProviderGeoSuffix(
+          value
+        )
       )
     );
 
@@ -839,6 +874,143 @@ function categoryCompatible(
   if (
     A.reserve !==
     B.reserve
+  ) {
+    return false;
+  }
+
+  return true;
+}
+
+
+function competitionLooksYouth(
+  match: AnyObj
+): boolean {
+
+  const competition =
+    competitionText(
+      match
+    );
+
+  if (!competition) {
+    return false;
+  }
+
+  return (
+    /\byouth\b/.test(
+      competition
+    ) ||
+    /\bu\s*(?:17|18|19|20|21|23)\b/.test(
+      competition
+    ) ||
+    /\bunder\s*(?:17|18|19|20|21|23)\b/.test(
+      competition
+    )
+  );
+}
+
+
+function categoryCompatibleWithContext(
+  a: any,
+  b: any,
+  matchA: AnyObj,
+  matchB: AnyObj
+): boolean {
+
+  const A =
+    teamCategoryProfile(
+      a
+    );
+
+  const B =
+    teamCategoryProfile(
+      b
+    );
+
+  // Women and reserve remain hard dimensions.
+  if (
+    A.women !==
+    B.women
+  ) {
+    return false;
+  }
+
+  if (
+    A.reserve !==
+    B.reserve
+  ) {
+    return false;
+  }
+
+  // Same youth marker (including both null) is always compatible here.
+  if (
+    A.youth ===
+    B.youth
+  ) {
+    return true;
+  }
+
+  // Two explicit but different youth ages are NEVER recovered.
+  if (
+    A.youth &&
+    B.youth &&
+    A.youth !==
+      B.youth
+  ) {
+    return false;
+  }
+
+  // Exactly one provider omitted the youth marker.
+  const oneYouthMissing =
+    Boolean(
+      A.youth
+    ) !==
+    Boolean(
+      B.youth
+    );
+
+  if (
+    !oneYouthMissing
+  ) {
+    return false;
+  }
+
+  // Competition context must positively identify this as a youth event.
+  const aYouthCompetition =
+    competitionLooksYouth(
+      matchA
+    );
+
+  const bYouthCompetition =
+    competitionLooksYouth(
+      matchB
+    );
+
+  if (
+    !aYouthCompetition &&
+    !bYouthCompetition
+  ) {
+    return false;
+  }
+
+  const compA =
+    competitionText(
+      matchA
+    );
+
+  const compB =
+    competitionText(
+      matchB
+    );
+
+  // If both providers expose competition names, they still have to agree.
+  if (
+    compA &&
+    compB &&
+    competitionSimilarity(
+      matchA,
+      matchB
+    ) <
+      STRONG_RECOVERY_MIN_COMPETITION_SCORE
   ) {
     return false;
   }
@@ -1092,7 +1264,9 @@ function acronymTeamMatch(
 
 function teamScore(
   a: any,
-  b: any
+  b: any,
+  matchA: AnyObj | null = null,
+  matchB: AnyObj | null = null
 ): number {
 
   const A =
@@ -1118,11 +1292,22 @@ function teamScore(
     return 1;
   }
 
+  const categoryOk =
+    matchA &&
+    matchB
+      ? categoryCompatibleWithContext(
+          a,
+          b,
+          matchA,
+          matchB
+        )
+      : categoryCompatible(
+          a,
+          b
+        );
+
   if (
-    !categoryCompatible(
-      a,
-      b
-    )
+    !categoryOk
   ) {
     return 0;
   }
@@ -1845,25 +2030,33 @@ function detailedMatchScore(
   const homeScore =
     teamScore(
       vHome,
-      cHome
+      cHome,
+      v27,
+      cb
     );
 
   const awayScore =
     teamScore(
       vAway,
-      cAway
+      cAway,
+      v27,
+      cb
     );
 
   const reverseHomeScore =
     teamScore(
       vHome,
-      cAway
+      cAway,
+      v27,
+      cb
     );
 
   const reverseAwayScore =
     teamScore(
       vAway,
-      cHome
+      cHome,
+      v27,
+      cb
     );
 
   const normal =
@@ -3836,8 +4029,21 @@ function evaluateContextFallback(
   const cbHome = extractHome(cb.raw) ?? "";
   const cbAway = extractAway(cb.raw) ?? "";
 
-  const homeCategoryOk = categoryCompatible(hunterHome, cbHome);
-  const awayCategoryOk = categoryCompatible(hunterAway, cbAway);
+  const homeCategoryOk =
+    categoryCompatibleWithContext(
+      hunterHome,
+      cbHome,
+      signal,
+      cb.raw
+    );
+
+  const awayCategoryOk =
+    categoryCompatibleWithContext(
+      hunterAway,
+      cbAway,
+      signal,
+      cb.raw
+    );
 
   const homeToken = sharedDistinctiveToken(hunterHome, cbHome);
   const awayToken = sharedDistinctiveToken(hunterAway, cbAway);
@@ -4780,23 +4986,31 @@ function rawLiveRecoveryForSignal(
     }
 
     const normalCategoryOk =
-      categoryCompatible(
+      categoryCompatibleWithContext(
         target.home,
-        cb.home
+        cb.home,
+        target.raw,
+        cb.raw
       ) &&
-      categoryCompatible(
+      categoryCompatibleWithContext(
         target.away,
-        cb.away
+        cb.away,
+        target.raw,
+        cb.raw
       );
 
     const reversedCategoryOk =
-      categoryCompatible(
+      categoryCompatibleWithContext(
         target.home,
-        cb.away
+        cb.away,
+        target.raw,
+        cb.raw
       ) &&
-      categoryCompatible(
+      categoryCompatibleWithContext(
         target.away,
-        cb.home
+        cb.home,
+        target.raw,
+        cb.raw
       );
 
     if (
@@ -4978,23 +5192,31 @@ function minuteUnknownRecoveryForSignal(
     }
 
     const normalCategoryOk =
-      categoryCompatible(
+      categoryCompatibleWithContext(
         target.home,
-        cb.home
+        cb.home,
+        target.raw,
+        cb.raw
       ) &&
-      categoryCompatible(
+      categoryCompatibleWithContext(
         target.away,
-        cb.away
+        cb.away,
+        target.raw,
+        cb.raw
       );
 
     const reversedCategoryOk =
-      categoryCompatible(
+      categoryCompatibleWithContext(
         target.home,
-        cb.away
+        cb.away,
+        target.raw,
+        cb.raw
       ) &&
-      categoryCompatible(
+      categoryCompatibleWithContext(
         target.away,
-        cb.home
+        cb.home,
+        target.raw,
+        cb.raw
       );
 
     if (
@@ -5184,13 +5406,17 @@ function strongRecoveryForSignal(
     }
 
     if (
-      !categoryCompatible(
+      !categoryCompatibleWithContext(
         target.home,
-        cb.home
+        cb.home,
+        target.raw,
+        cb.raw
       ) ||
-      !categoryCompatible(
+      !categoryCompatibleWithContext(
         target.away,
-        cb.away
+        cb.away,
+        target.raw,
+        cb.raw
       )
     ) {
       continue;
