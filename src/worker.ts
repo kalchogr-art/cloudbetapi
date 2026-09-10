@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7.6.5
+// CLOUDBET MATCH MATCHER V7.6.6
 // CANDIDATE RANKING + D1 DIAGNOSTICS + SEPARATE ODDS LOOKUP
 // LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
 // V27 SERVICE BINDING + DIRECT CLOUDBET PUBLIC SPORTS API
@@ -26,6 +26,18 @@
 //
 // - /diagnostic
 //   -> light V27 + Cloudbet diagnostic
+//
+// V7.6.6 FIXES:
+// - strips provider-only trailing geographic tags: (Bra), (Ecu), (Jam), (Cos), (Sur), (Hai), (GO), etc.
+// - preserves (W), U20/U21 and reserve category protection
+// - canonical Brazilian provider aliases: Atletico-MG, America-MG, Operario-PR, Botafogo-SP
+// - D.C. United punctuation recovery
+// - LDU Quito / Liga Deportiva Universitaria recovery
+// - Real Cundinamarca / Real Soacha Cundinamarca recovery
+// - Inter Bogota / Internacional de Bogota recovery
+// - CRB / Clube de Regatas Brasil recovery
+// - existing strict two-sided, category, competition, minute and ambiguity protections remain enabled
+// - no global threshold reduction
 //
 // V7.6.5 FIXES:
 // - provider abbreviation recovery: QPR <-> Queens Park Rangers
@@ -73,7 +85,7 @@ interface Env {
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.6.5-NAME-NORMALIZATION-ACRONYM-FIX";
+  "V7.6.6-PROVIDER-CORE-NAME-RECOVERY";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -372,6 +384,64 @@ const TEAM_ALIASES:
   "schwarz weiss bregenz":
     "schwarz weiss bregenz",
 
+  // V7.6.6 provider/canonical variants
+  "atletico mg":
+    "atletico mineiro",
+
+  "atletico mineiro mg":
+    "atletico mineiro",
+
+  "america mg":
+    "america mineiro",
+
+  "america mineiro mg":
+    "america mineiro",
+
+  "operario pr":
+    "operario ferroviario",
+
+  "operario ferroviario":
+    "operario ferroviario",
+
+  "botafogo sp":
+    "botafogo ribeirao preto",
+
+  "botafogo ribeirao preto":
+    "botafogo ribeirao preto",
+
+  "d c united":
+    "dc united",
+
+  "dc united":
+    "dc united",
+
+  "ldu quito":
+    "liga deportiva universitaria quito",
+
+  "liga deportiva universitaria de quito":
+    "liga deportiva universitaria quito",
+
+  "liga de quito":
+    "liga deportiva universitaria quito",
+
+  "real cundinamarca":
+    "real cundinamarca",
+
+  "real soacha cundinamarca":
+    "real cundinamarca",
+
+  "inter bogota":
+    "inter bogota",
+
+  "internacional de bogota":
+    "inter bogota",
+
+  "crb":
+    "clube regatas brasil",
+
+  "clube de regatas brasil":
+    "clube regatas brasil",
+
   // Bulgaria
   "dunav ruse":
     "dunav 2010",
@@ -486,13 +556,38 @@ function applyAlias(
 }
 
 
+function stripProviderGeoSuffix(
+  value: any
+): string {
+
+  // Flashscore/provider labels such as:
+  //   Palmeiras (Bra)
+  //   LDU Quito (Ecu)
+  //   Portmore (Jam)
+  //   Goiania EC (GO)
+  //
+  // Only 2-3 alphabetic characters in trailing parentheses are removed.
+  // This intentionally does NOT remove (W), U20, U21, "Reserve", etc.
+  return String(
+    value ?? ""
+  )
+    .replace(
+      /\s*\([A-Za-z]{2,3}\)\s*$/u,
+      ""
+    )
+    .trim();
+}
+
+
 function normalizeTeam(
   value: any
 ): string {
 
   let s =
     normalizeText(
-      value
+      stripProviderGeoSuffix(
+        value
+      )
     );
 
   if (!s) {
@@ -940,6 +1035,40 @@ function teamScore(
     )
   ) {
     return 0.96;
+  }
+
+  // V7.6.6 provider-core rescue.
+  // If one provider adds exactly one non-distinctive/regional token around
+  // the same distinctive club core, keep the side strong without lowering
+  // the global threshold. This is intentionally capped below exact/alias.
+  const providerCoreA =
+    A.split(" ")
+      .filter(Boolean);
+
+  const providerCoreB =
+    B.split(" ")
+      .filter(Boolean);
+
+  const sharedProviderCore =
+    providerCoreA
+      .filter(
+        token =>
+          providerCoreB.includes(token) &&
+          isDistinctiveTeamToken(token)
+      );
+
+  if (
+    sharedProviderCore.length >= 1 &&
+    Math.min(
+      providerCoreA.length,
+      providerCoreB.length
+    ) === 1 &&
+    Math.max(
+      providerCoreA.length,
+      providerCoreB.length
+    ) <= 3
+  ) {
+    return 0.92;
   }
 
   const aTokens =
