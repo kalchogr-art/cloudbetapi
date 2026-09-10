@@ -1,5 +1,5 @@
 // ============================================================
-// CLOUDBET MATCH MATCHER V7.6.6
+// CLOUDBET MATCH MATCHER V7.6.7
 // CANDIDATE RANKING + D1 DIAGNOSTICS + SEPARATE ODDS LOOKUP
 // LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
 // V27 SERVICE BINDING + DIRECT CLOUDBET PUBLIC SPORTS API
@@ -26,6 +26,15 @@
 //
 // - /diagnostic
 //   -> light V27 + Cloudbet diagnostic
+//
+// V7.6.7 FIXES:
+// - FAST_HUNTER no longer discards an otherwise valid LIVE + 1H + 0:0 event only because Cloudbet minute is missing
+// - normal strict pass is STILL +/-5 minutes and still requires a known compatible Cloudbet minute
+// - new MINUTE_UNKNOWN recovery runs only when the normal minute window has zero candidates
+// - MINUTE_UNKNOWN recovery requires very strong two-sided identity, compatible categories, competition agreement when known, and an unambiguous best candidate
+// - known Cloudbet clock drift still uses the existing capped STRONG EVENT RECOVERY (max +/-15)
+// - /live and other public eligible-event paths keep the original valid-minute requirement
+// - no global threshold reduction, no fuzzy one-sided auto-accept, no betting logic
 //
 // V7.6.6 FIXES:
 // - strips provider-only trailing geographic tags: (Bra), (Ecu), (Jam), (Cos), (Sur), (Hai), (GO), etc.
@@ -85,7 +94,7 @@ interface Env {
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.6.6-PROVIDER-CORE-NAME-RECOVERY";
+  "V7.6.7-MINUTE-UNKNOWN-CLOCK-DRIFT-RECOVERY";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -2323,6 +2332,34 @@ function isHunterEligibleCloudbetEvent(
 }
 
 
+
+// ============================================================
+// V7.6.7 FAST_HUNTER DISCOVERY ELIGIBILITY
+// ============================================================
+//
+// The public /live path keeps isHunterEligibleCloudbetEvent(), which
+// still requires a usable Cloudbet minute. FAST_HUNTER needs a wider
+// discovery pool so a missing Cloudbet clock cannot hide the correct
+// event before team names are compared.
+//
+function isFastHunterDiscoveryEvent(
+  event: AnyObj
+): boolean {
+
+  return (
+    isCloudbetLive(
+      event
+    ) &&
+    isCloudbetFirstHalf(
+      event
+    ) &&
+    isCloudbetZeroZero(
+      event
+    )
+  );
+}
+
+
 function minuteDifference(
   signal: AnyObj,
   event: AnyObj
@@ -3753,6 +3790,155 @@ function findHunterTargetMatch(
     if (
       minuteCandidates === 0
     ) {
+      // V7.6.7 — first recover events whose Cloudbet clock is completely
+      // missing. This path is stricter than the normal matcher and never
+      // invents a minute.
+      const minuteUnknownRecovery =
+        minuteUnknownRecoveryForSignal(
+          signal,
+          target,
+          cloudbet
+        );
+
+      if (
+        minuteUnknownRecovery?.accepted &&
+        minuteUnknownRecovery.best
+      ) {
+        const recovered =
+          minuteUnknownRecovery.best;
+
+        return {
+          found:
+            true,
+          best:
+            recovered.cb,
+          second:
+            minuteUnknownRecovery.second?.cb ??
+            null,
+          detail:
+            recovered.detail,
+          secondDetail:
+            minuteUnknownRecovery.second?.detail ??
+            null,
+          classification:
+            "CONFIDENT_MATCH",
+          reason:
+            "MINUTE_UNKNOWN_RECOVERY_CONFIDENT_MATCH",
+          matchMode:
+            "MINUTE_UNKNOWN_RECOVERY",
+          contextFallback: {
+            accepted:
+              false
+          },
+          minuteUnknownRecovery: {
+            accepted:
+              true,
+            candidates:
+              minuteUnknownRecovery.candidates,
+            cloudbet_minute:
+              null,
+            competition_score:
+              Number(
+                recovered.detail.competitionScore.toFixed(3)
+              ),
+            home_score:
+              Number(
+                recovered.detail.homeScore.toFixed(3)
+              ),
+            away_score:
+              Number(
+                recovered.detail.awayScore.toFixed(3)
+              ),
+            reverse_home_score:
+              Number(
+                recovered.detail.reverseHomeScore.toFixed(3)
+              ),
+            reverse_away_score:
+              Number(
+                recovered.detail.reverseAwayScore.toFixed(3)
+              ),
+            direction:
+              recovered.detail.direction,
+            total_score:
+              Number(
+                recovered.detail.total.toFixed(3)
+              ),
+            score_gap:
+              minuteUnknownRecovery.scoreGap
+          },
+          strongRecovery: {
+            accepted:
+              false
+          },
+          candidateEvaluations:
+            candidateEvaluations +
+            minuteUnknownRecovery.candidates,
+          candidates:
+            candidates.length,
+          minuteCandidates:
+            0,
+          targetMinute,
+          bestMinute:
+            null,
+          bestMinuteDifference:
+            null,
+          scoreGap:
+            minuteUnknownRecovery.scoreGap,
+          topCandidates: [
+            candidateDiagnosticRecord(
+              recovered.cb,
+              recovered.detail,
+              signal
+            )
+          ]
+        };
+      }
+
+      if (
+        minuteUnknownRecovery &&
+        minuteUnknownRecovery.accepted === false &&
+        minuteUnknownRecovery.reason === "MINUTE_UNKNOWN_RECOVERY_AMBIGUOUS"
+      ) {
+        const result =
+          emptyResult(
+            "MINUTE_UNKNOWN_RECOVERY_AMBIGUOUS",
+            targetMinute,
+            candidates.length,
+            0,
+            candidateEvaluations
+          );
+
+        return {
+          ...result,
+          matchMode:
+            "MINUTE_UNKNOWN_RECOVERY_REJECTED",
+          minuteUnknownRecovery: {
+            accepted:
+              false,
+            reason:
+              minuteUnknownRecovery.reason,
+            candidates:
+              minuteUnknownRecovery.candidates,
+            score_gap:
+              minuteUnknownRecovery.scoreGap,
+            best_event_id:
+              minuteUnknownRecovery.best
+                ? cloudbetEventId(
+                    minuteUnknownRecovery.best.cb.raw
+                  )
+                : null,
+            second_event_id:
+              minuteUnknownRecovery.second
+                ? cloudbetEventId(
+                    minuteUnknownRecovery.second.cb.raw
+                  )
+                : null
+          }
+        };
+      }
+
+      // Existing V7.6.4 recovery handles a KNOWN Cloudbet clock that is
+      // outside +/-5 but not more than the hard +/-15 cap.
       const recovery =
         strongRecoveryForSignal(
           signal,
@@ -4031,6 +4217,204 @@ function findHunterTargetMatch(
 
 
 // ============================================================
+// V7.6.7 MINUTE UNKNOWN EVENT RECOVERY
+// ============================================================
+//
+// This recovery exists for the specific failure mode:
+//   NO_CLOUDBET_CANDIDATE_WITHIN_MINUTE_WINDOW
+// caused by Cloudbet omitting the live minute.
+//
+// Safety:
+// - event is already LIVE + 1H + 0:0
+// - Cloudbet minute MUST be null
+// - both team sides must be very strong in NORMAL or REVERSED direction
+// - category compatibility is mandatory
+// - competition must agree when both providers expose it
+// - ambiguous top candidates are rejected
+//
+function minuteUnknownRecoveryForSignal(
+  signal: AnyObj,
+  target: PreparedMatch,
+  cloudbet: PreparedMatch[]
+): AnyObj | null {
+
+  const ranked:
+    {
+      cb: PreparedMatch;
+      detail: AnyObj;
+      score: number;
+      minute: null;
+      minuteDifference: null;
+    }[] = [];
+
+  for (
+    const cb
+    of cloudbet
+  ) {
+
+    if (
+      !cb ||
+      !cb.raw
+    ) {
+      continue;
+    }
+
+    if (
+      cloudbetMinute(
+        cb.raw
+      ) !== null
+    ) {
+      continue;
+    }
+
+    const normalCategoryOk =
+      categoryCompatible(
+        target.home,
+        cb.home
+      ) &&
+      categoryCompatible(
+        target.away,
+        cb.away
+      );
+
+    const reversedCategoryOk =
+      categoryCompatible(
+        target.home,
+        cb.away
+      ) &&
+      categoryCompatible(
+        target.away,
+        cb.home
+      );
+
+    if (
+      !normalCategoryOk &&
+      !reversedCategoryOk
+    ) {
+      continue;
+    }
+
+    const detail =
+      detailedMatchScore(
+        target.raw,
+        cb.raw
+      );
+
+    const normalStrong =
+      normalCategoryOk &&
+      detail.direction === "NORMAL" &&
+      detail.homeScore >= STRONG_RECOVERY_MIN_SIDE_SCORE &&
+      detail.awayScore >= STRONG_RECOVERY_MIN_SIDE_SCORE;
+
+    const reversedStrong =
+      reversedCategoryOk &&
+      detail.direction === "REVERSED" &&
+      detail.reverseHomeScore >= STRONG_RECOVERY_MIN_SIDE_SCORE &&
+      detail.reverseAwayScore >= STRONG_RECOVERY_MIN_SIDE_SCORE;
+
+    if (
+      !normalStrong &&
+      !reversedStrong
+    ) {
+      continue;
+    }
+
+    if (
+      detail.total < STRONG_RECOVERY_MIN_TOTAL_SCORE
+    ) {
+      continue;
+    }
+
+    const targetCompetition =
+      competitionText(
+        target.raw
+      );
+
+    const cbCompetition =
+      competitionText(
+        cb.raw
+      );
+
+    if (
+      targetCompetition &&
+      cbCompetition &&
+      detail.competitionScore < STRONG_RECOVERY_MIN_COMPETITION_SCORE
+    ) {
+      continue;
+    }
+
+    ranked.push({
+      cb,
+      detail,
+      score:
+        detail.total,
+      minute:
+        null,
+      minuteDifference:
+        null
+    });
+  }
+
+  ranked.sort(
+    (a, b) =>
+      b.score - a.score
+  );
+
+  if (
+    ranked.length === 0
+  ) {
+    return null;
+  }
+
+  const best =
+    ranked[0];
+
+  const second =
+    ranked.length > 1
+      ? ranked[1]
+      : null;
+
+  const scoreGap =
+    second
+      ? Math.max(
+          0,
+          best.score -
+          second.score
+        )
+      : 1;
+
+  if (
+    second &&
+    scoreGap < STRONG_RECOVERY_MIN_SCORE_GAP
+  ) {
+    return {
+      accepted:
+        false,
+      reason:
+        "MINUTE_UNKNOWN_RECOVERY_AMBIGUOUS",
+      best,
+      second,
+      scoreGap,
+      candidates:
+        ranked.length
+    };
+  }
+
+  return {
+    accepted:
+      true,
+    reason:
+      "MINUTE_UNKNOWN_RECOVERY_CONFIDENT_MATCH",
+    best,
+    second,
+    scoreGap,
+    candidates:
+      ranked.length
+  };
+}
+
+
+// ============================================================
 // V7.6.4 STRONG EVENT RECOVERY
 // ============================================================
 
@@ -4079,7 +4463,8 @@ function strongRecoveryForSignal(
       );
 
     // Normal +/-5 minute candidates are handled by the strict matcher.
-    // Recovery is ONLY for candidates outside that window, with a hard cap.
+    // Missing-minute candidates are handled by V7.6.7 MINUTE_UNKNOWN recovery.
+    // This recovery is ONLY for KNOWN minutes outside +/-5, with a hard cap.
     if (
       diff === null ||
       diff <= MATCH_MINUTE_TOLERANCE ||
@@ -4652,11 +5037,15 @@ async function runFastHunter(
     Date.now() -
     discoveryStarted;
 
-  // HARD PRE-FILTER:
-  // LIVE + FIRST HALF + 0:0 + valid minute.
+  // V7.6.7 FAST_HUNTER PRE-FILTER:
+  // LIVE + FIRST HALF + 0:0.
+  //
+  // Do NOT discard an event here only because Cloudbet minute is missing.
+  // The normal matcher still requires +/-5 minute compatibility.
+  // Minute-unknown events are considered only by the strict recovery path.
   const cloudbetLive =
     rawCloudbet.filter(
-      isHunterEligibleCloudbetEvent
+      isFastHunterDiscoveryEvent
     );
 
   const prepareStarted =
