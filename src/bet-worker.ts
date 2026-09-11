@@ -131,11 +131,23 @@ type Obj = Record<string, any>;
 // - No fuzzy event fallback and no betting threshold was lowered.
 
 // ============================================================
+// V7.6.22 — AI WAIT + ODDS HOLD FIX
+//
+// - Temporary AI /resolve failures => WAITING_AI, not final rejection.
+// - Missing AI history => pending until next cron, not skipped/rejected.
+// - Accepted AI match + unavailable exact odds => persistent PENDING_ODDS.
+// - Existing pending_odds row owns retries; /run does not duplicate checks.
+// - Terminal failures (goal, 1H ended, outside window, changed event) do not retry.
+// - SAME AI event_id / exact 1H O0.5 / all final safety gates preserved.
+// - NORMAL BETTING REMAINS OFF; existing one-shot keys are NOT rearmed.
+// ============================================================
+
+// ============================================================
 // CONFIG
 // ============================================================
 
 const VERSION =
-  "V7.6.21 DIRECT PREFLIGHT SIGNAL ENRICH FIX - BETTING OFF";
+  "V7.6.22 AI WAIT + ODDS HOLD FIX - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -1255,6 +1267,99 @@ function findAiHistoryMatch(
     category_guard_ok: categoryGuardOk,
     cache_hit: true,
     raw: row
+  };
+}
+
+
+function isAiResolutionPending(
+  aiMatch: AiMatchResolution | null | undefined
+): boolean {
+  if (!aiMatch) return true;
+
+  const reason =
+    safe(aiMatch.reason).toUpperCase();
+
+  if (reason === "AI_MATCHER_BINDING_MISSING") {
+    return false;
+  }
+
+  if (reason === "AI_MATCH_PENDING_HISTORY") {
+    return true;
+  }
+
+  if (!aiMatch.ok) {
+    return true;
+  }
+
+  return (
+    reason.includes("TIMEOUT") ||
+    reason.includes("ABORT") ||
+    reason.includes("TEMPORAR") ||
+    reason.startsWith("AI_MATCHER_HTTP_")
+  );
+}
+
+const TERMINAL_PREFLIGHT_ERRORS =
+  new Set([
+    "CLOUDBET_EVENT_ID_CHANGED",
+    "SCORE_NOT_0_0",
+    "FIRST_HALF_ENDED",
+    "OUTSIDE_HUNTER_MINUTE_WINDOW",
+    "HUNTER_ENTRY_MINUTE_OUTSIDE_WINDOW",
+    "EVENT_FINISHED",
+    "NOT_FIRST_HALF",
+    "MINUTE_OVER_45"
+  ]);
+
+function isTerminalPreflightFailure(
+  reason: any
+): boolean {
+  return TERMINAL_PREFLIGHT_ERRORS.has(
+    safe(reason)
+  );
+}
+
+async function pendingOddsExists(
+  env: Env,
+  cloudbetIdInput: any
+): Promise<boolean> {
+  const cloudbetId =
+    normalizeEventId(cloudbetIdInput);
+
+  if (!cloudbetId) return false;
+
+  const row =
+    await env.DB
+      .prepare(`
+        SELECT id
+        FROM pending_odds
+        WHERE cloudbet_id = ?
+        LIMIT 1
+      `)
+      .bind(cloudbetId)
+      .first();
+
+  return !!row;
+}
+
+async function removePendingRow(
+  env: Env,
+  rowId: any,
+  reason: string
+): Promise<any> {
+  if (rowId !== null && rowId !== undefined) {
+    await env.DB
+      .prepare(`
+        DELETE FROM pending_odds
+        WHERE id = ?
+      `)
+      .bind(rowId)
+      .run();
+  }
+
+  return {
+    action: "REMOVED_TERMINAL",
+    error: reason
   };
 }
 
@@ -4310,23 +4415,13 @@ async function processPending(
     if (
       !current.success
     ) {
-      const invalidEventReasons =
-        new Set([
-          "CLOUDBET_EVENT_ID_CHANGED",
-          "SCORE_NOT_0_0",
-          "NOT_FIRST_HALF",
-          "EVENT_FINISHED",
-          "MINUTE_OVER_45"
-        ]);
-
       const result =
-        invalidEventReasons.has(
-          current.error ||
-          ""
+        isTerminalPreflightFailure(
+          current.error
         )
-          ? await incrementPendingMissing(
+          ? await removePendingRow(
               env,
-              row,
+              row.id,
               current.error ||
               "EVENT_NO_LONGER_VALID"
             )
@@ -4350,7 +4445,9 @@ async function processPending(
         result.action ===
           "EXPIRED" ||
         result.action ===
-          "REMOVED_MISSING"
+          "REMOVED_MISSING" ||
+        result.action ===
+          "REMOVED_TERMINAL"
       ) {
         expired++;
       } else {
@@ -7269,17 +7366,23 @@ async function runDirectPreflight(
     );
 
   if (!aiMatch.ok || !aiMatch.accepted || !aiMatch.event_id) {
+    const aiPending =
+      isAiResolutionPending(aiMatch);
+
     return {
-      success: false,
+      success: aiPending,
       worker: "cloudbet-bet-worker",
       version: VERSION,
-      action: "DIRECT_PREFLIGHT",
+      action: aiPending ? "WAITING_AI" : "DIRECT_PREFLIGHT",
       ready: false,
+      pending: aiPending,
       requested_event_id: requestedEventId,
       event_id: aiMatch.event_id,
       reason:
-        aiMatch.reason ||
-        "AI_MATCH_NOT_ACCEPTED",
+        aiPending
+          ? "AI_MATCH_PENDING"
+          : (aiMatch.reason || "AI_MATCH_NOT_ACCEPTED"),
+      ai_reason: aiMatch.reason || null,
       ai_match: aiMatch,
       signal_sent_to_ai: {
         match_id: signal?.match_id ?? null,
@@ -7315,6 +7418,27 @@ async function runDirectPreflight(
     );
 
   if (!current.success) {
+    if (isTerminalPreflightFailure(current.error)) {
+      return {
+        success: true,
+        worker: "cloudbet-bet-worker",
+        version: VERSION,
+        mode: MODE,
+        dry_run: DRY_RUN,
+        betting_enabled: BETTING_ENABLED,
+        action: "NOT_ELIGIBLE",
+        ready: false,
+        pending: false,
+        event_id: eventId,
+        match: signalMatch(signal),
+        reason: current.error || "EVENT_NO_LONGER_ELIGIBLE",
+        current,
+        ai_match: aiMatch,
+        requested_event_id: requestedEventId,
+        processing_ms: Date.now() - started
+      };
+    }
+
     const pendingExecutionId = crypto.randomUUID();
     const saved = await savePending(
       env,
@@ -7333,6 +7457,7 @@ async function runDirectPreflight(
       betting_enabled: BETTING_ENABLED,
       action: "PENDING_ODDS",
       ready: false,
+      pending: true,
       event_id: eventId,
       match: signalMatch(signal),
       reason: current.error || "TARGET_ODDS_NOT_AVAILABLE",
@@ -7342,7 +7467,7 @@ async function runDirectPreflight(
       account,
       account_balance: numberOrNull(account?.balance),
       current,
-      pending: saved,
+      pending_odds: saved,
       ai_match: aiMatch,
       requested_event_id: requestedEventId,
       source: {
@@ -7525,6 +7650,7 @@ async function runWorker(
 
   const ready: any[] = [];
   const pending: any[] = [];
+  const pendingAi: any[] = [];
   const skipped: any[] = [];
   const errors: any[] = [];
 
@@ -7545,6 +7671,7 @@ async function runWorker(
 
   let aiResolved = 0;
   let aiAccepted = 0;
+  let aiPending = 0;
   let aiRejected = 0;
 
   for (const signal of hunterSignals) {
@@ -7565,17 +7692,30 @@ async function runWorker(
         !aiMatch.accepted ||
         !aiMatch.event_id
       ) {
-        aiRejected++;
-
-        skipped.push({
-          reason:
-            aiMatch.reason ||
-            "AI_MATCH_NOT_ACCEPTED",
-          signal,
-          ai_match: aiMatch,
-          previous_tracker_cloudbet:
-            previousTrackerCloudbet
-        });
+        if (isAiResolutionPending(aiMatch)) {
+          aiPending++;
+          pendingAi.push({
+            action: "WAITING_AI",
+            reason:
+              aiMatch.reason ||
+              "AI_MATCH_PENDING",
+            signal,
+            ai_match: aiMatch,
+            previous_tracker_cloudbet:
+              previousTrackerCloudbet
+          });
+        } else {
+          aiRejected++;
+          skipped.push({
+            reason:
+              aiMatch.reason ||
+              "AI_MATCH_NOT_ACCEPTED",
+            signal,
+            ai_match: aiMatch,
+            previous_tracker_cloudbet:
+              previousTrackerCloudbet
+          });
+        }
         continue;
       }
 
@@ -7592,6 +7732,25 @@ async function runWorker(
       const cloudbetId =
         trackerCloudbet.event_id!;
 
+      if (
+        await pendingOddsExists(
+          env,
+          cloudbetId
+        )
+      ) {
+        targetPending++;
+        pending.push({
+          action: "ALREADY_PENDING_ODDS",
+          cloudbet_id: cloudbetId,
+          ai_match: aiMatch,
+          previous_tracker_event_id:
+            previousTrackerCloudbet.event_id,
+          match: signalMatch(signal),
+          reason: "PENDING_QUEUE_OWNS_RETRY"
+        });
+        continue;
+      }
+
       const current =
         await verifySameEventAndOdds(
           env,
@@ -7603,6 +7762,19 @@ async function runWorker(
         );
 
       if (!current.success) {
+        if (isTerminalPreflightFailure(current.error)) {
+          skipped.push({
+            reason:
+              current.error ||
+              "EVENT_NO_LONGER_ELIGIBLE",
+            signal,
+            cloudbet_id: cloudbetId,
+            ai_match: aiMatch,
+            current
+          });
+          continue;
+        }
+
         const pendingExecutionId =
           crypto.randomUUID();
 
@@ -7627,9 +7799,9 @@ async function runWorker(
         }
 
         targetPending++;
-
         pending.push({
           execution_id: pendingExecutionId,
+          action: "PENDING_ODDS",
           cloudbet_id: cloudbetId,
           ai_match: aiMatch,
           previous_tracker_event_id:
@@ -7812,6 +7984,7 @@ async function runWorker(
       ai_history_rows: aiHistory.rows.length,
       ai_resolved: aiResolved,
       ai_accepted: aiAccepted,
+      ai_pending: aiPending,
       ai_rejected: aiRejected,
       tracker_ready: trackerReady,
       ready_to_bet: refreshedReady,
@@ -7824,6 +7997,7 @@ async function runWorker(
     pending_retry: pendingResult,
     ready,
     pending,
+    pending_ai: pendingAi,
     skipped,
     errors,
     auto_e2e_test: autoE2ETest,
