@@ -70,7 +70,13 @@ interface Env {
 
 type Obj = Record<string, any>;
 
-// V7.6.16 FIX:
+// V7.6.17 FIX:
+// - NEXT genuine DIRECT_PREFLIGHT BET READY can execute the existing AUTO E2E one-shot
+// - Real test stake remains exactly 0.10 USDT and globally one-shot guarded in D1
+// - Final fresh same-event validation now also receives Hunter entry_minute fallback
+// - Final event/score/period/minute/exact 1H O0.5/selection/odds/stake/balance/duplicate gates remain active
+//
+// // V7.6.16 FIX:
 // - DIRECT /preflight now passes Hunter entry_minute into verifySameEventAndOdds()
 // - If Cloudbet minute is unavailable, Hunter ENTRY minute may be used only inside 10-42
 // - SAME event_id, score, period, exact 1H O0.5, selection, odds, stake, balance and duplicate checks remain unchanged
@@ -89,7 +95,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.16 DIRECT PREFLIGHT MINUTE FALLBACK FIX 0.10 USDT";
+  "V7.6.17 NEXT BET READY AUTO E2E 0.10 USDT";
 
 const MODE =
   "DRY_RUN";
@@ -4981,7 +4987,15 @@ async function runAutoE2EOneShot(env: Env, signal: any, eventIdInput: any): Prom
   }
   if (!eventId) return { attempted: false, consumed: false, reason: "EVENT_ID_MISSING" };
 
-  const current = await verifySameEventAndOdds(env, eventId);
+  const current =
+    await verifySameEventAndOdds(
+      env,
+      eventId,
+      numberOrNull(
+        signal?.entry_minute ??
+        signal?.minute
+      )
+    );
   if (!current?.success) {
     return { attempted: false, consumed: false, reason: current?.error || "FINAL_EVENT_REFRESH_FAILED", event_id: eventId, current };
   }
@@ -6448,12 +6462,25 @@ async function runDirectPreflight(
   const handoff = buildTradingHandoff(bet, current, account);
   const ready = handoff?.ready_to_send === true;
 
-  // V7.6.7 SAFETY: normal preflight NEVER executes the real one-shot test.
-  // The only execution path is the explicit /real-test-010 route with confirmation.
-  const realTest = {
+  // V7.6.17: the NEXT genuinely BET READY direct-preflight signal may execute
+  // the existing globally guarded AUTO E2E one-shot test for exactly 0.10 USDT.
+  // runAutoE2EOneShot performs a fresh same-event validation immediately before POST.
+  let realTest: any = {
     attempted: false,
-    reason: "REAL_TEST_REQUIRES_EXPLICIT_CONFIRMED_ROUTE"
+    consumed: false,
+    reason: "NOT_READY_FOR_AUTO_E2E"
   };
+
+  if (
+    AUTO_E2E_TEST_ENABLED &&
+    ready === true
+  ) {
+    realTest = await runAutoE2EOneShot(
+      env,
+      signal,
+      eventId
+    );
+  }
 
   return {
     success: true,
