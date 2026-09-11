@@ -1,4 +1,16 @@
 // ============================================================
+// V1.3.2 HARD CATEGORY GUARD
+// - AI still sees all RAW Cloudbet live soccer events
+// - Missing Cloudbet minute/period remains allowed
+// - Final AI event_id is deterministically blocked on explicit:
+//     U19/U20/U21/etc mismatch
+//     Women vs Men mismatch
+//     Reserve / II / B-team / Academy vs Senior mismatch
+// - AI confidence cannot override a hard category conflict
+// - READ ONLY / NO BETTING
+// ============================================================
+
+// ============================================================
 // AI MATCHER — V1.0
 // RAW CLOUDBET LIVE SOCCER -> WORKERS AI MATCH IDENTITY
 // READ ONLY / NO BETTING
@@ -21,7 +33,7 @@ interface Env {
   TRACKER: any;
 }
 
-const VERSION = "AI-MATCHER-V1.3.1-COLLAPSIBLE-AI-REASON";
+const VERSION = "AI-MATCHER-V1.3.2-HARD-CATEGORY-GUARD";
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 const CLOUDBET_BASE = "https://www.cloudbet.com";
@@ -342,6 +354,158 @@ function compactCandidate(event: AnyObj, index: number): AnyObj {
   };
 }
 
+
+// ============================================================
+// HARD CATEGORY GUARD
+// ============================================================
+//
+// Purpose:
+// AI may identify aliases very well, but category identity must never be
+// overridden by AI confidence. These checks are deterministic and run
+// AFTER the final AI selection.
+//
+// IMPORTANT:
+// - Missing Cloudbet minute / period is NOT a rejection reason.
+// - Only explicit team-category conflicts are blocked.
+// - The guard compares HOME-to-HOME and AWAY-to-AWAY separately.
+// ============================================================
+
+type TeamCategoryProfile = {
+  youth_age: string | null;
+  women: boolean;
+  reserve: boolean;
+  reserve_marker: string | null;
+};
+
+function normalizedCategoryText(value: any): string {
+  return str(value)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[()[\]{}]/g, " ")
+    .replace(/[._-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function teamCategoryProfile(value: any): TeamCategoryProfile {
+  const raw = str(value);
+  const text = normalizedCategoryText(raw);
+
+  const youthMatch =
+    text.match(/(?:^|\s)u[\s-]?(\d{2})(?:\s|$)/i) ??
+    text.match(/(?:^|\s)under[\s-]?(\d{2})(?:\s|$)/i);
+
+  const youthAge = youthMatch ? `U${youthMatch[1]}` : null;
+
+  const women =
+    /(?:^|\s)(women|woman|womens|ladies|female|femenino|femenina)(?:\s|$)/i.test(text) ||
+    /(?:^|\s)w(?:\s|$)/i.test(text);
+
+  // Reserve / second-team markers.
+  // These are deliberately conservative to avoid treating numbers that are
+  // part of normal club names as reserve markers.
+  const reservePatterns: Array<[RegExp, string]> = [
+    [/(?:^|\s)(reserve|reserves|res)(?:\s|$)/i, "RESERVE"],
+    [/(?:^|\s)(academy)(?:\s|$)/i, "ACADEMY"],
+    [/(?:^|\s)(ii)(?:\s|$)/i, "II"],
+    [/(?:^|\s)(b team|team b)(?:\s|$)/i, "B_TEAM"],
+    [/\s+b\s*$/i, "B_SUFFIX"],
+    [/(?:^|\s)(second team)(?:\s|$)/i, "SECOND_TEAM"]
+  ];
+
+  let reserve = false;
+  let reserveMarker: string | null = null;
+
+  for (const [pattern, marker] of reservePatterns) {
+    if (pattern.test(text)) {
+      reserve = true;
+      reserveMarker = marker;
+      break;
+    }
+  }
+
+  return {
+    youth_age: youthAge,
+    women,
+    reserve,
+    reserve_marker: reserveMarker
+  };
+}
+
+function compareTeamCategory(
+  hunterTeam: any,
+  cloudbetTeam: any,
+  side: "HOME" | "AWAY"
+): AnyObj | null {
+  const hunter = teamCategoryProfile(hunterTeam);
+  const cloudbet = teamCategoryProfile(cloudbetTeam);
+
+  // Explicit youth age mismatch OR youth only on one side.
+  if (hunter.youth_age !== cloudbet.youth_age) {
+    if (hunter.youth_age || cloudbet.youth_age) {
+      return {
+        side,
+        type: "YOUTH_CATEGORY_CONFLICT",
+        hunter_team: str(hunterTeam),
+        cloudbet_team: str(cloudbetTeam),
+        hunter_category: hunter,
+        cloudbet_category: cloudbet
+      };
+    }
+  }
+
+  // Women must agree when explicitly present.
+  if (hunter.women !== cloudbet.women) {
+    return {
+      side,
+      type: "WOMEN_CATEGORY_CONFLICT",
+      hunter_team: str(hunterTeam),
+      cloudbet_team: str(cloudbetTeam),
+      hunter_category: hunter,
+      cloudbet_category: cloudbet
+    };
+  }
+
+  // Reserve / II / B / Academy must agree when explicitly present.
+  if (hunter.reserve !== cloudbet.reserve) {
+    return {
+      side,
+      type: "RESERVE_CATEGORY_CONFLICT",
+      hunter_team: str(hunterTeam),
+      cloudbet_team: str(cloudbetTeam),
+      hunter_category: hunter,
+      cloudbet_category: cloudbet
+    };
+  }
+
+  return null;
+}
+
+function hardCategoryGuard(signal: AnyObj, candidate: AnyObj): AnyObj {
+  const conflicts: AnyObj[] = [];
+
+  const homeConflict = compareTeamCategory(
+    signal?.home,
+    candidate?.home,
+    "HOME"
+  );
+
+  const awayConflict = compareTeamCategory(
+    signal?.away,
+    candidate?.away,
+    "AWAY"
+  );
+
+  if (homeConflict) conflicts.push(homeConflict);
+  if (awayConflict) conflicts.push(awayConflict);
+
+  return {
+    ok: conflicts.length === 0,
+    conflicts
+  };
+}
+
 // ============================================================
 // AI
 // ============================================================
@@ -396,7 +560,7 @@ function systemPrompt(): string {
     "Examples of legitimate naming differences can include Levski Sofia vs Levski 1914, PSG vs Paris Saint-Germain, or Como U19 vs a provider club label that omits U19 when the competition context clearly establishes a youth fixture.",
     "Do NOT invent an event_id.",
     "Do NOT select a candidate just because one team matches.",
-    "Do NOT treat different youth ages, women vs men, reserve vs senior, or clearly different clubs as the same fixture.",
+    "Do NOT treat different youth ages, women vs men, reserve/II/B/Academy vs senior, or clearly different clubs as the same fixture.",
     "Competition, minute, period and score are supporting context only. Missing metadata is not by itself a reason to reject an otherwise clear identity match.",
     "Never discuss betting or whether a wager should be placed.",
     "Return JSON only. No markdown and no text outside the JSON.",
@@ -601,6 +765,40 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
   }
 
   const candidate = finalChecked.candidate;
+
+  // V1.3.2 HARD CATEGORY GUARD
+  // AI confidence can NEVER override an explicit category conflict.
+  const categoryGuard = hardCategoryGuard(signal, candidate);
+
+  if (!categoryGuard.ok) {
+    const firstConflict = categoryGuard.conflicts[0] ?? null;
+
+    return {
+      matched: true,
+      accepted: false,
+      event_id: finalChecked.event_id,
+      confidence: finalChecked.confidence,
+      threshold: AI_ACCEPT_CONFIDENCE,
+      reason: firstConflict
+        ? `HARD_CATEGORY_GUARD:${firstConflict.type}:${firstConflict.side}`
+        : "HARD_CATEGORY_GUARD",
+      ai_reason: finalChecked.reason,
+      cloudbet_match: `${candidate.home} v ${candidate.away}`,
+      candidate,
+      category_guard: categoryGuard,
+      diagnostics: {
+        raw_events: rawEvents.length,
+        usable_candidates: candidates.length,
+        batches: batches.length,
+        ai_calls: batches.length + 1,
+        finalists: finalists.length,
+        final_processing_ms: finalAi.processing_ms,
+        final_usage: finalAi.usage,
+        batch_results: batchResults
+      }
+    };
+  }
+
   const accepted = finalChecked.confidence >= AI_ACCEPT_CONFIDENCE;
 
   return {
@@ -615,6 +813,7 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
     ai_reason: finalChecked.reason,
     cloudbet_match: `${candidate.home} v ${candidate.away}`,
     candidate,
+    category_guard: categoryGuard,
     diagnostics: {
       raw_events: rawEvents.length,
       usable_candidates: candidates.length,
