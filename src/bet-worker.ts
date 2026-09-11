@@ -147,7 +147,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.22 AI WAIT + ODDS HOLD FIX - BETTING OFF";
+  "V7.6.23 MATCHER SYNC + PENDING ODDS CALLBACK - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -4282,6 +4282,140 @@ async function archiveBet(
   }
 }
 
+
+// ============================================================
+// V7.6.23 — TRACKER CALLBACK FOR PENDING_ODDS -> FOUND
+// ============================================================
+
+async function notifyTrackerOddsFound(
+  env: Env,
+  row: any,
+  signal: any,
+  cloudbetId: string,
+  current: any
+): Promise<any> {
+
+  if (!env.TRACKER) {
+    return {
+      success: false,
+      reason:
+        "TRACKER_BINDING_MISSING"
+    };
+  }
+
+  const odds =
+    numberOrNull(
+      current?.odds ??
+      current?.price ??
+      current?.current_odds
+    );
+
+  if (
+    odds === null ||
+    odds <= 1
+  ) {
+    return {
+      success: false,
+      reason:
+        "ODDS_MISSING"
+    };
+  }
+
+  try {
+
+    const response =
+      await env.TRACKER.fetch(
+        new Request(
+          "https://tracker.internal/internal/odds-found",
+          {
+            method: "POST",
+            headers: {
+              "content-type":
+                "application/json",
+              "accept":
+                "application/json"
+            },
+            body:
+              JSON.stringify({
+                match_id:
+                  signal?.match_id ??
+                  signal?.id ??
+                  row?.match_id ??
+                  null,
+
+                signal_id:
+                  signal?.id ??
+                  null,
+
+                event_id:
+                  cloudbetId,
+
+                odds,
+
+                max_stake:
+                  numberOrNull(
+                    current?.max_stake ??
+                    current?.maxStake
+                  ),
+
+                cloudbet_match:
+                  current?.match ??
+                  current?.cloudbet_match ??
+                  null,
+
+                found_at:
+                  nowISO(),
+
+                source:
+                  "BET_WORKER_PENDING_RETRY"
+              })
+          }
+        )
+      );
+
+    const text =
+      await response.text();
+
+    let data: any =
+      null;
+
+    try {
+      data =
+        text
+          ? JSON.parse(text)
+          : null;
+    } catch {
+      data = {
+        raw:
+          text.slice(
+            0,
+            500
+          )
+      };
+    }
+
+    return {
+      success:
+        response.ok &&
+        data?.success !== false,
+      status:
+        response.status,
+      data
+    };
+
+  } catch (error) {
+
+    return {
+      success: false,
+      reason:
+        error instanceof Error
+          ? error.message
+          : String(error)
+    };
+  }
+}
+
+
 // ============================================================
 // PENDING RETRY
 // ============================================================
@@ -4534,6 +4668,17 @@ async function processPending(
       continue;
     }
 
+    // Persist the newly discovered real odds back into Hunter D1
+    // and send ONE Telegram reply to the original ENTRY.
+    const trackerNotification =
+      await notifyTrackerOddsFound(
+        env,
+        row,
+        signal,
+        cloudbetId,
+        current
+      );
+
     const handoff =
       buildTradingHandoff(
         bet,
@@ -4575,9 +4720,13 @@ async function processPending(
         cloudbetId,
       action:
         "READY_TO_BET",
+      odds_transition:
+        "PENDING_TO_FOUND",
       bet,
       handoff,
-      archive
+      archive,
+      tracker_notification:
+        trackerNotification
     });
   }
 
@@ -7359,13 +7508,62 @@ async function runDirectPreflight(
       enrichedInput
     );
 
+  const matcherSync =
+    enrichedInput?.matcher_sync &&
+    typeof enrichedInput.matcher_sync === "object"
+      ? enrichedInput.matcher_sync
+      : {};
+
+  const oldMatcherLocked =
+    matcherSync?.old_matcher_locked === true &&
+    requestedEventId !== null;
+
+  // V7.6.23:
+  // - secure deterministic matcher => AI verifies the SAME event only
+  // - no secure deterministic match => AI keeps its normal fallback search
+  const aiRequest = {
+    ...signal,
+    matcher_sync: {
+      ...matcherSync,
+      old_matcher_event_id:
+        requestedEventId ??
+        matcherSync?.old_matcher_event_id ??
+        null,
+      old_matcher_locked:
+        oldMatcherLocked
+    },
+    locked_event_id:
+      oldMatcherLocked
+        ? requestedEventId
+        : null,
+    resolve_mode:
+      oldMatcherLocked
+        ? "VERIFY_LOCKED_EVENT"
+        : "FALLBACK_SEARCH"
+  };
+
   const aiMatch =
     await resolveAiMatch(
       env,
-      signal
+      aiRequest
     );
 
-  if (!aiMatch.ok || !aiMatch.accepted || !aiMatch.event_id) {
+  const synchronizedEventId =
+    oldMatcherLocked
+      ? requestedEventId
+      : aiMatch.event_id;
+
+  // When the deterministic matcher locked an event, AI disagreement is
+  // diagnostic only. It is not allowed to replace or reject that identity.
+  // When there is no lock, existing AI acceptance rules remain mandatory.
+  if (
+    !oldMatcherLocked &&
+    (
+      !aiMatch.ok ||
+      !aiMatch.accepted ||
+      !aiMatch.event_id
+    )
+  ) {
     const aiPending =
       isAiResolutionPending(aiMatch);
 
@@ -7384,6 +7582,12 @@ async function runDirectPreflight(
           : (aiMatch.reason || "AI_MATCH_NOT_ACCEPTED"),
       ai_reason: aiMatch.reason || null,
       ai_match: aiMatch,
+      matcher_sync: {
+        old_matcher_locked:
+          false,
+        source:
+          "AI_FALLBACK"
+      },
       signal_sent_to_ai: {
         match_id: signal?.match_id ?? null,
         match: signal?.match ?? null,
@@ -7397,14 +7601,83 @@ async function runDirectPreflight(
     };
   }
 
+  if (!synchronizedEventId) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      action: "DIRECT_PREFLIGHT",
+      ready: false,
+      pending: false,
+      requested_event_id: requestedEventId,
+      event_id: null,
+      reason: "SYNCHRONIZED_EVENT_ID_MISSING",
+      ai_match: aiMatch,
+      processing_ms: Date.now() - started
+    };
+  }
+
+  const synchronizedAiMatch =
+    oldMatcherLocked
+      ? {
+          ...aiMatch,
+          event_id:
+            synchronizedEventId,
+          accepted:
+            aiMatch?.accepted === true &&
+            normalizeEventId(
+              aiMatch?.event_id
+            ) === synchronizedEventId,
+          synchronization_source:
+            (
+              aiMatch?.accepted === true &&
+              normalizeEventId(
+                aiMatch?.event_id
+              ) === synchronizedEventId
+            )
+              ? "OLD_MATCHER_AI_CONFIRMED"
+              : "OLD_MATCHER_LOCK"
+        }
+      : aiMatch;
+
   const trackerCloudbet =
-    buildAiSelectedCloudbetData(
-      signal,
-      aiMatch
-    );
+    oldMatcherLocked
+      ? {
+          event_id:
+            synchronizedEventId,
+          match:
+            safe(
+              aiMatch?.cloudbet_match ??
+              ""
+            ) || null,
+          entry_odds:
+            numberOrNull(
+              enrichedInput?.entry_odds
+            ),
+          max_stake:
+            numberOrNull(
+              enrichedInput?.max_stake
+            ),
+          odds_available:
+            numberOrNull(
+              enrichedInput?.entry_odds
+            ) !== null,
+          matcher_score:
+            numberOrNull(
+              matcherSync?.old_matcher_score ??
+              enrichedInput?.matcher_score
+            )
+        }
+      : buildAiSelectedCloudbetData(
+          signal,
+          aiMatch
+        );
 
   const eventId =
-    aiMatch.event_id;
+    synchronizedEventId;
+
+  const effectiveAiMatch =
+    synchronizedAiMatch;
 
   const account = await fetchAccountSnapshot(env);
   const current =
@@ -7433,7 +7706,7 @@ async function runDirectPreflight(
         match: signalMatch(signal),
         reason: current.error || "EVENT_NO_LONGER_ELIGIBLE",
         current,
-        ai_match: aiMatch,
+        ai_match: effectiveAiMatch,
         requested_event_id: requestedEventId,
         processing_ms: Date.now() - started
       };
@@ -7468,7 +7741,7 @@ async function runDirectPreflight(
       account_balance: numberOrNull(account?.balance),
       current,
       pending_odds: saved,
-      ai_match: aiMatch,
+      ai_match: effectiveAiMatch,
       requested_event_id: requestedEventId,
       source: {
         identity: "AI_MATCHER /resolve",
@@ -7548,7 +7821,7 @@ async function runDirectPreflight(
     handoff,
     archive,
     current,
-    ai_match: aiMatch,
+    ai_match: effectiveAiMatch,
     requested_event_id: requestedEventId,
     source: {
       identity: "AI_MATCHER /resolve",
