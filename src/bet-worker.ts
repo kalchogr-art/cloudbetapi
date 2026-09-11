@@ -71,7 +71,16 @@ interface Env {
 
 type Obj = Record<string, any>;
 
-// V7.6.19 AI MATCHER CONNECTION:
+// V7.6.20 FAST /run FIX:
+// - /run NO LONGER calls AI /resolve sequentially for every Hunter signal
+// - /run fetches AI Matcher /api/history ONCE and reads current V1.3.3 accepted matches
+// - This removes long browser hangs when many Hunter signals are present
+// - Direct /preflight can still use AI /resolve for one signal
+// - AI /resolve now has a hard timeout
+// - Existing betting/test code preserved
+// - NORMAL BETTING REMAINS DISABLED
+//
+// // V7.6.19 AI MATCHER CONNECTION:
 // - AI_MATCHER service binding is now the PRIMARY source of Cloudbet event_id
 // - Uses AI Matcher POST /resolve for Hunter fixture identity
 // - Requires AI accepted=true, confidence>=0.90 and category_guard.ok=true
@@ -116,7 +125,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.19 AI MATCHER PRIMARY IDENTITY - BETTING OFF";
+  "V7.6.20 FAST AI HISTORY RUN - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -197,6 +206,12 @@ const CLOUDBET_EVENT_PATH =
 
 const SERVICE_TIMEOUT_MS =
   10_000;
+
+const AI_MATCHER_TIMEOUT_MS =
+  12_000;
+
+const AI_HISTORY_LIMIT =
+  500;
 
 const ODDS_EVENT_MAX_RETRIES =
   20;
@@ -929,6 +944,15 @@ async function resolveAiMatch(
     };
   }
 
+  const controller =
+    new AbortController();
+
+  const timeout =
+    setTimeout(
+      () => controller.abort(),
+      AI_MATCHER_TIMEOUT_MS
+    );
+
   try {
     const response = await env.AI_MATCHER.fetch(
       new Request(
@@ -939,7 +963,8 @@ async function resolveAiMatch(
             "content-type": "application/json",
             "accept": "application/json"
           },
-          body: JSON.stringify(signal ?? {})
+          body: JSON.stringify(signal ?? {}),
+          signal: controller.signal
         }
       )
     );
@@ -1034,7 +1059,193 @@ async function resolveAiMatch(
       cache_hit: null,
       raw: null
     };
+  } finally {
+    clearTimeout(timeout);
   }
+}
+
+function aiHistorySignalIds(signal: any): string[] {
+  const ids = [
+    signal?.id,
+    signal?.signal_id,
+    signal?.match_id,
+    signal?.v27_id
+  ]
+    .map(value => safe(value))
+    .filter(Boolean);
+
+  return Array.from(new Set(ids));
+}
+
+async function fetchAiHistory(
+  env: Env
+): Promise<{
+  ok: boolean;
+  rows: any[];
+  error: string | null;
+}> {
+  if (!env.AI_MATCHER) {
+    return {
+      ok: false,
+      rows: [],
+      error: "AI_MATCHER_BINDING_MISSING"
+    };
+  }
+
+  const controller =
+    new AbortController();
+
+  const timeout =
+    setTimeout(
+      () => controller.abort(),
+      AI_MATCHER_TIMEOUT_MS
+    );
+
+  try {
+    const response =
+      await env.AI_MATCHER.fetch(
+        new Request(
+          `https://ai-matcher.internal/api/history?limit=${AI_HISTORY_LIMIT}`,
+          {
+            method: "GET",
+            headers: {
+              "accept": "application/json"
+            },
+            signal: controller.signal
+          }
+        )
+      );
+
+    const data =
+      await response.json() as any;
+
+    if (!response.ok || data?.success !== true) {
+      return {
+        ok: false,
+        rows: [],
+        error:
+          safe(data?.error) ||
+          `AI_HISTORY_HTTP_${response.status}`
+      };
+    }
+
+    return {
+      ok: true,
+      rows:
+        Array.isArray(data?.history)
+          ? data.history
+          : [],
+      error: null
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      rows: [],
+      error:
+        error instanceof Error
+          ? error.message
+          : String(error)
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function findAiHistoryMatch(
+  signal: any,
+  rows: any[]
+): AiMatchResolution {
+  const ids =
+    aiHistorySignalIds(signal);
+
+  const home =
+    safe(signalHome(signal))
+      .toLowerCase();
+
+  const away =
+    safe(signalAway(signal))
+      .toLowerCase();
+
+  const row =
+    rows.find((item: any) => {
+      const rowIds = [
+        item?.signal_id,
+        item?.match_id
+      ]
+        .map((value: any) => safe(value))
+        .filter(Boolean);
+
+      if (
+        ids.length &&
+        rowIds.some((id: string) =>
+          ids.includes(id)
+        )
+      ) {
+        return true;
+      }
+
+      return (
+        home &&
+        away &&
+        safe(item?.hunter_home).toLowerCase() === home &&
+        safe(item?.hunter_away).toLowerCase() === away
+      );
+    }) ?? null;
+
+  if (!row) {
+    return {
+      ok: true,
+      accepted: false,
+      event_id: null,
+      cloudbet_match: null,
+      confidence: null,
+      reason: "AI_MATCH_PENDING_HISTORY",
+      category_guard_ok: false,
+      cache_hit: false,
+      raw: null
+    };
+  }
+
+  const confidence =
+    numberOrNull(row?.confidence);
+
+  const eventId =
+    normalizeEventId(
+      row?.cloudbet_event_id
+    );
+
+  const categoryGuardOk =
+    Number(row?.category_guard_ok) === 1;
+
+  const currentVersion =
+    safe(row?.matcher_version) ===
+    "AI-MATCHER-V1.3.3-BET-WORKER-RESOLVE-HISTORY-500";
+
+  const accepted =
+    currentVersion &&
+    Number(row?.ai_accepted) === 1 &&
+    eventId !== null &&
+    confidence !== null &&
+    confidence >= 0.90 &&
+    categoryGuardOk;
+
+  return {
+    ok: true,
+    accepted,
+    event_id: eventId,
+    cloudbet_match:
+      safe(row?.cloudbet_match) || null,
+    confidence,
+    reason:
+      accepted
+        ? safe(row?.reason) || "AI_HISTORY_ACCEPTED"
+        : !currentVersion
+        ? "AI_HISTORY_OLD_VERSION"
+        : safe(row?.reason) || "AI_HISTORY_NOT_ACCEPTED",
+    category_guard_ok: categoryGuardOk,
+    cache_hit: true,
+    raw: row
+  };
 }
 
 function buildAiSelectedCloudbetData(
@@ -7062,6 +7273,26 @@ async function runWorker(
   const trackerSignals = trackerEntries(trackerResult.data);
   const hunterSignals = trackerSignals.filter(isHunterEntry);
 
+  const aiHistory =
+    await fetchAiHistory(env);
+
+  if (!aiHistory.ok) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      mode: MODE,
+      betting_enabled: BETTING_ENABLED,
+      action: "RUN",
+      execution_id: executionId,
+      error: "AI_MATCHER_HISTORY_FAILED",
+      ai_matcher: aiHistory,
+      account,
+      pending_retry: pendingResult,
+      processing_ms: Date.now() - started
+    };
+  }
+
   const ready: any[] = [];
   const pending: any[] = [];
   const skipped: any[] = [];
@@ -7092,9 +7323,9 @@ async function runWorker(
         trackerCloudbetData(signal);
 
       const aiMatch =
-        await resolveAiMatch(
-          env,
-          signal
+        findAiHistoryMatch(
+          signal,
+          aiHistory.rows
         );
 
       aiResolved++;
@@ -7293,7 +7524,7 @@ async function runWorker(
       target_params: TARGET_PARAMS,
       tracker_is_match_source: false,
       ai_matcher_is_primary_match_source: true,
-      ai_matcher_endpoint: "/resolve",
+      ai_matcher_endpoint: "/api/history (RUN) + /resolve (DIRECT PREFLIGHT)",
       ai_accept_confidence: 0.90,
       ai_hard_category_guard_required: true,
       direct_event_preflight: true,
@@ -7336,7 +7567,7 @@ async function runWorker(
     source: {
       tracker: "/entries",
       identity:
-        "AI_MATCHER /resolve -> accepted event_id",
+        "AI_MATCHER /api/history -> accepted event_id",
       previous_tracker_match:
         "DIAGNOSTIC ONLY",
       cloudbet_event:
@@ -7348,6 +7579,7 @@ async function runWorker(
     stats: {
       tracker_signals: trackerSignals.length,
       hunter_signals: hunterSignals.length,
+      ai_history_rows: aiHistory.rows.length,
       ai_resolved: aiResolved,
       ai_accepted: aiAccepted,
       ai_rejected: aiRejected,
