@@ -62,6 +62,7 @@ interface Env {
   TRACKER: Fetcher;
   CLOUDBET: Fetcher;
   MATCHER: Fetcher;
+  AI_MATCHER: Fetcher;
   DB: D1Database;
   CLOUDBET_API_KEY?: string;
   TELEGRAM_BOT_TOKEN?: string;
@@ -70,7 +71,18 @@ interface Env {
 
 type Obj = Record<string, any>;
 
-// V7.6.18 FIX:
+// V7.6.19 AI MATCHER CONNECTION:
+// - AI_MATCHER service binding is now the PRIMARY source of Cloudbet event_id
+// - Uses AI Matcher POST /resolve for Hunter fixture identity
+// - Requires AI accepted=true, confidence>=0.90 and category_guard.ok=true
+// - Tracker/old matcher event_id is retained only as diagnostic/entry-odds metadata
+// - Old MATCHER binding remains untouched and is still used ONLY for exact SAME event_id odds refresh
+// - If AI event_id differs from Tracker event_id, stale Tracker entry_odds are NOT reused
+// - Final same-event / score / period / minute / exact market / odds / balance / duplicate gates remain unchanged
+// - ALL existing betting/test code is preserved
+// - NORMAL BETTING REMAINS DISABLED
+//
+// // V7.6.18 FIX:
 // - Rearms exactly ONE additional automatic real 0.10 USDT E2E test with a NEW D1 key
 // - A PlaceBet response of PENDING_ACCEPTANCE is NOT archived as a placed bet
 // - real_bet_archive is written ONLY after Cloudbet returns betStatus=ACCEPTED
@@ -104,7 +116,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.18 SECOND AUTO E2E + CLOUDBET CONFIRM BEFORE ARCHIVE";
+  "V7.6.19 AI MATCHER PRIMARY IDENTITY - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -878,6 +890,197 @@ function trackerCandidateDiagnostic(
         : "TRACKER_READY_WAITING_FOR_ODDS",
     hunter,
     cloudbet
+  };
+}
+
+// ============================================================
+// V7.6.19 — AI MATCHER PRIMARY IDENTITY
+// AI decides fixture identity only.
+// Bet Worker remains authoritative for every betting safety gate.
+// ============================================================
+
+interface AiMatchResolution {
+  ok: boolean;
+  accepted: boolean;
+  event_id: string | null;
+  cloudbet_match: string | null;
+  confidence: number | null;
+  reason: string | null;
+  category_guard_ok: boolean;
+  cache_hit: boolean | null;
+  raw: any;
+}
+
+async function resolveAiMatch(
+  env: Env,
+  signal: any
+): Promise<AiMatchResolution> {
+  if (!env.AI_MATCHER) {
+    return {
+      ok: false,
+      accepted: false,
+      event_id: null,
+      cloudbet_match: null,
+      confidence: null,
+      reason: "AI_MATCHER_BINDING_MISSING",
+      category_guard_ok: false,
+      cache_hit: null,
+      raw: null
+    };
+  }
+
+  try {
+    const response = await env.AI_MATCHER.fetch(
+      new Request(
+        "https://ai-matcher.internal/resolve",
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "accept": "application/json"
+          },
+          body: JSON.stringify(signal ?? {})
+        }
+      )
+    );
+
+    const rawText = await response.text();
+
+    let data: any = null;
+    try {
+      data = rawText ? JSON.parse(rawText) : null;
+    } catch {
+      data = {
+        parse_error: true,
+        raw: rawText.slice(0, 4000)
+      };
+    }
+
+    if (!response.ok || data?.success !== true) {
+      return {
+        ok: false,
+        accepted: false,
+        event_id: null,
+        cloudbet_match: null,
+        confidence: null,
+        reason:
+          safe(data?.error) ||
+          `AI_MATCHER_HTTP_${response.status}`,
+        category_guard_ok: false,
+        cache_hit:
+          typeof data?.cache_hit === "boolean"
+            ? data.cache_hit
+            : null,
+        raw: data
+      };
+    }
+
+    const result = data?.result ?? {};
+    const eventId =
+      normalizeEventId(
+        result?.event_id ??
+        result?.candidate?.event_id ??
+        result?.candidate?.id
+      );
+
+    const confidence =
+      numberOrNull(
+        result?.confidence
+      );
+
+    const categoryGuardOk =
+      result?.category_guard?.ok === true;
+
+    const accepted =
+      result?.accepted === true &&
+      eventId !== null &&
+      confidence !== null &&
+      confidence >= 0.90 &&
+      categoryGuardOk;
+
+    return {
+      ok: true,
+      accepted,
+      event_id: eventId,
+      cloudbet_match:
+        safe(
+          result?.cloudbet_match ??
+          ""
+        ) || null,
+      confidence,
+      reason:
+        accepted
+          ? safe(result?.reason) || "AI_MATCH_ACCEPTED"
+          : safe(result?.reason) || "AI_MATCH_NOT_ACCEPTED",
+      category_guard_ok: categoryGuardOk,
+      cache_hit:
+        typeof data?.cache_hit === "boolean"
+          ? data.cache_hit
+          : null,
+      raw: data
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      accepted: false,
+      event_id: null,
+      cloudbet_match: null,
+      confidence: null,
+      reason:
+        error instanceof Error
+          ? error.message
+          : String(error),
+      category_guard_ok: false,
+      cache_hit: null,
+      raw: null
+    };
+  }
+}
+
+function buildAiSelectedCloudbetData(
+  signal: any,
+  aiMatch: AiMatchResolution
+): TrackerCloudbetData {
+  const previous =
+    trackerCloudbetData(signal);
+
+  const eventId =
+    normalizeEventId(
+      aiMatch?.event_id
+    );
+
+  const sameAsPrevious =
+    Boolean(
+      eventId &&
+      previous.event_id &&
+      eventId === previous.event_id
+    );
+
+  // Entry odds belong to the OLD tracker-selected event.
+  // Reuse them only when both systems selected the exact same event_id.
+  const entryOdds =
+    sameAsPrevious
+      ? previous.entry_odds
+      : null;
+
+  const maxStake =
+    sameAsPrevious
+      ? previous.max_stake
+      : null;
+
+  return {
+    event_id: eventId,
+    match:
+      aiMatch?.cloudbet_match ??
+      previous.match ??
+      null,
+    entry_odds: entryOdds,
+    max_stake: maxStake,
+    odds_available:
+      entryOdds !== null &&
+      entryOdds > 1,
+    matcher_score:
+      aiMatch?.confidence ?? null
   };
 }
 
@@ -4571,6 +4774,7 @@ interface DirectPreflightInput {
   match?: any;
   home?: any;
   away?: any;
+  competition?: any;
   entry_minute?: any;
   hunter_score?: any;
   entry_odds?: any;
@@ -4613,6 +4817,11 @@ function buildDirectSignal(
       safe(
         input?.away
       ),
+
+    competition:
+      safe(
+        input?.competition
+      ) || null,
 
     entry_minute:
       numberOrNull(
@@ -6601,19 +6810,7 @@ async function runDirectPreflight(
   input: DirectPreflightInput
 ): Promise<any> {
   const started = Date.now();
-  const eventId = normalizeEventId(input?.event_id);
-
-  if (!eventId) {
-    return {
-      success: false,
-      worker: "cloudbet-bet-worker",
-      version: VERSION,
-      action: "DIRECT_PREFLIGHT",
-      ready: false,
-      reason: "CLOUDBET_EVENT_ID_MISSING",
-      processing_ms: Date.now() - started
-    };
-  }
+  const requestedEventId = normalizeEventId(input?.event_id);
 
   const schema = await ensureDatabaseSchema(env);
 
@@ -6632,20 +6829,38 @@ async function runDirectPreflight(
   }
 
   const signal = buildDirectSignal(input);
-  const trackerCloudbet = trackerCloudbetData(signal);
 
-  if (trackerCloudbet.event_id !== eventId) {
+  const aiMatch =
+    await resolveAiMatch(
+      env,
+      signal
+    );
+
+  if (!aiMatch.ok || !aiMatch.accepted || !aiMatch.event_id) {
     return {
       success: false,
       worker: "cloudbet-bet-worker",
       version: VERSION,
       action: "DIRECT_PREFLIGHT",
       ready: false,
-      event_id: eventId,
-      reason: "DIRECT_EVENT_ID_NORMALIZATION_FAILED",
+      requested_event_id: requestedEventId,
+      event_id: aiMatch.event_id,
+      reason:
+        aiMatch.reason ||
+        "AI_MATCH_NOT_ACCEPTED",
+      ai_match: aiMatch,
       processing_ms: Date.now() - started
     };
   }
+
+  const trackerCloudbet =
+    buildAiSelectedCloudbetData(
+      signal,
+      aiMatch
+    );
+
+  const eventId =
+    aiMatch.event_id;
 
   const account = await fetchAccountSnapshot(env);
   const current =
@@ -6687,10 +6902,14 @@ async function runDirectPreflight(
       account_balance: numberOrNull(account?.balance),
       current,
       pending: saved,
+      ai_match: aiMatch,
+      requested_event_id: requestedEventId,
       source: {
-        event: "DIRECT_TRACKER_EVENT_ID",
-        state: "/event?id=SAME_EVENT_ID",
-        odds: "MATCHER /live EXACT SAME EVENT_ID"
+        identity: "AI_MATCHER /resolve",
+        previous_tracker_event_id: requestedEventId,
+        event: "AI_MATCHER_EVENT_ID",
+        state: "/event?id=SAME_AI_EVENT_ID",
+        odds: "MATCHER /live EXACT SAME AI EVENT_ID"
       },
       processing_ms: Date.now() - started
     };
@@ -6763,10 +6982,14 @@ async function runDirectPreflight(
     handoff,
     archive,
     current,
+    ai_match: aiMatch,
+    requested_event_id: requestedEventId,
     source: {
-      event: "DIRECT_TRACKER_EVENT_ID",
-      state: "/event?id=SAME_EVENT_ID",
-      odds: "MATCHER /live EXACT SAME EVENT_ID"
+      identity: "AI_MATCHER /resolve",
+      previous_tracker_event_id: requestedEventId,
+      event: "AI_MATCHER_EVENT_ID",
+      state: "/event?id=SAME_AI_EVENT_ID",
+      odds: "MATCHER /live EXACT SAME AI EVENT_ID"
     },
     real_test: realTest,
     processing_ms: Date.now() - started
@@ -6859,24 +7082,51 @@ async function runWorker(
         : "AUTO_E2E_TEST_DISABLED"
     };
 
+  let aiResolved = 0;
+  let aiAccepted = 0;
+  let aiRejected = 0;
+
   for (const signal of hunterSignals) {
     try {
-      const diagnostic = trackerCandidateDiagnostic(signal);
+      const previousTrackerCloudbet =
+        trackerCloudbetData(signal);
 
-      if (!diagnostic.ready) {
+      const aiMatch =
+        await resolveAiMatch(
+          env,
+          signal
+        );
+
+      aiResolved++;
+
+      if (
+        !aiMatch.ok ||
+        !aiMatch.accepted ||
+        !aiMatch.event_id
+      ) {
+        aiRejected++;
+
         skipped.push({
-          reason: diagnostic.reason,
+          reason:
+            aiMatch.reason ||
+            "AI_MATCH_NOT_ACCEPTED",
           signal,
-          diagnostic
+          ai_match: aiMatch,
+          previous_tracker_cloudbet:
+            previousTrackerCloudbet
         });
         continue;
       }
 
+      aiAccepted++;
       trackerReady++;
 
       const trackerCloudbet:
         TrackerCloudbetData =
-        diagnostic.cloudbet;
+        buildAiSelectedCloudbetData(
+          signal,
+          aiMatch
+        );
 
       const cloudbetId =
         trackerCloudbet.event_id!;
@@ -6920,6 +7170,9 @@ async function runWorker(
         pending.push({
           execution_id: pendingExecutionId,
           cloudbet_id: cloudbetId,
+          ai_match: aiMatch,
+          previous_tracker_event_id:
+            previousTrackerCloudbet.event_id,
           match: signalMatch(signal),
           entry_odds: trackerCloudbet.entry_odds,
           current_odds: current.current_odds,
@@ -6978,6 +7231,9 @@ async function runWorker(
         execution_id: bet.execution_id,
         action: "READY_TO_BET",
         cloudbet_id: cloudbetId,
+        ai_match: aiMatch,
+        previous_tracker_event_id:
+          previousTrackerCloudbet.event_id,
         match: signalMatch(signal),
         home: signalHome(signal),
         away: signalAway(signal),
@@ -7035,12 +7291,17 @@ async function runWorker(
       target_submarket: TARGET_SUBMARKET,
       target_outcome: TARGET_OUTCOME,
       target_params: TARGET_PARAMS,
-      tracker_is_match_source: true,
+      tracker_is_match_source: false,
+      ai_matcher_is_primary_match_source: true,
+      ai_matcher_endpoint: "/resolve",
+      ai_accept_confidence: 0.90,
+      ai_hard_category_guard_required: true,
       direct_event_preflight: true,
       direct_preflight_endpoint: "/preflight",
       d1_auto_migration: true,
       matcher_lookup: true,
       matcher_used_for_matching: false,
+      old_tracker_match_retained_for_diagnostics: true,
       matcher_used_for_exact_odds: true,
       matcher_odds_endpoint: "/live",
       matcher_odds_event_lock: "EXACT_EVENT_ID_ONLY",
@@ -7074,14 +7335,22 @@ async function runWorker(
 
     source: {
       tracker: "/entries",
-      cloudbet_event: "/event?id=CLOUDBET_EVENT_ID",
+      identity:
+        "AI_MATCHER /resolve -> accepted event_id",
+      previous_tracker_match:
+        "DIAGNOSTIC ONLY",
+      cloudbet_event:
+        "/event?id=AI_MATCHER_EVENT_ID",
       current_odds:
-        "MATCHER /live -> EXACT SAME EVENT_ID"
+        "MATCHER /live -> EXACT SAME AI EVENT_ID"
     },
 
     stats: {
       tracker_signals: trackerSignals.length,
       hunter_signals: hunterSignals.length,
+      ai_resolved: aiResolved,
+      ai_accepted: aiAccepted,
+      ai_rejected: aiRejected,
       tracker_ready: trackerReady,
       ready_to_bet: refreshedReady,
       pending: targetPending,
