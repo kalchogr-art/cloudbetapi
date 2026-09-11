@@ -1,4 +1,15 @@
 // ============================================================
+// V1.3.3 BET WORKER INTEGRATION
+// - Adds POST /resolve for Bet Worker service binding
+// - /resolve reuses only cache rows created by THIS exact matcher version
+// - Older V1.3.1/V1.3.2 rows are NOT trusted as current cache
+// - Stores matcher_version + category_guard_ok in D1
+// - History retention raised from 30 to 500 rows
+// - Existing AI matching + hard category guard preserved
+// - READ ONLY / NO BETTING
+// ============================================================
+
+// ============================================================
 // V1.3.2 HARD CATEGORY GUARD
 // - AI still sees all RAW Cloudbet live soccer events
 // - Missing Cloudbet minute/period remains allowed
@@ -33,7 +44,7 @@ interface Env {
   TRACKER: any;
 }
 
-const VERSION = "AI-MATCHER-V1.3.2-HARD-CATEGORY-GUARD";
+const VERSION = "AI-MATCHER-V1.3.3-BET-WORKER-RESOLVE-HISTORY-500";
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 const CLOUDBET_BASE = "https://www.cloudbet.com";
@@ -832,7 +843,7 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
 // TRACKER + D1 HISTORY
 // ============================================================
 
-const HISTORY_LIMIT = 30;
+const HISTORY_LIMIT = 500;
 const TRACKER_TIMEOUT_MS = 8000;
 const MAX_SIGNALS_PER_SCAN = 5;
 
@@ -880,9 +891,26 @@ async function ensureSchema(env: Env): Promise<void> {
       usable_candidates INTEGER,
       ai_calls INTEGER,
       processing_ms INTEGER,
+      matcher_version TEXT,
+      category_guard_ok INTEGER,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `).run();
+
+  // V1.3.3 safe migrations for an existing ai-matcher-db.
+  for (const migration of [
+    "ALTER TABLE ai_match_history ADD COLUMN matcher_version TEXT",
+    "ALTER TABLE ai_match_history ADD COLUMN category_guard_ok INTEGER"
+  ]) {
+    try {
+      await env.DB.prepare(migration).run();
+    } catch (error: any) {
+      const message = String(error?.message ?? error).toLowerCase();
+      if (!message.includes("duplicate column") && !message.includes("already exists")) {
+        throw error;
+      }
+    }
+  }
 
   await env.DB.prepare(
     `CREATE INDEX IF NOT EXISTS idx_ai_match_history_created_at
@@ -964,6 +992,45 @@ async function historyHasKey(env: Env, key: string): Promise<boolean> {
   return Boolean(row);
 }
 
+async function getHistoryRowByKey(env: Env, key: string): Promise<AnyObj | null> {
+  const row = await env.DB.prepare(
+    `SELECT *
+     FROM ai_match_history
+     WHERE signal_key = ?
+     LIMIT 1`
+  ).bind(key).first();
+
+  return row ? row as AnyObj : null;
+}
+
+function cachedResultFromRow(row: AnyObj): AnyObj {
+  const categoryGuardOk = Number(row?.category_guard_ok) === 1;
+
+  return {
+    matched: Number(row?.ai_matched) === 1,
+    accepted: Number(row?.ai_accepted) === 1 && categoryGuardOk,
+    event_id: str(row?.cloudbet_event_id) || null,
+    confidence: boundedConfidence(row?.confidence),
+    reason: str(row?.reason) || null,
+    cloudbet_match: str(row?.cloudbet_match) || null,
+    candidate: {
+      event_id: str(row?.cloudbet_event_id) || null,
+      period: row?.cloudbet_period ?? null,
+      minute: parseMinute(row?.cloudbet_minute)
+    },
+    category_guard: {
+      ok: categoryGuardOk,
+      conflicts: []
+    },
+    cache: {
+      hit: true,
+      matcher_version: row?.matcher_version ?? null,
+      signal_key: row?.signal_key ?? null,
+      created_at: row?.created_at ?? null
+    }
+  };
+}
+
 async function storeHistory(
   env: Env,
   rawSignal: AnyObj,
@@ -976,8 +1043,13 @@ async function storeHistory(
   const candidate = result?.candidate ?? null;
   const diagnostics = result?.diagnostics ?? {};
 
+  const categoryGuardOk =
+    result?.category_guard?.ok === true
+      ? 1
+      : 0;
+
   await env.DB.prepare(`
-    INSERT OR IGNORE INTO ai_match_history (
+    INSERT INTO ai_match_history (
       signal_key,
       signal_id,
       match_id,
@@ -998,8 +1070,34 @@ async function storeHistory(
       raw_events,
       usable_candidates,
       ai_calls,
-      processing_ms
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      processing_ms,
+      matcher_version,
+      category_guard_ok
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(signal_key) DO UPDATE SET
+      signal_id = excluded.signal_id,
+      match_id = excluded.match_id,
+      hunter_match = excluded.hunter_match,
+      hunter_home = excluded.hunter_home,
+      hunter_away = excluded.hunter_away,
+      competition = excluded.competition,
+      hunter_minute = excluded.hunter_minute,
+      hunter_score = excluded.hunter_score,
+      ai_matched = excluded.ai_matched,
+      ai_accepted = excluded.ai_accepted,
+      cloudbet_event_id = excluded.cloudbet_event_id,
+      cloudbet_match = excluded.cloudbet_match,
+      confidence = excluded.confidence,
+      reason = excluded.reason,
+      cloudbet_period = excluded.cloudbet_period,
+      cloudbet_minute = excluded.cloudbet_minute,
+      raw_events = excluded.raw_events,
+      usable_candidates = excluded.usable_candidates,
+      ai_calls = excluded.ai_calls,
+      processing_ms = excluded.processing_ms,
+      matcher_version = excluded.matcher_version,
+      category_guard_ok = excluded.category_guard_ok,
+      created_at = CURRENT_TIMESTAMP
   `).bind(
     key,
     str(rawSignal?.id ?? rawSignal?.signal_id ?? "") || null,
@@ -1021,7 +1119,9 @@ async function storeHistory(
     diagnostics?.raw_events ?? null,
     diagnostics?.usable_candidates ?? null,
     diagnostics?.ai_calls ?? null,
-    processingMs
+    processingMs,
+    VERSION,
+    categoryGuardOk
   ).run();
 
   await env.DB.prepare(`
@@ -1275,7 +1375,7 @@ export default {
     const url = new URL(request.url);
 
     // --------------------------------------------------------
-    // HTML DASHBOARD — LAST 30
+    // HTML DASHBOARD — LAST 500
     // --------------------------------------------------------
     if (url.pathname === "/" && request.method === "GET") {
       try {
@@ -1303,12 +1403,13 @@ export default {
         model: MODEL,
         history_limit: HISTORY_LIMIT,
         max_signals_per_scan: MAX_SIGNALS_PER_SCAN,
-        architecture: "TRACKER -> RAW CLOUDBET LIVE -> BATCHED AI IDENTITY MATCH -> D1 LAST 30 -> DASHBOARD",
+        architecture: "TRACKER/BET_WORKER -> RAW CLOUDBET LIVE -> BATCHED AI IDENTITY MATCH -> HARD CATEGORY GUARD -> D1 LAST 500",
         endpoints: {
           dashboard: "GET /",
           status: "GET /status",
           scan: "GET /scan",
           history: "GET /api/history",
+          resolve: "POST /resolve",
           live_test: "GET /live-test",
           match_get: "GET /match-get?home=...&away=...&competition=...&minute=...",
           match: "POST /match"
@@ -1442,6 +1543,85 @@ export default {
     }
 
     // --------------------------------------------------------
+    // V1.3.3 RESOLVE FOR BET WORKER
+    // - Uses current-version D1 cache when available
+    // - Otherwise performs a fresh AI match and stores it
+    // - READ ONLY: never places a bet
+    // --------------------------------------------------------
+    if (url.pathname === "/resolve" && request.method === "POST") {
+      if (!env.AI) {
+        return json({ success: false, error: "AI_BINDING_MISSING" }, 500);
+      }
+
+      let body: AnyObj;
+      try {
+        body = (await request.json()) as AnyObj;
+      } catch {
+        return json({ success: false, error: "INVALID_JSON_BODY" }, 400);
+      }
+
+      const signal = normalizeSignal(body);
+      if (!signalValid(signal)) {
+        return json({
+          success: false,
+          error: "INVALID_SIGNAL",
+          received_signal: signal
+        }, 400);
+      }
+
+      try {
+        await ensureSchema(env);
+
+        const key = signalKey(body, signal);
+        const existing = await getHistoryRowByKey(env, key);
+
+        if (
+          existing &&
+          str(existing?.matcher_version) === VERSION
+        ) {
+          const cached = cachedResultFromRow(existing);
+
+          return json({
+            success: true,
+            worker: "ai-matcher",
+            version: VERSION,
+            action: "RESOLVE",
+            mode: "READ_ONLY",
+            betting: "DISABLED",
+            processed: true,
+            signal,
+            result: cached,
+            cache_hit: true,
+            signal_key: key,
+            processing_ms: 0
+          });
+        }
+
+        const processed = await processOneSignal(env, body, key);
+
+        return json({
+          success: true,
+          worker: "ai-matcher",
+          version: VERSION,
+          action: "RESOLVE",
+          mode: "READ_ONLY",
+          betting: "DISABLED",
+          cache_hit: false,
+          signal_key: key,
+          ...processed
+        });
+      } catch (error: any) {
+        return json({
+          success: false,
+          worker: "ai-matcher",
+          version: VERSION,
+          error: "AI_RESOLVE_FAILED",
+          message: String(error?.message ?? error)
+        }, 500);
+      }
+    }
+
+    // --------------------------------------------------------
     // POST MATCH — ALSO STORED IN HISTORY
     // --------------------------------------------------------
     if (url.pathname === "/match" && request.method === "POST") {
@@ -1485,7 +1665,7 @@ export default {
     return json({
       success: false,
       error: "NOT_FOUND",
-      endpoints: ["GET /", "GET /status", "GET /scan", "GET /api/history", "GET /live-test", "GET /match-get", "POST /match"]
+      endpoints: ["GET /", "GET /status", "GET /scan", "GET /api/history", "GET /live-test", "GET /match-get", "POST /resolve", "POST /match"]
     }, 404);
   },
 
