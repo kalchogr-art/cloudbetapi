@@ -17,6 +17,10 @@
     {
       "binding": "CLOUDBET",
       "service": "cloudbetapi"
+    },
+    {
+      "binding": "AI_MATCHER",
+      "service": "ai-matcher"
     }
   ],
   "d1_databases": [
