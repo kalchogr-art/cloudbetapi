@@ -71,7 +71,17 @@ interface Env {
 
 type Obj = Record<string, any>;
 
-// V7.6.20 FAST /run FIX:
+// V7.6.21 DIRECT PREFLIGHT FIX:
+// - Fixes Telegram BET READY -> INVALID_SIGNAL
+// - Direct /preflight enriches the just-created Hunter signal from TRACKER /entries
+// - HOME/AWAY can also be derived safely from match/match_name
+// - competition can fall back to league
+// - AI /resolve therefore receives a complete fixture identity signal
+// - /run fast AI-history path remains unchanged
+// - Existing betting/test code is preserved
+// - NORMAL BETTING REMAINS DISABLED
+//
+// // V7.6.20 FAST /run FIX:
 // - /run NO LONGER calls AI /resolve sequentially for every Hunter signal
 // - /run fetches AI Matcher /api/history ONCE and reads current V1.3.3 accepted matches
 // - This removes long browser hangs when many Hunter signals are present
@@ -125,7 +135,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.20 FAST AI HISTORY RUN - BETTING OFF";
+  "V7.6.21 DIRECT PREFLIGHT SIGNAL ENRICH FIX - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -4983,9 +4993,11 @@ interface DirectPreflightInput {
   event_id?: any;
   match_id?: any;
   match?: any;
+  match_name?: any;
   home?: any;
   away?: any;
   competition?: any;
+  league?: any;
   entry_minute?: any;
   hunter_score?: any;
   entry_odds?: any;
@@ -5006,6 +5018,29 @@ function buildDirectSignal(
       input?.entry_odds
     );
 
+  const matchText =
+    safe(
+      input?.match ??
+      input?.match_name
+    );
+
+  const parsed =
+    splitMatch(
+      matchText
+    );
+
+  const home =
+    safe(
+      input?.home
+    ) ||
+    parsed.home;
+
+  const away =
+    safe(
+      input?.away
+    ) ||
+    parsed.away;
+
   return {
     status:
       "ENTRY",
@@ -5015,22 +5050,33 @@ function buildDirectSignal(
       null,
 
     match:
-      safe(
-        input?.match
+      matchText ||
+      (
+        home && away
+          ? `${home} - ${away}`
+          : ""
       ),
 
-    home:
-      safe(
-        input?.home
+    match_name:
+      matchText ||
+      (
+        home && away
+          ? `${home} - ${away}`
+          : ""
       ),
 
-    away:
-      safe(
-        input?.away
-      ),
+    home,
+    away,
 
     competition:
       safe(
+        input?.competition ??
+        input?.league
+      ) || null,
+
+    league:
+      safe(
+        input?.league ??
         input?.competition
       ) || null,
 
@@ -5049,9 +5095,7 @@ function buildDirectSignal(
         eventId,
 
       match:
-        safe(
-          input?.match
-        ) || null,
+        matchText || null,
 
       entry_odds:
         entryOdds,
@@ -5071,6 +5115,174 @@ function buildDirectSignal(
         )
     }
   };
+}
+
+// ============================================================
+// V7.6.21 — DIRECT PREFLIGHT TRACKER ENRICHMENT
+// Tracker creates the Hunter DB row BEFORE /preflight.
+// Reuse that row so AI always receives fixture names.
+// ============================================================
+
+async function enrichDirectPreflightInput(
+  env: Env,
+  input: DirectPreflightInput
+): Promise<DirectPreflightInput> {
+  const requestedMatchId =
+    safe(
+      input?.match_id
+    );
+
+  const requestedEventId =
+    normalizeEventId(
+      input?.event_id
+    );
+
+  try {
+    const tracker =
+      await fetchServiceJSON(
+        env.TRACKER,
+        "/entries",
+        SERVICE_TIMEOUT_MS
+      );
+
+    if (!tracker.ok) {
+      return input;
+    }
+
+    const rows =
+      trackerEntries(
+        tracker.data
+      );
+
+    const row =
+      rows.find((item: any) => {
+        const rowMatchId =
+          safe(
+            item?.match_id ??
+            item?.id
+          );
+
+        const rowEventId =
+          normalizeEventId(
+            item?.cloudbet?.event_id ??
+            item?.cloudbet_event_id
+          );
+
+        if (
+          requestedMatchId &&
+          rowMatchId &&
+          requestedMatchId === rowMatchId
+        ) {
+          return true;
+        }
+
+        if (
+          requestedEventId &&
+          rowEventId &&
+          requestedEventId === rowEventId
+        ) {
+          return true;
+        }
+
+        return false;
+      }) ?? null;
+
+    if (!row) {
+      return input;
+    }
+
+    const rowMatch =
+      safe(
+        row?.match ??
+        row?.match_name
+      );
+
+    const parsed =
+      splitMatch(
+        rowMatch
+      );
+
+    return {
+      ...input,
+
+      event_id:
+        input?.event_id ??
+        row?.cloudbet?.event_id ??
+        row?.cloudbet_event_id ??
+        null,
+
+      match_id:
+        input?.match_id ??
+        row?.match_id ??
+        row?.id ??
+        null,
+
+      match:
+        safe(input?.match) ||
+        rowMatch ||
+        null,
+
+      match_name:
+        safe(input?.match_name) ||
+        rowMatch ||
+        null,
+
+      home:
+        safe(input?.home) ||
+        safe(row?.home) ||
+        parsed.home ||
+        null,
+
+      away:
+        safe(input?.away) ||
+        safe(row?.away) ||
+        parsed.away ||
+        null,
+
+      competition:
+        safe(input?.competition) ||
+        safe(row?.competition) ||
+        safe(row?.league) ||
+        null,
+
+      league:
+        safe(input?.league) ||
+        safe(row?.league) ||
+        safe(row?.competition) ||
+        null,
+
+      entry_minute:
+        input?.entry_minute ??
+        row?.entry_minute ??
+        row?.current_minute ??
+        null,
+
+      hunter_score:
+        input?.hunter_score ??
+        row?.hunter_score ??
+        null,
+
+      entry_odds:
+        input?.entry_odds ??
+        row?.cloudbet?.entry_odds ??
+        row?.entry_odds ??
+        null,
+
+      max_stake:
+        input?.max_stake ??
+        row?.cloudbet?.max_stake ??
+        row?.cloudbet_max_stake ??
+        null,
+
+      matcher_score:
+        input?.matcher_score ??
+        row?.cloudbet?.matcher_score ??
+        row?.matcher_score ??
+        null
+    };
+  } catch {
+    return input;
+  }
 }
 
 
@@ -7032,14 +7244,23 @@ async function runDirectPreflight(
       version: VERSION,
       action: "DIRECT_PREFLIGHT",
       ready: false,
-      event_id: eventId,
+      event_id: requestedEventId,
       reason: "DATABASE_SCHEMA_MIGRATION_FAILED",
       database_schema: schema,
       processing_ms: Date.now() - started
     };
   }
 
-  const signal = buildDirectSignal(input);
+  const enrichedInput =
+    await enrichDirectPreflightInput(
+      env,
+      input
+    );
+
+  const signal =
+    buildDirectSignal(
+      enrichedInput
+    );
 
   const aiMatch =
     await resolveAiMatch(
@@ -7060,6 +7281,15 @@ async function runDirectPreflight(
         aiMatch.reason ||
         "AI_MATCH_NOT_ACCEPTED",
       ai_match: aiMatch,
+      signal_sent_to_ai: {
+        match_id: signal?.match_id ?? null,
+        match: signal?.match ?? null,
+        home: signal?.home ?? null,
+        away: signal?.away ?? null,
+        competition: signal?.competition ?? null,
+        entry_minute: signal?.entry_minute ?? null,
+        hunter_score: signal?.hunter_score ?? null
+      },
       processing_ms: Date.now() - started
     };
   }
