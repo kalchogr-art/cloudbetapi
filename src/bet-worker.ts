@@ -70,7 +70,16 @@ interface Env {
 
 type Obj = Record<string, any>;
 
-// V7.6.17 FIX:
+// V7.6.18 FIX:
+// - Rearms exactly ONE additional automatic real 0.10 USDT E2E test with a NEW D1 key
+// - A PlaceBet response of PENDING_ACCEPTANCE is NOT archived as a placed bet
+// - real_bet_archive is written ONLY after Cloudbet returns betStatus=ACCEPTED
+// - PENDING / REJECTED / API errors stay only in the safety/test guard tables
+// - Adds GET /bet-status?reference_id=... to query Cloudbet GraphQL directly
+// - /bet-status archives + notifies only when Cloudbet confirms ACCEPTED
+// - Normal betting remains DISABLED; all existing final safety gates remain active
+//
+// // V7.6.17 FIX:
 // - NEXT genuine DIRECT_PREFLIGHT BET READY can execute the existing AUTO E2E one-shot
 // - Real test stake remains exactly 0.10 USDT and globally one-shot guarded in D1
 // - Final fresh same-event validation now also receives Hunter entry_minute fallback
@@ -95,7 +104,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.17 NEXT BET READY AUTO E2E 0.10 USDT";
+  "V7.6.18 SECOND AUTO E2E + CLOUDBET CONFIRM BEFORE ARCHIVE";
 
 const MODE =
   "DRY_RUN";
@@ -141,7 +150,7 @@ const REAL_TEST_CONFIRM = "PLACE_0_10_USDT_ONCE";
 // may be sent from the normal Hunter -> /run flow after ALL safety gates pass.
 const AUTO_E2E_TEST_ENABLED = true;
 const AUTO_E2E_TEST_STAKE = "0.10";
-const AUTO_E2E_TEST_KEY = "V7.6.12_AUTO_E2E_ONE_SHOT_0_10_USDT";
+const AUTO_E2E_TEST_KEY = "V7.6.18_SECOND_AUTO_E2E_ONE_SHOT_0_10_USDT";
 
 // Legacy display/archive value preserved from V7.0.2.
 const BET_STAKE_EUR =
@@ -4918,6 +4927,214 @@ async function realBetAlreadyClaimed(
   return !!row;
 }
 
+
+// ============================================================
+// V7.6.18 — CLOUDBET BET CONFIRMATION
+// Cloudbet GraphQL supports querying a submitted bet by referenceId.
+// IMPORTANT: real_bet_archive is written only after betStatus=ACCEPTED.
+// ============================================================
+
+function isCloudbetAcceptedBetStatus(value: any): boolean {
+  return safe(value).toUpperCase() === "ACCEPTED";
+}
+
+function isCloudbetRejectedBetStatus(value: any): boolean {
+  const status = safe(value).toUpperCase();
+  return status === "REJECTED" ||
+         status === "CANCELLED" ||
+         status === "CANCELED" ||
+         status === "FAILED";
+}
+
+async function queryCloudbetBetByReference(
+  env: Env,
+  referenceIdInput: any
+): Promise<any> {
+  const referenceId = safe(referenceIdInput);
+  const apiKey = safe(env.CLOUDBET_API_KEY);
+
+  if (!referenceId) {
+    return {
+      success: false,
+      found: false,
+      error: "REFERENCE_ID_MISSING"
+    };
+  }
+
+  if (!apiKey) {
+    return {
+      success: false,
+      found: false,
+      reference_id: referenceId,
+      error: "CLOUDBET_API_KEY_MISSING"
+    };
+  }
+
+  const query = `
+    query Bet($referenceId: String!) {
+      bet(referenceId: $referenceId) {
+        referenceId
+        sportsKey
+        categoryKey
+        eventId
+        eventName
+        marketUrl
+        currency
+        price
+        stake
+        side
+        returnAmount
+        betStatus
+        betErrorCode
+      }
+    }
+  `;
+
+  try {
+    const response = await fetch(GRAPHQL_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-API-KEY": apiKey
+      },
+      body: JSON.stringify({
+        query,
+        variables: { referenceId }
+      }),
+      redirect: "manual"
+    });
+
+    const raw = await response.text();
+
+    let body: any = null;
+    try {
+      body = raw ? JSON.parse(raw) : null;
+    } catch {
+      body = raw ? { raw: raw.slice(0, 5000) } : null;
+    }
+
+    const bet = body?.data?.bet ?? null;
+
+    return {
+      success: response.ok && !!bet,
+      found: !!bet,
+      reference_id: referenceId,
+      http_status: response.status,
+      bet_status: safe(bet?.betStatus) || null,
+      bet_error_code: safe(bet?.betErrorCode) || null,
+      accepted: isCloudbetAcceptedBetStatus(bet?.betStatus),
+      rejected: isCloudbetRejectedBetStatus(bet?.betStatus),
+      bet,
+      response: body
+    };
+  } catch (error) {
+    return {
+      success: false,
+      found: false,
+      reference_id: referenceId,
+      http_status: 0,
+      error: error instanceof Error ? error.message : String(error)
+    };
+  }
+}
+
+async function confirmAndArchiveCloudbetBet(
+  env: Env,
+  referenceIdInput: any,
+  source = "AUTO_E2E_CONFIRMED"
+): Promise<any> {
+  const lookup = await queryCloudbetBetByReference(env, referenceIdInput);
+  const referenceId = safe(referenceIdInput);
+
+  if (!lookup?.found || !lookup?.bet) {
+    return {
+      ...lookup,
+      archived: false,
+      archive_reason: "CLOUDBET_BET_NOT_CONFIRMED"
+    };
+  }
+
+  const bet = lookup.bet;
+  const status = safe(bet?.betStatus).toUpperCase();
+
+  // Update guard state, but do NOT create a real_bet_archive row unless ACCEPTED.
+  await ensureRealBetGuardTable(env);
+
+  const eventId = normalizeEventId(bet?.eventId);
+  const marketUrl = safe(bet?.marketUrl);
+
+  if (eventId && marketUrl) {
+    await env.DB.prepare(`
+      UPDATE real_bet_guard
+      SET status = ?, reference_id = ?, updated_at = ?
+      WHERE guard_key = ?
+    `).bind(
+      status || "UNKNOWN",
+      safe(bet?.referenceId || referenceId),
+      nowISO(),
+      realBetGuardKey(eventId, marketUrl)
+    ).run();
+  }
+
+  await ensureAutoE2ETestTable(env);
+  await env.DB.prepare(`
+    UPDATE auto_e2e_test_guard
+    SET status = ?, reference_id = ?, http_status = ?, response_json = ?, updated_at = ?
+    WHERE test_key = ?
+  `).bind(
+    status || "UNKNOWN",
+    safe(bet?.referenceId || referenceId),
+    numberOrNull(lookup?.http_status),
+    JSON.stringify(lookup?.response ?? null).slice(0, 12000),
+    nowISO(),
+    AUTO_E2E_TEST_KEY
+  ).run();
+
+  if (!isCloudbetAcceptedBetStatus(status)) {
+    return {
+      ...lookup,
+      archived: false,
+      archive_reason: isCloudbetRejectedBetStatus(status)
+        ? "CLOUDBET_REJECTED"
+        : "WAITING_FOR_CLOUDBET_ACCEPTED"
+    };
+  }
+
+  const archiveNotification = await archiveAndNotifyRealBet(env, {
+    reference_id: safe(bet?.referenceId || referenceId),
+    event_id: safe(bet?.eventId),
+    match: safe(bet?.eventName) || null,
+    home: null,
+    away: null,
+    market_url: safe(bet?.marketUrl),
+    currency: safe(bet?.currency || BET_CURRENCY),
+    stake: bet?.stake,
+    odds: bet?.price,
+    bet_status: status,
+    bet_error_code: safe(bet?.betErrorCode) || null,
+    http_status: numberOrNull(lookup?.http_status),
+    transport: "GRAPHQL",
+    source,
+    response: lookup?.response
+  });
+
+  await env.DB.prepare(`
+    UPDATE auto_e2e_test_guard
+    SET status = 'COMPLETED_ACCEPTED', updated_at = ?
+    WHERE test_key = ?
+  `).bind(
+    nowISO(),
+    AUTO_E2E_TEST_KEY
+  ).run();
+
+  return {
+    ...lookup,
+    archived: archiveNotification?.archived === true,
+    archive_notification: archiveNotification
+  };
+}
+
 // ============================================================
 // V7.6.11 — AUTOMATIC END-TO-END ONE-SHOT TEST
 // Triggered only from the normal /run Hunter flow.
@@ -4960,6 +5177,8 @@ async function autoE2ETestStatus(env: Env): Promise<any> {
     enabled: AUTO_E2E_TEST_ENABLED,
     normal_betting_enabled: BETTING_ENABLED,
     max_real_bets: 1,
+    test_generation: "SECOND_ONE_SHOT",
+    archive_policy: "ONLY_AFTER_CLOUDBET_ACCEPTED",
     stake: AUTO_E2E_TEST_STAKE,
     currency: BET_CURRENCY,
     consumed: !!row,
@@ -5085,44 +5304,82 @@ async function runAutoE2EOneShot(env: Env, signal: any, eventIdInput: any): Prom
     const placeBet = responseBody?.data?.placeBet ?? null;
     const betStatus = safe(placeBet?.betStatus) || (response.ok ? "UNKNOWN" : "HTTP_ERROR");
     const betErrorCode = safe(placeBet?.betErrorCode) || null;
+    const returnedReferenceId = safe(placeBet?.referenceId || referenceId);
 
+    // V7.6.18:
+    // The POST response is NOT enough to call the bet "placed" when Cloudbet says
+    // PENDING_ACCEPTANCE. We persist only the technical safety state here.
+    // real_bet_archive remains untouched until a direct Cloudbet bet(referenceId)
+    // query confirms betStatus=ACCEPTED.
     await env.DB.prepare(`
       UPDATE auto_e2e_test_guard
-      SET status = 'COMPLETED', http_status = ?, response_json = ?, updated_at = ?
+      SET status = ?, reference_id = ?, http_status = ?, response_json = ?, updated_at = ?
       WHERE test_key = ?
-    `).bind(httpStatus, JSON.stringify(responseBody ?? null).slice(0, 12000), nowISO(), AUTO_E2E_TEST_KEY).run();
+    `).bind(
+      betStatus,
+      returnedReferenceId,
+      httpStatus,
+      JSON.stringify(responseBody ?? null).slice(0, 12000),
+      nowISO(),
+      AUTO_E2E_TEST_KEY
+    ).run();
 
     await env.DB.prepare(`
-      UPDATE real_bet_guard SET status = ?, reference_id = ?, updated_at = ? WHERE guard_key = ?
-    `).bind(betStatus, safe(placeBet?.referenceId || referenceId), nowISO(), realBetGuardKey(eventId, marketUrl)).run();
+      UPDATE real_bet_guard
+      SET status = ?, reference_id = ?, updated_at = ?
+      WHERE guard_key = ?
+    `).bind(
+      betStatus,
+      returnedReferenceId,
+      nowISO(),
+      realBetGuardKey(eventId, marketUrl)
+    ).run();
 
     const teams = cloudbetEventTeams(current?.event);
-    const archiveNotification = await archiveAndNotifyRealBet(env, {
-      reference_id: safe(placeBet?.referenceId || referenceId),
-      event_id: safe(placeBet?.eventId || eventId),
-      match: teams.match || signalMatch(signal),
-      home: teams.home || signalHome(signal),
-      away: teams.away || signalAway(signal),
-      market_url: safe(placeBet?.marketUrl || marketUrl),
-      currency: safe(placeBet?.currency || BET_CURRENCY),
-      stake: placeBet?.stake ?? AUTO_E2E_TEST_STAKE,
-      odds: placeBet?.price ?? price,
+
+    // If Cloudbet already returned ACCEPTED on PlaceBet, confirm once more from
+    // the dedicated bet(referenceId) query before archiving.
+    // If it returned PENDING_ACCEPTANCE, no archive row is created.
+    let cloudbetConfirmation: any = {
+      found: false,
+      accepted: false,
       bet_status: betStatus,
-      bet_error_code: betErrorCode,
-      http_status: httpStatus,
-      transport: "GRAPHQL",
-      source: "AUTO_E2E_ONE_SHOT_0_10",
-      response: responseBody
-    });
+      archived: false,
+      archive_reason: "WAITING_FOR_CLOUDBET_ACCEPTED"
+    };
+
+    if (returnedReferenceId) {
+      cloudbetConfirmation = await confirmAndArchiveCloudbetBet(
+        env,
+        returnedReferenceId,
+        "AUTO_E2E_CONFIRMED_ACCEPTED"
+      );
+    }
 
     return {
-      attempted: true, consumed: true, max_real_bets: 1, event_id: eventId,
+      attempted: true,
+      consumed: true,
+      max_real_bets: 1,
+      event_id: eventId,
       match: teams.match || signalMatch(signal),
-      request: { endpoint: GRAPHQL_ENDPOINT, operation: "PlaceBet", reference_id: referenceId, event_id: eventId,
-                 market_url: marketUrl, price: String(price), stake: AUTO_E2E_TEST_STAKE, currency: BET_CURRENCY,
-                 balance_before_request: account.balance },
-      response: { ok: response.ok, status: httpStatus, body: responseBody },
-      archive_notification: archiveNotification
+      request: {
+        endpoint: GRAPHQL_ENDPOINT,
+        operation: "PlaceBet",
+        reference_id: referenceId,
+        event_id: eventId,
+        market_url: marketUrl,
+        price: String(price),
+        stake: AUTO_E2E_TEST_STAKE,
+        currency: BET_CURRENCY,
+        balance_before_request: account.balance
+      },
+      response: {
+        ok: response.ok,
+        status: httpStatus,
+        body: responseBody
+      },
+      cloudbet_confirmation: cloudbetConfirmation,
+      real_bet_archived: cloudbetConfirmation?.archived === true
     };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -7031,6 +7288,7 @@ function healthResponse():
       "/real-test-010",
       "/real-bets",
       "/auto-test-status",
+      "/bet-status?reference_id=...",
       "/telegram-test",
       "/trading-diagnostic",
       "/graphql-diagnostic",
@@ -7135,6 +7393,7 @@ export default {
             "/real-test-010",
             "/real-bets",
             "/auto-test-status",
+            "/bet-status?reference_id=...",
             "/telegram-test",
             "/trading-diagnostic",
             "/graphql-diagnostic",
@@ -7218,6 +7477,36 @@ export default {
           return json({ success: false, worker: "cloudbet-bet-worker", version: VERSION, error: "METHOD_NOT_ALLOWED", expected_method: "GET" }, 405);
         }
         return json(await autoE2ETestStatus(env));
+      }
+
+      if (path === "/bet-status") {
+        if (request.method !== "GET") {
+          return json({
+            success: false,
+            worker: "cloudbet-bet-worker",
+            version: VERSION,
+            error: "METHOD_NOT_ALLOWED",
+            expected_method: "GET"
+          }, 405);
+        }
+
+        const referenceId = url.searchParams.get("reference_id");
+        const result = await confirmAndArchiveCloudbetBet(
+          env,
+          referenceId,
+          "BET_STATUS_CONFIRMED_ACCEPTED"
+        );
+
+        return json({
+          success: result?.success === true,
+          worker: "cloudbet-bet-worker",
+          version: VERSION,
+          action: "CLOUDBET_BET_STATUS",
+          reference_id: safe(referenceId),
+          normal_betting_enabled: BETTING_ENABLED,
+          real_bet_archived: result?.archived === true,
+          result
+        });
       }
 
       if (path === "/real-bets") {
