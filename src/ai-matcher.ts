@@ -44,7 +44,7 @@ interface Env {
   TRACKER: any;
 }
 
-const VERSION = "AI-MATCHER-V1.3.3-BET-WORKER-RESOLVE-HISTORY-500";
+const VERSION = "AI-MATCHER-V1.3.4-LOCKED-EVENT-SYNC";
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 const CLOUDBET_BASE = "https://www.cloudbet.com";
@@ -839,6 +839,192 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
 }
 
 
+
+// ============================================================
+// V1.3.4 — LOCKED EVENT SYNCHRONIZATION
+// ============================================================
+
+function requestedResolveMode(
+  input: AnyObj
+): string {
+  return str(
+    input?.resolve_mode ??
+    input?.matcher_sync?.ai_mode ??
+    ""
+  ).toUpperCase();
+}
+
+function requestedLockedEventId(
+  input: AnyObj
+): string | null {
+  const id =
+    str(
+      input?.locked_event_id ??
+      input?.matcher_sync?.old_matcher_event_id ??
+      ""
+    );
+
+  return id || null;
+}
+
+async function verifyLockedEventWithAi(
+  env: Env,
+  rawInput: AnyObj,
+  signal: AnyObj,
+  rawEvents: AnyObj[]
+): Promise<AnyObj> {
+
+  const lockedEventId =
+    requestedLockedEventId(
+      rawInput
+    );
+
+  if (!lockedEventId) {
+    return {
+      matched: false,
+      accepted: false,
+      event_id: null,
+      confidence: 0,
+      reason:
+        "LOCKED_EVENT_ID_MISSING",
+      cloudbet_match: null,
+      candidate: null
+    };
+  }
+
+  const rawCandidate =
+    rawEvents.find(
+      event =>
+        eventId(event) ===
+        lockedEventId
+    );
+
+  if (!rawCandidate) {
+    return {
+      matched: false,
+      accepted: false,
+      event_id:
+        lockedEventId,
+      confidence: 0,
+      reason:
+        "LOCKED_EVENT_NOT_IN_CURRENT_LIVE_FEED",
+      cloudbet_match: null,
+      candidate: null,
+      locked_event_id:
+        lockedEventId
+    };
+  }
+
+  const candidate =
+    compactCandidate(
+      rawCandidate,
+      0
+    );
+
+  const categoryGuard =
+    hardCategoryGuard(
+      signal,
+      candidate
+    );
+
+  if (!categoryGuard.ok) {
+    const firstConflict =
+      categoryGuard.conflicts[0] ??
+      null;
+
+    return {
+      matched: true,
+      accepted: false,
+      event_id:
+        lockedEventId,
+      confidence: 0,
+      reason:
+        firstConflict
+          ? `HARD_CATEGORY_GUARD:${firstConflict.type}:${firstConflict.side}`
+          : "HARD_CATEGORY_GUARD",
+      cloudbet_match:
+        `${candidate.home} v ${candidate.away}`,
+      candidate,
+      category_guard:
+        categoryGuard,
+      locked_event_id:
+        lockedEventId
+    };
+  }
+
+  // AI sees ONLY the deterministic matcher's locked candidate.
+  const aiResult =
+    await askAiForBatch(
+      env,
+      signal,
+      [candidate]
+    );
+
+  const checked =
+    validateAiSelection(
+      aiResult.parsed,
+      [candidate]
+    );
+
+  const sameEvent =
+    checked?.valid === true &&
+    checked?.matched === true &&
+    str(
+      checked?.event_id
+    ) === lockedEventId;
+
+  const confidence =
+    boundedConfidence(
+      checked?.confidence
+    );
+
+  const accepted =
+    sameEvent &&
+    confidence >=
+      AI_ACCEPT_CONFIDENCE;
+
+  return {
+    matched:
+      sameEvent,
+    accepted,
+    event_id:
+      lockedEventId,
+    confidence,
+    threshold:
+      AI_ACCEPT_CONFIDENCE,
+    reason:
+      accepted
+        ? (
+            checked?.reason ||
+            "AI_CONFIRMED_LOCKED_EVENT"
+          )
+        : (
+            checked?.reason ||
+            "AI_DID_NOT_CONFIRM_LOCKED_EVENT"
+          ),
+    cloudbet_match:
+      `${candidate.home} v ${candidate.away}`,
+    candidate,
+    category_guard:
+      categoryGuard,
+    locked_event_id:
+      lockedEventId,
+    diagnostics: {
+      mode:
+        "VERIFY_LOCKED_EVENT",
+      candidates_given_to_ai:
+        1,
+      ai_processing_ms:
+        aiResult?.processing_ms ??
+        null,
+      ai_usage:
+        aiResult?.usage ??
+        null
+    }
+  };
+}
+
+
 // ============================================================
 // TRACKER + D1 HISTORY
 // ============================================================
@@ -1158,7 +1344,27 @@ async function processOneSignal(env: Env, rawSignal: AnyObj, forcedKey?: string)
 
   const started = Date.now();
   const rawEvents = await getRawCloudbetLive();
-  const result = await matchWithAi(env, signal, rawEvents);
+
+  const resolveMode =
+    requestedResolveMode(
+      rawSignal
+    );
+
+  const result =
+    resolveMode ===
+      "VERIFY_LOCKED_EVENT"
+      ? await verifyLockedEventWithAi(
+          env,
+          rawSignal,
+          signal,
+          rawEvents
+        )
+      : await matchWithAi(
+          env,
+          signal,
+          rawEvents
+        );
+
   const processingMs = Date.now() - started;
 
   await storeHistory(env, rawSignal, signal, result, processingMs, forcedKey);
@@ -1575,7 +1781,16 @@ export default {
         const key = signalKey(body, signal);
         const existing = await getHistoryRowByKey(env, key);
 
+        const resolveMode =
+          requestedResolveMode(
+            body
+          );
+
+        // Locked verification is candidate-specific and must not reuse a
+        // general cached AI choice for the same Hunter signal.
         if (
+          resolveMode !==
+            "VERIFY_LOCKED_EVENT" &&
           existing &&
           str(existing?.matcher_version) === VERSION
         ) {
@@ -1597,7 +1812,25 @@ export default {
           });
         }
 
-        const processed = await processOneSignal(env, body, key);
+        const effectiveKey =
+          resolveMode ===
+            "VERIFY_LOCKED_EVENT"
+            ? key +
+              "|locked:" +
+              (
+                requestedLockedEventId(
+                  body
+                ) ||
+                "missing"
+              )
+            : key;
+
+        const processed =
+          await processOneSignal(
+            env,
+            body,
+            effectiveKey
+          );
 
         return json({
           success: true,
