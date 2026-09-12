@@ -147,7 +147,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.24 PENDING CRON + CALLBACK RETRY SAFE - BETTING OFF";
+  "V7.6.25 PENDING TIME + CRON + CALLBACK RETRY SAFE - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -3752,8 +3752,8 @@ async function loadPending(
         FROM pending_odds
         WHERE
           next_check_at IS NULL
-          OR next_check_at <= datetime('now')
-        ORDER BY id ASC
+          OR datetime(next_check_at) <= datetime('now')
+        ORDER BY datetime(next_check_at) ASC, id ASC
         LIMIT 100
       `)
       .all<PendingRow>();
@@ -3811,12 +3811,14 @@ async function incrementPendingRetry(
       UPDATE pending_odds
       SET
         retry_count = ?,
+        last_checked_at = ?,
         updated_at = ?,
         next_check_at = ?
       WHERE id = ?
     `)
     .bind(
       nextRetry,
+      nowISO(),
       nowISO(),
       nextCheck,
       row.id
@@ -4679,7 +4681,7 @@ async function processPending(
         current
       );
 
-    // V7.6.24 — callback is a required part of completing a pending odds row.
+    // V7.6.25 — callback is a required part of completing a pending odds row.
     // If Tracker cannot persist/acknowledge the recovered odds, keep the
     // pending row and retry it on the next cron tick. Never silently delete it.
     if (
