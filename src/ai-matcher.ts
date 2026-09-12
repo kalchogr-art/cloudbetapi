@@ -1,39 +1,16 @@
 // ============================================================
-// V1.3.3 BET WORKER INTEGRATION
-// - Adds POST /resolve for Bet Worker service binding
-// - /resolve reuses only cache rows created by THIS exact matcher version
-// - Older V1.3.1/V1.3.2 rows are NOT trusted as current cache
-// - Stores matcher_version + category_guard_ok in D1
-// - History retention raised from 30 to 500 rows
-// - Existing AI matching + hard category guard preserved
-// - READ ONLY / NO BETTING
-// ============================================================
-
-// ============================================================
-// V1.3.2 HARD CATEGORY GUARD
-// - AI still sees all RAW Cloudbet live soccer events
-// - Missing Cloudbet minute/period remains allowed
-// - Final AI event_id is deterministically blocked on explicit:
-//     U19/U20/U21/etc mismatch
-//     Women vs Men mismatch
-//     Reserve / II / B-team / Academy vs Senior mismatch
-// - AI confidence cannot override a hard category conflict
-// - READ ONLY / NO BETTING
-// ============================================================
-
-// ============================================================
-// AI MATCHER — V1.0
-// RAW CLOUDBET LIVE SOCCER -> WORKERS AI MATCH IDENTITY
+// AI MATCHER V1.3.5 — LOCKED CANDIDATE FIRST + 1H 0:0 FALLBACK
 // READ ONLY / NO BETTING
 //
-// PURPOSE
-// - Receives a Hunter signal
-// - Reads RAW Cloudbet LIVE soccer events directly
-// - DOES NOT drop candidates by fuzzy-name formulas
-// - Sends all raw live candidates to AI in batches
-// - AI chooses the most likely Cloudbet event_id
-// - Returned event_id is verified against the exact candidate set
-// - NO BETTING ACTION EXISTS IN THIS WORKER
+// V1.3.5:
+// 1) VERIFY_LOCKED_EVENT can verify matcher_sync.weak_candidate / locked_candidate
+//    directly, without first loading 200 raw Cloudbet events.
+// 2) Generic AI fallback is reduced before AI to LIVE + 1H + 0:0.
+// 3) Missing Cloudbet period is tolerated only when minute is known <= 45.
+// 4) Explicit non-1H periods and explicit non-0:0 scores are rejected.
+// 5) Existing hard category guard (youth/women/reserve) is preserved.
+// 6) Same D1 history schema/endpoints are preserved.
+// 7) No betting action exists in this Worker.
 // ============================================================
 
 type AnyObj = Record<string, any>;
@@ -44,7 +21,7 @@ interface Env {
   TRACKER: any;
 }
 
-const VERSION = "AI-MATCHER-V1.3.4-LOCKED-EVENT-SYNC";
+const VERSION = "AI-MATCHER-V1.3.5-LOCKED-CANDIDATE-1H-00-FALLBACK";
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 const CLOUDBET_BASE = "https://www.cloudbet.com";
@@ -52,14 +29,16 @@ const SPORTS_EVENTS_PATH = "/sports-api/c/v6/sports/events";
 const CLOUDBET_TIMEOUT_MS = 8000;
 const LIVE_LIMIT = 200;
 
-// Every raw LIVE event is allowed to reach AI.
-// We batch only to keep prompts manageable.
-const AI_BATCH_SIZE = 35;
-const AI_FINALISTS_LIMIT = 12;
+const AI_BATCH_SIZE = 20;
+const AI_FINALISTS_LIMIT = 10;
 const AI_ACCEPT_CONFIDENCE = 0.90;
 
+const HISTORY_LIMIT = 500;
+const TRACKER_TIMEOUT_MS = 8000;
+const MAX_SIGNALS_PER_SCAN = 5;
+
 // ============================================================
-// RESPONSE
+// RESPONSE / GENERIC HELPERS
 // ============================================================
 
 function json(data: any, status = 200): Response {
@@ -74,9 +53,15 @@ function json(data: any, status = 200): Response {
   });
 }
 
-// ============================================================
-// GENERIC HELPERS
-// ============================================================
+function html(body: string, status = 200): Response {
+  return new Response(body, {
+    status,
+    headers: {
+      "content-type": "text/html; charset=UTF-8",
+      "cache-control": "no-store, max-age=0"
+    }
+  });
+}
 
 function str(value: any): string {
   return String(value ?? "").trim();
@@ -121,20 +106,18 @@ function splitMatchName(value: any): { home: string | null; away: string | null 
 }
 
 function extractHome(match: AnyObj): string | null {
-  if (typeof match?.home === "string") return match.home;
-  if (typeof match?.homeTeam === "string") return match.homeTeam;
-  if (typeof match?.home_name === "string") return match.home_name;
-  if (typeof match?.home?.name === "string") return match.home.name;
-
+  if (typeof match?.home === "string") return str(match.home) || null;
+  if (typeof match?.homeTeam === "string") return str(match.homeTeam) || null;
+  if (typeof match?.home_name === "string") return str(match.home_name) || null;
+  if (typeof match?.home?.name === "string") return str(match.home.name) || null;
   return splitMatchName(match?.match ?? match?.name ?? "").home;
 }
 
 function extractAway(match: AnyObj): string | null {
-  if (typeof match?.away === "string") return match.away;
-  if (typeof match?.awayTeam === "string") return match.awayTeam;
-  if (typeof match?.away_name === "string") return match.away_name;
-  if (typeof match?.away?.name === "string") return match.away.name;
-
+  if (typeof match?.away === "string") return str(match.away) || null;
+  if (typeof match?.awayTeam === "string") return str(match.awayTeam) || null;
+  if (typeof match?.away_name === "string") return str(match.away_name) || null;
+  if (typeof match?.away?.name === "string") return str(match.away.name) || null;
   return splitMatchName(match?.match ?? match?.name ?? "").away;
 }
 
@@ -163,11 +146,7 @@ function eventMinute(match: AnyObj): number | null {
 }
 
 function scoreOf(match: AnyObj): { home: number | null; away: number | null } {
-  const candidates = [
-    match?.score,
-    match?.scores,
-    match?.result
-  ];
+  const candidates = [match?.score, match?.scores, match?.result];
 
   for (const score of candidates) {
     if (!score || typeof score !== "object") continue;
@@ -179,20 +158,23 @@ function scoreOf(match: AnyObj): { home: number | null; away: number | null } {
       score?.away ?? score?.awayScore ?? score?.away_score ?? score?.participant2
     );
 
-    if (home !== null || away !== null) {
-      return { home, away };
-    }
+    if (home !== null || away !== null) return { home, away };
   }
 
   return {
-    home: numOrNull(match?.homeScore ?? match?.home_score),
-    away: numOrNull(match?.awayScore ?? match?.away_score)
+    home: numOrNull(match?.homeScore ?? match?.home_score ?? match?.score_home),
+    away: numOrNull(match?.awayScore ?? match?.away_score ?? match?.score_away)
   };
 }
 
 function isLive(match: AnyObj): boolean {
   const status = str(match?.status).toUpperCase();
-  return match?.live === true || status === "LIVE" || status === "TRADING_LIVE" || status.includes("LIVE");
+  return (
+    match?.live === true ||
+    status === "LIVE" ||
+    status === "TRADING_LIVE" ||
+    status.includes("LIVE")
+  );
 }
 
 function periodText(match: AnyObj): string | null {
@@ -212,8 +194,17 @@ function eventId(match: AnyObj): string {
   return str(match?.id ?? match?.event_id ?? match?.eventId ?? match?.key ?? "");
 }
 
+function escapeHtml(value: any): string {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
 // ============================================================
-// HUNTER SIGNAL PARSER
+// HUNTER SIGNAL
 // ============================================================
 
 function normalizeSignal(input: AnyObj): AnyObj {
@@ -221,10 +212,9 @@ function normalizeSignal(input: AnyObj): AnyObj {
     ? input.signal
     : input;
 
-  const parsedFromMatch = splitMatchName(raw?.match ?? raw?.match_name ?? raw?.name ?? "");
-
-  const home = str(raw?.home ?? raw?.home_team ?? parsedFromMatch.home ?? "");
-  const away = str(raw?.away ?? raw?.away_team ?? parsedFromMatch.away ?? "");
+  const parsed = splitMatchName(raw?.match ?? raw?.match_name ?? raw?.name ?? "");
+  const home = str(raw?.home ?? raw?.home_team ?? parsed.home ?? "");
+  const away = str(raw?.away ?? raw?.away_team ?? parsed.away ?? "");
 
   return {
     id: str(raw?.id ?? raw?.signal_id ?? raw?.match_id ?? "") || null,
@@ -245,7 +235,7 @@ function signalValid(signal: AnyObj): boolean {
 }
 
 // ============================================================
-// DIRECT CLOUDBET RAW LIVE SOCCER
+// CLOUDBET LIVE
 // ============================================================
 
 async function fetchCloudbetJson(url: string): Promise<any> {
@@ -304,17 +294,8 @@ async function getRawCloudbetLive(): Promise<AnyObj[]> {
   url.searchParams.set("limit", String(LIVE_LIMIT));
   url.searchParams.set("locale", "en");
 
-  // IMPORTANT:
-  // NO market filter here.
-  // NO minute filter here.
-  // NO period filter here.
-  // NO score filter here.
-  // NO name similarity filter here.
   const result = await fetchCloudbetJson(url.toString());
-
-  if (!result.ok) {
-    throw new Error(`CLOUDBET_LIVE_FAILED:${result.error}`);
-  }
+  if (!result.ok) throw new Error(`CLOUDBET_LIVE_FAILED:${result.error}`);
 
   const events: AnyObj[] = [];
   const sports = Array.isArray(result.data?.sports) ? result.data.sports : [];
@@ -341,8 +322,6 @@ async function getRawCloudbetLive(): Promise<AnyObj[]> {
     }
   }
 
-  // The endpoint is requested with live=true, but we keep this tolerant:
-  // if Cloudbet omits/changes the status field we do not silently drop it.
   return events;
 }
 
@@ -365,20 +344,83 @@ function compactCandidate(event: AnyObj, index: number): AnyObj {
   };
 }
 
+// ============================================================
+// V1.3.5 GENERIC FALLBACK FILTER: LIVE + 1H + 0:0
+// ============================================================
+
+function normalizedPeriod(value: any): string {
+  return str(value)
+    .toLowerCase()
+    .replace(/[._-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function explicitFirstHalf(value: any): boolean | null {
+  const p = normalizedPeriod(value);
+  if (!p) return null;
+
+  if (
+    ["1p", "1h", "1", "first half", "firsthalf", "first period", "firstperiod"].includes(p) ||
+    p.includes("first half")
+  ) {
+    return true;
+  }
+
+  if (
+    ["2p", "2h", "2", "second half", "secondhalf", "half time", "halftime", "ht"].includes(p) ||
+    p.includes("second half")
+  ) {
+    return false;
+  }
+
+  return null;
+}
+
+function fallbackCandidateDecision(candidate: AnyObj): AnyObj {
+  if (!candidate?.event_id || !candidate?.home || !candidate?.away) {
+    return { ok: false, reason: "IDENTITY_FIELDS_MISSING" };
+  }
+
+  // Endpoint itself is requested with live=true. If Cloudbet explicitly says
+  // a non-live status, reject it. Missing/odd status is tolerated.
+  const status = str(candidate?.status).toUpperCase();
+  if (status && !candidate?.live && !status.includes("TRADING")) {
+    return { ok: false, reason: "EXPLICIT_NOT_LIVE" };
+  }
+
+  // Generic fallback is intentionally 0:0 only.
+  if (candidate?.score_home !== 0 || candidate?.score_away !== 0) {
+    return { ok: false, reason: "NOT_EXPLICIT_0_0" };
+  }
+
+  const firstHalf = explicitFirstHalf(candidate?.period);
+  if (firstHalf === false) {
+    return { ok: false, reason: "EXPLICIT_NOT_FIRST_HALF" };
+  }
+
+  if (firstHalf === true) {
+    return { ok: true, reason: "EXPLICIT_1H_0_0" };
+  }
+
+  // Recovery for Cloudbet records with missing period metadata.
+  // Only a known minute inside normal first-half time is allowed.
+  const minute = parseMinute(candidate?.minute);
+  if (minute !== null && minute >= 0 && minute <= 45) {
+    return { ok: true, reason: "PERIOD_MISSING_MINUTE_RECOVERY_1H_0_0" };
+  }
+
+  return { ok: false, reason: "FIRST_HALF_NOT_CONFIRMED" };
+}
+
+function genericFallbackCandidates(rawEvents: AnyObj[]): AnyObj[] {
+  return rawEvents
+    .map((event, index) => compactCandidate(event, index))
+    .filter(candidate => fallbackCandidateDecision(candidate).ok === true);
+}
 
 // ============================================================
 // HARD CATEGORY GUARD
-// ============================================================
-//
-// Purpose:
-// AI may identify aliases very well, but category identity must never be
-// overridden by AI confidence. These checks are deterministic and run
-// AFTER the final AI selection.
-//
-// IMPORTANT:
-// - Missing Cloudbet minute / period is NOT a rejection reason.
-// - Only explicit team-category conflicts are blocked.
-// - The guard compares HOME-to-HOME and AWAY-to-AWAY separately.
 // ============================================================
 
 type TeamCategoryProfile = {
@@ -400,8 +442,7 @@ function normalizedCategoryText(value: any): string {
 }
 
 function teamCategoryProfile(value: any): TeamCategoryProfile {
-  const raw = str(value);
-  const text = normalizedCategoryText(raw);
+  const text = normalizedCategoryText(value);
 
   const youthMatch =
     text.match(/(?:^|\s)u[\s-]?(\d{2})(?:\s|$)/i) ??
@@ -413,9 +454,6 @@ function teamCategoryProfile(value: any): TeamCategoryProfile {
     /(?:^|\s)(women|woman|womens|ladies|female|femenino|femenina)(?:\s|$)/i.test(text) ||
     /(?:^|\s)w(?:\s|$)/i.test(text);
 
-  // Reserve / second-team markers.
-  // These are deliberately conservative to avoid treating numbers that are
-  // part of normal club names as reserve markers.
   const reservePatterns: Array<[RegExp, string]> = [
     [/(?:^|\s)(reserve|reserves|res)(?:\s|$)/i, "RESERVE"],
     [/(?:^|\s)(academy)(?:\s|$)/i, "ACADEMY"],
@@ -452,21 +490,17 @@ function compareTeamCategory(
   const hunter = teamCategoryProfile(hunterTeam);
   const cloudbet = teamCategoryProfile(cloudbetTeam);
 
-  // Explicit youth age mismatch OR youth only on one side.
-  if (hunter.youth_age !== cloudbet.youth_age) {
-    if (hunter.youth_age || cloudbet.youth_age) {
-      return {
-        side,
-        type: "YOUTH_CATEGORY_CONFLICT",
-        hunter_team: str(hunterTeam),
-        cloudbet_team: str(cloudbetTeam),
-        hunter_category: hunter,
-        cloudbet_category: cloudbet
-      };
-    }
+  if (hunter.youth_age !== cloudbet.youth_age && (hunter.youth_age || cloudbet.youth_age)) {
+    return {
+      side,
+      type: "YOUTH_CATEGORY_CONFLICT",
+      hunter_team: str(hunterTeam),
+      cloudbet_team: str(cloudbetTeam),
+      hunter_category: hunter,
+      cloudbet_category: cloudbet
+    };
   }
 
-  // Women must agree when explicitly present.
   if (hunter.women !== cloudbet.women) {
     return {
       side,
@@ -478,7 +512,6 @@ function compareTeamCategory(
     };
   }
 
-  // Reserve / II / B / Academy must agree when explicitly present.
   if (hunter.reserve !== cloudbet.reserve) {
     return {
       side,
@@ -496,25 +529,13 @@ function compareTeamCategory(
 function hardCategoryGuard(signal: AnyObj, candidate: AnyObj): AnyObj {
   const conflicts: AnyObj[] = [];
 
-  const homeConflict = compareTeamCategory(
-    signal?.home,
-    candidate?.home,
-    "HOME"
-  );
-
-  const awayConflict = compareTeamCategory(
-    signal?.away,
-    candidate?.away,
-    "AWAY"
-  );
+  const homeConflict = compareTeamCategory(signal?.home, candidate?.home, "HOME");
+  const awayConflict = compareTeamCategory(signal?.away, candidate?.away, "AWAY");
 
   if (homeConflict) conflicts.push(homeConflict);
   if (awayConflict) conflicts.push(awayConflict);
 
-  return {
-    ok: conflicts.length === 0,
-    conflicts
-  };
+  return { ok: conflicts.length === 0, conflicts };
 }
 
 // ============================================================
@@ -524,10 +545,8 @@ function hardCategoryGuard(signal: AnyObj, candidate: AnyObj): AnyObj {
 function aiText(result: any): string {
   const choiceContent = result?.choices?.[0]?.message?.content;
   if (typeof choiceContent === "string") return choiceContent.trim();
-
   if (typeof result?.response === "string") return result.response.trim();
   if (typeof result?.result?.response === "string") return result.result.response.trim();
-
   return "";
 }
 
@@ -543,7 +562,6 @@ function parseAiJson(text: string): AnyObj | null {
   } catch {
     const first = cleaned.indexOf("{");
     const last = cleaned.lastIndexOf("}");
-
     if (first >= 0 && last > first) {
       try {
         const parsed = JSON.parse(cleaned.slice(first, last + 1));
@@ -552,7 +570,6 @@ function parseAiJson(text: string): AnyObj | null {
         return null;
       }
     }
-
     return null;
   }
 }
@@ -568,13 +585,12 @@ function systemPrompt(): string {
     "You are a football fixture identity matcher.",
     "Your ONLY job is to identify whether a Hunter fixture corresponds to one of the supplied Cloudbet LIVE events.",
     "Provider names can differ because of abbreviations, aliases, sponsorship names, club founding years, transliteration, punctuation, country suffixes, youth notation, women notation, reserve notation, or city/club naming conventions.",
-    "Examples of legitimate naming differences can include Levski Sofia vs Levski 1914, PSG vs Paris Saint-Germain, or Como U19 vs a provider club label that omits U19 when the competition context clearly establishes a youth fixture.",
     "Do NOT invent an event_id.",
     "Do NOT select a candidate just because one team matches.",
     "Do NOT treat different youth ages, women vs men, reserve/II/B/Academy vs senior, or clearly different clubs as the same fixture.",
     "Competition, minute, period and score are supporting context only. Missing metadata is not by itself a reason to reject an otherwise clear identity match.",
     "Never discuss betting or whether a wager should be placed.",
-    "Return JSON only. No markdown and no text outside the JSON.",
+    "Return JSON only.",
     "Required schema: {\"matched\":boolean,\"event_id\":string|null,\"confidence\":number,\"reason\":string}.",
     "Confidence must be between 0 and 1.",
     "If there is no sufficiently clear candidate, return matched=false and event_id=null."
@@ -599,18 +615,15 @@ async function askAiForBatch(env: Env, signal: AnyObj, candidates: AnyObj[]): Pr
       { role: "system", content: systemPrompt() },
       { role: "user", content: prompt }
     ],
-    chat_template_kwargs: {
-      enable_thinking: false
-    }
+    chat_template_kwargs: { enable_thinking: false }
   });
 
   const text = aiText(raw);
-  const parsed = parseAiJson(text);
 
   return {
     processing_ms: Date.now() - started,
     text,
-    parsed,
+    parsed: parseAiJson(text),
     usage: raw?.usage ?? null
   };
 }
@@ -644,7 +657,6 @@ function validateAiSelection(parsed: AnyObj | null, candidates: AnyObj[]): AnyOb
   }
 
   const candidate = candidates.find(c => str(c?.event_id) === selectedId) ?? null;
-
   if (!candidate) {
     return {
       valid: false,
@@ -668,16 +680,18 @@ function validateAiSelection(parsed: AnyObj | null, candidates: AnyObj[]): AnyOb
 
 function chunks<T>(items: T[], size: number): T[][] {
   const out: T[][] = [];
-  for (let i = 0; i < items.length; i += size) {
-    out.push(items.slice(i, i + size));
-  }
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
   return out;
 }
 
 async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promise<AnyObj> {
-  const candidates = rawEvents
+  const allCompact = rawEvents
     .map((event, index) => compactCandidate(event, index))
     .filter(candidate => Boolean(candidate.event_id && candidate.home && candidate.away));
+
+  const candidates = allCompact.filter(
+    candidate => fallbackCandidateDecision(candidate).ok === true
+  );
 
   if (candidates.length === 0) {
     return {
@@ -685,12 +699,15 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
       accepted: false,
       event_id: null,
       confidence: 0,
-      reason: "NO_RAW_CLOUDBET_CANDIDATES",
+      reason: "NO_LIVE_1H_0_0_CLOUDBET_CANDIDATES",
       cloudbet_match: null,
       candidate: null,
+      category_guard: { ok: false, conflicts: [] },
       diagnostics: {
         raw_events: rawEvents.length,
+        raw_identity_candidates: allCompact.length,
         usable_candidates: 0,
+        candidate_filter: "LIVE_1H_0_0",
         batches: 0,
         ai_calls: 0
       }
@@ -730,12 +747,15 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
       accepted: false,
       event_id: null,
       confidence: 0,
-      reason: "AI_NO_MATCH_ACROSS_ALL_RAW_LIVE_BATCHES",
+      reason: "AI_NO_MATCH_ACROSS_1H_0_0_CANDIDATES",
       cloudbet_match: null,
       candidate: null,
+      category_guard: { ok: false, conflicts: [] },
       diagnostics: {
         raw_events: rawEvents.length,
+        raw_identity_candidates: allCompact.length,
         usable_candidates: candidates.length,
+        candidate_filter: "LIVE_1H_0_0",
         batches: batches.length,
         ai_calls: batches.length,
         finalists: 0,
@@ -744,8 +764,6 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
     };
   }
 
-  // If only one batch produced a candidate, that candidate is still sent
-  // through one final confirmation call. This keeps one uniform decision path.
   const finalPool = finalists
     .sort((a, b) => Number(b.batch_confidence ?? 0) - Number(a.batch_confidence ?? 0))
     .slice(0, AI_FINALISTS_LIMIT);
@@ -762,9 +780,12 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
       reason: finalChecked.reason || "AI_FINAL_CONFIRMATION_FAILED",
       cloudbet_match: null,
       candidate: null,
+      category_guard: { ok: false, conflicts: [] },
       diagnostics: {
         raw_events: rawEvents.length,
+        raw_identity_candidates: allCompact.length,
         usable_candidates: candidates.length,
+        candidate_filter: "LIVE_1H_0_0",
         batches: batches.length,
         ai_calls: batches.length + 1,
         finalists: finalists.length,
@@ -776,14 +797,10 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
   }
 
   const candidate = finalChecked.candidate;
-
-  // V1.3.2 HARD CATEGORY GUARD
-  // AI confidence can NEVER override an explicit category conflict.
   const categoryGuard = hardCategoryGuard(signal, candidate);
 
   if (!categoryGuard.ok) {
     const firstConflict = categoryGuard.conflicts[0] ?? null;
-
     return {
       matched: true,
       accepted: false,
@@ -799,7 +816,9 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
       category_guard: categoryGuard,
       diagnostics: {
         raw_events: rawEvents.length,
+        raw_identity_candidates: allCompact.length,
         usable_candidates: candidates.length,
+        candidate_filter: "LIVE_1H_0_0",
         batches: batches.length,
         ai_calls: batches.length + 1,
         finalists: finalists.length,
@@ -818,16 +837,16 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
     event_id: finalChecked.event_id,
     confidence: finalChecked.confidence,
     threshold: AI_ACCEPT_CONFIDENCE,
-    reason: accepted
-      ? finalChecked.reason
-      : "AI_MATCH_BELOW_ACCEPT_CONFIDENCE",
+    reason: accepted ? finalChecked.reason : "AI_MATCH_BELOW_ACCEPT_CONFIDENCE",
     ai_reason: finalChecked.reason,
     cloudbet_match: `${candidate.home} v ${candidate.away}`,
     candidate,
     category_guard: categoryGuard,
     diagnostics: {
       raw_events: rawEvents.length,
+      raw_identity_candidates: allCompact.length,
       usable_candidates: candidates.length,
+      candidate_filter: "LIVE_1H_0_0",
       batches: batches.length,
       ai_calls: batches.length + 1,
       finalists: finalists.length,
@@ -838,46 +857,193 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
   };
 }
 
-
-
 // ============================================================
-// V1.3.4 — LOCKED EVENT SYNCHRONIZATION
+// V1.3.5 — LOCKED CANDIDATE FIRST
 // ============================================================
 
-function requestedResolveMode(
-  input: AnyObj
-): string {
-  return str(
-    input?.resolve_mode ??
-    input?.matcher_sync?.ai_mode ??
-    ""
-  ).toUpperCase();
+function requestedResolveMode(input: AnyObj): string {
+  return str(input?.resolve_mode ?? input?.matcher_sync?.ai_mode ?? "").toUpperCase();
 }
 
-function requestedLockedEventId(
-  input: AnyObj
-): string | null {
-  const id =
-    str(
-      input?.locked_event_id ??
-      input?.matcher_sync?.old_matcher_event_id ??
-      ""
-    );
-
+function requestedLockedEventId(input: AnyObj): string | null {
+  const id = str(
+    input?.locked_event_id ??
+    input?.matcher_sync?.old_matcher_event_id ??
+    ""
+  );
   return id || null;
 }
 
-async function verifyLockedEventWithAi(
+function requestedLockedCandidate(input: AnyObj): AnyObj | null {
+  const candidate =
+    input?.locked_candidate ??
+    input?.matcher_sync?.weak_candidate ??
+    input?.matcher_sync?.old_matcher_candidate ??
+    null;
+
+  return candidate && typeof candidate === "object" ? candidate : null;
+}
+
+function normalizeSuppliedCandidate(raw: AnyObj): AnyObj {
+  const parsed = splitMatchName(raw?.match ?? raw?.name ?? "");
+  const score = scoreOf(raw);
+
+  return {
+    index: 0,
+    event_id: str(raw?.event_id ?? raw?.eventId ?? raw?.id ?? raw?.key ?? ""),
+    home: str(raw?.home ?? raw?.home_team ?? raw?.homeTeam ?? parsed.home ?? "") || null,
+    away: str(raw?.away ?? raw?.away_team ?? raw?.awayTeam ?? parsed.away ?? "") || null,
+    competition: competitionName(raw),
+    competition_key: competitionKey(raw),
+    status: str(raw?.status) || null,
+    live: raw?.live === true || isLive(raw),
+    period: periodText(raw),
+    minute: parseMinute(
+      raw?.minute ??
+      raw?.minute_extended ??
+      raw?.cloudbet_minute ??
+      raw?.metadata?.eventTimeExtended ??
+      null
+    ),
+    score_home: score.home ?? numOrNull(raw?.score_home),
+    score_away: score.away ?? numOrNull(raw?.score_away)
+  };
+}
+
+async function verifyCandidateObjectWithAi(
+  env: Env,
+  signal: AnyObj,
+  lockedEventId: string,
+  candidate: AnyObj,
+  source: string
+): Promise<AnyObj> {
+  if (!candidate?.event_id || candidate.event_id !== lockedEventId) {
+    return {
+      matched: false,
+      accepted: false,
+      event_id: lockedEventId,
+      confidence: 0,
+      reason: "LOCKED_CANDIDATE_EVENT_ID_MISMATCH",
+      cloudbet_match: null,
+      candidate,
+      category_guard: { ok: false, conflicts: [] },
+      locked_event_id: lockedEventId,
+      diagnostics: {
+        mode: "VERIFY_LOCKED_EVENT",
+        candidate_source: source,
+        raw_feed_used: false,
+        candidates_given_to_ai: 0
+      }
+    };
+  }
+
+  if (!candidate.home || !candidate.away) {
+    return {
+      matched: false,
+      accepted: false,
+      event_id: lockedEventId,
+      confidence: 0,
+      reason: "LOCKED_CANDIDATE_TEAMS_MISSING",
+      cloudbet_match: null,
+      candidate,
+      category_guard: { ok: false, conflicts: [] },
+      locked_event_id: lockedEventId,
+      diagnostics: {
+        mode: "VERIFY_LOCKED_EVENT",
+        candidate_source: source,
+        raw_feed_used: false,
+        candidates_given_to_ai: 0
+      }
+    };
+  }
+
+  const categoryGuard = hardCategoryGuard(signal, candidate);
+  if (!categoryGuard.ok) {
+    const firstConflict = categoryGuard.conflicts[0] ?? null;
+    return {
+      matched: true,
+      accepted: false,
+      event_id: lockedEventId,
+      confidence: 0,
+      reason: firstConflict
+        ? `HARD_CATEGORY_GUARD:${firstConflict.type}:${firstConflict.side}`
+        : "HARD_CATEGORY_GUARD",
+      cloudbet_match: `${candidate.home} v ${candidate.away}`,
+      candidate,
+      category_guard: categoryGuard,
+      locked_event_id: lockedEventId,
+      diagnostics: {
+        mode: "VERIFY_LOCKED_EVENT",
+        candidate_source: source,
+        raw_feed_used: false,
+        candidates_given_to_ai: 0
+      }
+    };
+  }
+
+  const aiResult = await askAiForBatch(env, signal, [candidate]);
+  const checked = validateAiSelection(aiResult.parsed, [candidate]);
+
+  const sameEvent =
+    checked?.valid === true &&
+    checked?.matched === true &&
+    str(checked?.event_id) === lockedEventId;
+
+  const confidence = boundedConfidence(checked?.confidence);
+  const accepted = sameEvent && confidence >= AI_ACCEPT_CONFIDENCE;
+
+  return {
+    matched: sameEvent,
+    accepted,
+    event_id: lockedEventId,
+    confidence,
+    threshold: AI_ACCEPT_CONFIDENCE,
+    reason: accepted
+      ? (checked?.reason || "AI_CONFIRMED_LOCKED_EVENT")
+      : (checked?.reason || "AI_DID_NOT_CONFIRM_LOCKED_EVENT"),
+    cloudbet_match: `${candidate.home} v ${candidate.away}`,
+    candidate,
+    category_guard: categoryGuard,
+    locked_event_id: lockedEventId,
+    diagnostics: {
+      mode: "VERIFY_LOCKED_EVENT",
+      candidate_source: source,
+      raw_feed_used: false,
+      candidates_given_to_ai: 1,
+      ai_processing_ms: aiResult?.processing_ms ?? null,
+      ai_usage: aiResult?.usage ?? null
+    }
+  };
+}
+
+async function verifyLockedCandidateDirect(
+  env: Env,
+  rawInput: AnyObj,
+  signal: AnyObj
+): Promise<AnyObj | null> {
+  const lockedEventId = requestedLockedEventId(rawInput);
+  const suppliedRaw = requestedLockedCandidate(rawInput);
+
+  if (!lockedEventId || !suppliedRaw) return null;
+
+  const candidate = normalizeSuppliedCandidate(suppliedRaw);
+
+  return verifyCandidateObjectWithAi(
+    env,
+    signal,
+    lockedEventId,
+    candidate,
+    "LOCKED_CANDIDATE_FROM_MATCHER"
+  );
+}
+
+async function verifyLockedEventFromRawFeed(
   env: Env,
   rawInput: AnyObj,
   signal: AnyObj,
   rawEvents: AnyObj[]
 ): Promise<AnyObj> {
-
-  const lockedEventId =
-    requestedLockedEventId(
-      rawInput
-    );
+  const lockedEventId = requestedLockedEventId(rawInput);
 
   if (!lockedEventId) {
     return {
@@ -885,172 +1051,57 @@ async function verifyLockedEventWithAi(
       accepted: false,
       event_id: null,
       confidence: 0,
-      reason:
-        "LOCKED_EVENT_ID_MISSING",
+      reason: "LOCKED_EVENT_ID_MISSING",
       cloudbet_match: null,
-      candidate: null
+      candidate: null,
+      category_guard: { ok: false, conflicts: [] }
     };
   }
 
-  const rawCandidate =
-    rawEvents.find(
-      event =>
-        eventId(event) ===
-        lockedEventId
-    );
+  const rawCandidate = rawEvents.find(event => eventId(event) === lockedEventId);
 
   if (!rawCandidate) {
     return {
       matched: false,
       accepted: false,
-      event_id:
-        lockedEventId,
+      event_id: lockedEventId,
       confidence: 0,
-      reason:
-        "LOCKED_EVENT_NOT_IN_CURRENT_LIVE_FEED",
+      reason: "LOCKED_EVENT_NOT_IN_CURRENT_LIVE_FEED",
       cloudbet_match: null,
       candidate: null,
-      locked_event_id:
-        lockedEventId
+      category_guard: { ok: false, conflicts: [] },
+      locked_event_id: lockedEventId,
+      diagnostics: {
+        mode: "VERIFY_LOCKED_EVENT",
+        candidate_source: "RAW_LIVE_FEED_EVENT_ID_LOOKUP",
+        raw_feed_used: true,
+        raw_events: rawEvents.length,
+        candidates_given_to_ai: 0
+      }
     };
   }
 
-  const candidate =
-    compactCandidate(
-      rawCandidate,
-      0
-    );
-
-  const categoryGuard =
-    hardCategoryGuard(
-      signal,
-      candidate
-    );
-
-  if (!categoryGuard.ok) {
-    const firstConflict =
-      categoryGuard.conflicts[0] ??
-      null;
-
-    return {
-      matched: true,
-      accepted: false,
-      event_id:
-        lockedEventId,
-      confidence: 0,
-      reason:
-        firstConflict
-          ? `HARD_CATEGORY_GUARD:${firstConflict.type}:${firstConflict.side}`
-          : "HARD_CATEGORY_GUARD",
-      cloudbet_match:
-        `${candidate.home} v ${candidate.away}`,
-      candidate,
-      category_guard:
-        categoryGuard,
-      locked_event_id:
-        lockedEventId
-    };
-  }
-
-  // AI sees ONLY the deterministic matcher's locked candidate.
-  const aiResult =
-    await askAiForBatch(
-      env,
-      signal,
-      [candidate]
-    );
-
-  const checked =
-    validateAiSelection(
-      aiResult.parsed,
-      [candidate]
-    );
-
-  const sameEvent =
-    checked?.valid === true &&
-    checked?.matched === true &&
-    str(
-      checked?.event_id
-    ) === lockedEventId;
-
-  const confidence =
-    boundedConfidence(
-      checked?.confidence
-    );
-
-  const accepted =
-    sameEvent &&
-    confidence >=
-      AI_ACCEPT_CONFIDENCE;
-
-  return {
-    matched:
-      sameEvent,
-    accepted,
-    event_id:
-      lockedEventId,
-    confidence,
-    threshold:
-      AI_ACCEPT_CONFIDENCE,
-    reason:
-      accepted
-        ? (
-            checked?.reason ||
-            "AI_CONFIRMED_LOCKED_EVENT"
-          )
-        : (
-            checked?.reason ||
-            "AI_DID_NOT_CONFIRM_LOCKED_EVENT"
-          ),
-    cloudbet_match:
-      `${candidate.home} v ${candidate.away}`,
+  const candidate = compactCandidate(rawCandidate, 0);
+  const result = await verifyCandidateObjectWithAi(
+    env,
+    signal,
+    lockedEventId,
     candidate,
-    category_guard:
-      categoryGuard,
-    locked_event_id:
-      lockedEventId,
-    diagnostics: {
-      mode:
-        "VERIFY_LOCKED_EVENT",
-      candidates_given_to_ai:
-        1,
-      ai_processing_ms:
-        aiResult?.processing_ms ??
-        null,
-      ai_usage:
-        aiResult?.usage ??
-        null
-    }
+    "RAW_LIVE_FEED_EVENT_ID_LOOKUP"
+  );
+
+  result.diagnostics = {
+    ...(result.diagnostics ?? {}),
+    raw_feed_used: true,
+    raw_events: rawEvents.length
   };
-}
 
+  return result;
+}
 
 // ============================================================
-// TRACKER + D1 HISTORY
+// D1 HISTORY / TRACKER
 // ============================================================
-
-const HISTORY_LIMIT = 500;
-const TRACKER_TIMEOUT_MS = 8000;
-const MAX_SIGNALS_PER_SCAN = 5;
-
-function html(body: string, status = 200): Response {
-  return new Response(body, {
-    status,
-    headers: {
-      "content-type": "text/html; charset=UTF-8",
-      "cache-control": "no-store, max-age=0"
-    }
-  });
-}
-
-function escapeHtml(value: any): string {
-  return String(value ?? "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/\"/g, "&quot;")
-    .replace(/'/g, "&#039;");
-}
 
 async function ensureSchema(env: Env): Promise<void> {
   await env.DB.prepare(`
@@ -1083,7 +1134,6 @@ async function ensureSchema(env: Env): Promise<void> {
     )
   `).run();
 
-  // V1.3.3 safe migrations for an existing ai-matcher-db.
   for (const migration of [
     "ALTER TABLE ai_match_history ADD COLUMN matcher_version TEXT",
     "ALTER TABLE ai_match_history ADD COLUMN category_guard_ok INTEGER"
@@ -1092,9 +1142,7 @@ async function ensureSchema(env: Env): Promise<void> {
       await env.DB.prepare(migration).run();
     } catch (error: any) {
       const message = String(error?.message ?? error).toLowerCase();
-      if (!message.includes("duplicate column") && !message.includes("already exists")) {
-        throw error;
-      }
+      if (!message.includes("duplicate column") && !message.includes("already exists")) throw error;
     }
   }
 
@@ -1134,9 +1182,7 @@ function signalKey(raw: AnyObj, signal: AnyObj): string {
   const entryMinute = parseMinute(raw?.entry_minute ?? signal?.minute ?? null);
   const entryTime = str(raw?.entry_time ?? raw?.created_at ?? raw?.timestamp ?? "");
 
-  if (matchId) {
-    return `match:${matchId}:${entryMinute ?? "x"}:${entryTime || "x"}`;
-  }
+  if (matchId) return `match:${matchId}:${entryMinute ?? "x"}:${entryTime || "x"}`;
 
   return [
     "fixture",
@@ -1159,10 +1205,7 @@ async function fetchTrackerEntries(env: Env): Promise<AnyObj[]> {
       headers: { accept: "application/json" }
     });
 
-    if (!response.ok) {
-      throw new Error(`TRACKER_HTTP_${response.status}`);
-    }
-
+    if (!response.ok) throw new Error(`TRACKER_HTTP_${response.status}`);
     const data = await response.json();
     return trackerEntries(data);
   } finally {
@@ -1174,18 +1217,13 @@ async function historyHasKey(env: Env, key: string): Promise<boolean> {
   const row = await env.DB.prepare(
     "SELECT id FROM ai_match_history WHERE signal_key = ? LIMIT 1"
   ).bind(key).first();
-
   return Boolean(row);
 }
 
 async function getHistoryRowByKey(env: Env, key: string): Promise<AnyObj | null> {
   const row = await env.DB.prepare(
-    `SELECT *
-     FROM ai_match_history
-     WHERE signal_key = ?
-     LIMIT 1`
+    `SELECT * FROM ai_match_history WHERE signal_key = ? LIMIT 1`
   ).bind(key).first();
-
   return row ? row as AnyObj : null;
 }
 
@@ -1204,10 +1242,7 @@ function cachedResultFromRow(row: AnyObj): AnyObj {
       period: row?.cloudbet_period ?? null,
       minute: parseMinute(row?.cloudbet_minute)
     },
-    category_guard: {
-      ok: categoryGuardOk,
-      conflicts: []
-    },
+    category_guard: { ok: categoryGuardOk, conflicts: [] },
     cache: {
       hit: true,
       matcher_version: row?.matcher_version ?? null,
@@ -1228,37 +1263,15 @@ async function storeHistory(
   const key = forcedKey || signalKey(rawSignal, signal);
   const candidate = result?.candidate ?? null;
   const diagnostics = result?.diagnostics ?? {};
-
-  const categoryGuardOk =
-    result?.category_guard?.ok === true
-      ? 1
-      : 0;
+  const categoryGuardOk = result?.category_guard?.ok === true ? 1 : 0;
 
   await env.DB.prepare(`
     INSERT INTO ai_match_history (
-      signal_key,
-      signal_id,
-      match_id,
-      hunter_match,
-      hunter_home,
-      hunter_away,
-      competition,
-      hunter_minute,
-      hunter_score,
-      ai_matched,
-      ai_accepted,
-      cloudbet_event_id,
-      cloudbet_match,
-      confidence,
-      reason,
-      cloudbet_period,
-      cloudbet_minute,
-      raw_events,
-      usable_candidates,
-      ai_calls,
-      processing_ms,
-      matcher_version,
-      category_guard_ok
+      signal_key, signal_id, match_id, hunter_match, hunter_home, hunter_away,
+      competition, hunter_minute, hunter_score, ai_matched, ai_accepted,
+      cloudbet_event_id, cloudbet_match, confidence, reason, cloudbet_period,
+      cloudbet_minute, raw_events, usable_candidates, ai_calls, processing_ms,
+      matcher_version, category_guard_ok
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(signal_key) DO UPDATE SET
       signal_id = excluded.signal_id,
@@ -1303,8 +1316,8 @@ async function storeHistory(
     candidate?.period ?? null,
     candidate?.minute ?? null,
     diagnostics?.raw_events ?? null,
-    diagnostics?.usable_candidates ?? null,
-    diagnostics?.ai_calls ?? null,
+    diagnostics?.usable_candidates ?? diagnostics?.candidates_given_to_ai ?? null,
+    diagnostics?.ai_calls ?? (diagnostics?.candidates_given_to_ai === 1 ? 1 : null),
     processingMs,
     VERSION,
     categoryGuardOk
@@ -1313,9 +1326,7 @@ async function storeHistory(
   await env.DB.prepare(`
     DELETE FROM ai_match_history
     WHERE id NOT IN (
-      SELECT id FROM ai_match_history
-      ORDER BY id DESC
-      LIMIT ?
+      SELECT id FROM ai_match_history ORDER BY id DESC LIMIT ?
     )
   `).bind(HISTORY_LIMIT).run();
 }
@@ -1323,50 +1334,44 @@ async function storeHistory(
 async function getHistory(env: Env, limit = HISTORY_LIMIT): Promise<AnyObj[]> {
   const safeLimit = Math.max(1, Math.min(HISTORY_LIMIT, Math.floor(limit)));
   const result = await env.DB.prepare(`
-    SELECT *
-    FROM ai_match_history
-    ORDER BY id DESC
-    LIMIT ?
+    SELECT * FROM ai_match_history ORDER BY id DESC LIMIT ?
   `).bind(safeLimit).all();
 
   return Array.isArray(result?.results) ? result.results as AnyObj[] : [];
 }
 
-async function processOneSignal(env: Env, rawSignal: AnyObj, forcedKey?: string): Promise<AnyObj> {
+async function processOneSignal(
+  env: Env,
+  rawSignal: AnyObj,
+  forcedKey?: string
+): Promise<AnyObj> {
   const signal = normalizeSignal(rawSignal);
+
   if (!signalValid(signal)) {
-    return {
-      processed: false,
-      reason: "INVALID_SIGNAL",
-      signal
-    };
+    return { processed: false, reason: "INVALID_SIGNAL", signal };
   }
 
   const started = Date.now();
-  const rawEvents = await getRawCloudbetLive();
+  const resolveMode = requestedResolveMode(rawSignal);
+  let result: AnyObj;
 
-  const resolveMode =
-    requestedResolveMode(
-      rawSignal
-    );
+  // V1.3.5: if matcher supplied the concrete candidate, verify it directly.
+  if (resolveMode === "VERIFY_LOCKED_EVENT") {
+    const direct = await verifyLockedCandidateDirect(env, rawSignal, signal);
 
-  const result =
-    resolveMode ===
-      "VERIFY_LOCKED_EVENT"
-      ? await verifyLockedEventWithAi(
-          env,
-          rawSignal,
-          signal,
-          rawEvents
-        )
-      : await matchWithAi(
-          env,
-          signal,
-          rawEvents
-        );
+    if (direct) {
+      result = direct;
+    } else {
+      // Backward-compatible fallback for callers that send only event_id.
+      const rawEvents = await getRawCloudbetLive();
+      result = await verifyLockedEventFromRawFeed(env, rawSignal, signal, rawEvents);
+    }
+  } else {
+    const rawEvents = await getRawCloudbetLive();
+    result = await matchWithAi(env, signal, rawEvents);
+  }
 
   const processingMs = Date.now() - started;
-
   await storeHistory(env, rawSignal, signal, result, processingMs, forcedKey);
 
   return {
@@ -1385,7 +1390,6 @@ async function scanTracker(env: Env): Promise<AnyObj> {
 
   const entries = await fetchTrackerEntries(env);
   const eligible = entries.filter(trackerSignalEligible);
-
   const unseen: Array<{ raw: AnyObj; signal: AnyObj; key: string }> = [];
 
   for (const raw of eligible) {
@@ -1395,9 +1399,7 @@ async function scanTracker(env: Env): Promise<AnyObj> {
     unseen.push({ raw, signal, key });
   }
 
-  // Oldest first is safer when several ENTRY signals arrive between cron runs.
   unseen.reverse();
-
   const selected = unseen.slice(0, MAX_SIGNALS_PER_SCAN);
   const processed: AnyObj[] = [];
 
@@ -1427,6 +1429,10 @@ async function scanTracker(env: Env): Promise<AnyObj> {
   };
 }
 
+// ============================================================
+// SIMPLE DASHBOARD
+// ============================================================
+
 function confidenceLabel(value: any): string {
   const n = Number(value);
   if (!Number.isFinite(n)) return "0%";
@@ -1437,128 +1443,31 @@ function dashboardPage(rows: AnyObj[]): string {
   const tableRows = rows.map(row => {
     const accepted = Number(row.ai_accepted) === 1;
     const matched = Number(row.ai_matched) === 1;
+    const status = accepted ? "✅ MATCH" : matched ? "⚠️ LOW CONF" : "❌ NO MATCH";
 
-    const status = accepted
-      ? "✅ MATCH"
-      : matched
-        ? "⚠️ LOW CONF"
-        : "❌ NO MATCH";
-
-    const hunter = `${escapeHtml(row.hunter_home)} <span class="sep">vs</span> ${escapeHtml(row.hunter_away)}`;
-    const cloudbet = row.cloudbet_match
-      ? escapeHtml(row.cloudbet_match)
-      : '<span class="muted">—</span>';
-
-    const meta = [
-      row.competition ? escapeHtml(row.competition) : null,
-      row.hunter_minute !== null && row.hunter_minute !== undefined
-        ? `${escapeHtml(row.hunter_minute)}'`
-        : null,
-      row.hunter_score !== null && row.hunter_score !== undefined
-        ? `Hunter ${escapeHtml(row.hunter_score)}`
-        : null
-    ].filter(Boolean).join(" · ");
-
-    const cbMeta = [
-      row.cloudbet_period ? escapeHtml(row.cloudbet_period) : null,
-      row.cloudbet_minute !== null && row.cloudbet_minute !== undefined
-        ? `${escapeHtml(row.cloudbet_minute)}'`
-        : null
-    ].filter(Boolean).join(" · ");
-
-    return `
-      <tr>
-        <td class="time">${escapeHtml(row.created_at)}</td>
-        <td>
-          <div class="fixture">${hunter}</div>
-          <div class="meta">${meta || "—"}</div>
-        </td>
-        <td>
-          <div class="fixture">${cloudbet}</div>
-          <div class="meta">${cbMeta || "—"}</div>
-        </td>
-        <td class="center"><strong>${confidenceLabel(row.confidence)}</strong></td>
-        <td class="mono">${row.cloudbet_event_id ? escapeHtml(row.cloudbet_event_id) : "—"}</td>
-        <td class="status ${accepted ? "ok" : matched ? "warn" : "bad"}">${status}</td>
-        <td class="reason">
-          <details class="reason-details">
-            <summary>🤖 Покажи причина</summary>
-            <div class="reason-text">${escapeHtml(row.reason ?? "—")}</div>
-          </details>
-        </td>
-      </tr>`;
+    return `<tr>
+      <td>${escapeHtml(row.created_at)}</td>
+      <td><b>${escapeHtml(row.hunter_home)} vs ${escapeHtml(row.hunter_away)}</b><br><small>${escapeHtml(row.competition ?? "")}</small></td>
+      <td>${escapeHtml(row.cloudbet_match ?? "—")}</td>
+      <td>${confidenceLabel(row.confidence)}</td>
+      <td>${escapeHtml(row.cloudbet_event_id ?? "—")}</td>
+      <td>${status}</td>
+      <td>${escapeHtml(row.reason ?? "—")}</td>
+    </tr>`;
   }).join("");
 
   return `<!doctype html>
 <html lang="bg">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="refresh" content="30">
-  <title>AI Matcher Watch</title>
-  <style>
-    *{box-sizing:border-box}
-    body{margin:0;background:#0b1020;color:#eef2ff;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
-    .wrap{max-width:1600px;margin:0 auto;padding:18px}
-    .top{display:flex;gap:14px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin-bottom:14px}
-    h1{font-size:22px;margin:0}
-    .badge{background:#18213a;border:1px solid #2d395b;border-radius:999px;padding:7px 11px;font-size:13px;color:#cbd5e1}
-    .cards{display:flex;gap:10px;flex-wrap:wrap;margin:0 0 14px}
-    .card{background:#11182b;border:1px solid #25304d;border-radius:12px;padding:10px 13px;font-size:13px;color:#cbd5e1}
-    .tablebox{overflow:auto;border:1px solid #25304d;border-radius:14px;background:#0f1628}
-    table{width:100%;border-collapse:collapse;min-width:1100px}
-    th{position:sticky;top:0;background:#18213a;color:#cbd5e1;text-align:left;font-size:12px;padding:11px;border-bottom:1px solid #2d395b}
-    td{padding:11px;border-bottom:1px solid #1f2942;vertical-align:top;font-size:13px}
-    tr:last-child td{border-bottom:0}
-    .fixture{font-weight:700;font-size:14px;white-space:nowrap}
-    .sep{font-weight:500;color:#64748b;padding:0 3px}
-    .meta,.muted{margin-top:4px;color:#94a3b8;font-size:12px}
-    .time{white-space:nowrap;color:#94a3b8}
-    .center{text-align:center;white-space:nowrap}
-    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;white-space:nowrap}
-    .status{font-weight:800;white-space:nowrap}
-    .ok{color:#4ade80}.warn{color:#facc15}.bad{color:#fb7185}
-    .reason{max-width:360px;color:#cbd5e1}
-    .reason-details{max-width:360px}
-    .reason-details summary{cursor:pointer;color:#93c5fd;font-weight:700;white-space:nowrap;user-select:none}
-    .reason-details summary:hover{color:#bfdbfe}
-    .reason-text{margin-top:8px;line-height:1.45;color:#cbd5e1;white-space:normal}
-    .empty{padding:28px;text-align:center;color:#94a3b8}
-    a{color:#93c5fd;text-decoration:none}
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="top">
-      <h1>🤖 AI Matcher Watch</h1>
-      <div class="badge">${escapeHtml(VERSION)} · READ ONLY · Betting disabled</div>
-    </div>
-    <div class="cards">
-      <div class="card">Последни записи: <strong>${rows.length}/${HISTORY_LIMIT}</strong></div>
-      <div class="card">Auto refresh: <strong>30 sec</strong></div>
-      <div class="card"><a href="/scan">▶ Manual scan</a></div>
-      <div class="card"><a href="/api/history">JSON history</a></div>
-    </div>
-    <div class="tablebox">
-      ${rows.length ? `
-      <table>
-        <thead>
-          <tr>
-            <th>Време UTC</th>
-            <th>Hunter сигнал</th>
-            <th>AI намерен Cloudbet мач</th>
-            <th>Confidence</th>
-            <th>Event ID</th>
-            <th>Резултат</th>
-            <th>AI reason</th>
-          </tr>
-        </thead>
-        <tbody>${tableRows}</tbody>
-      </table>` : '<div class="empty">Още няма записани AI проверки. Cron или /scan ще добави първите.</div>'}
-    </div>
-  </div>
-</body>
-</html>`;
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="30"><title>AI Matcher Watch</title>
+<style>
+body{margin:0;background:#0b1020;color:#eef2ff;font-family:system-ui,Arial,sans-serif}.wrap{padding:16px;max-width:1500px;margin:auto}table{width:100%;border-collapse:collapse;background:#11182b}th,td{padding:10px;border-bottom:1px solid #25304d;text-align:left;font-size:13px}th{background:#18213a}.badge{display:inline-block;padding:6px 10px;background:#18213a;border-radius:999px;color:#cbd5e1;margin-bottom:12px}.scroll{overflow:auto}a{color:#93c5fd}
+</style></head><body><div class="wrap">
+<h2>🤖 AI Matcher Watch</h2><div class="badge">${escapeHtml(VERSION)} · READ ONLY · Betting disabled</div>
+<p><a href="/scan">▶ Manual scan</a> · <a href="/api/history">JSON history</a> · <a href="/live-test">Live filter test</a></p>
+<div class="scroll"><table><thead><tr><th>UTC</th><th>Hunter</th><th>Cloudbet</th><th>Confidence</th><th>Event ID</th><th>Status</th><th>Reason</th></tr></thead><tbody>${tableRows}</tbody></table></div>
+</div></body></html>`;
 }
 
 // ============================================================
@@ -1580,22 +1489,15 @@ export default {
 
     const url = new URL(request.url);
 
-    // --------------------------------------------------------
-    // HTML DASHBOARD — LAST 500
-    // --------------------------------------------------------
     if (url.pathname === "/" && request.method === "GET") {
       try {
         await ensureSchema(env);
-        const rows = await getHistory(env);
-        return html(dashboardPage(rows));
+        return html(dashboardPage(await getHistory(env)));
       } catch (error: any) {
-        return html(`<!doctype html><html><body style="font-family:system-ui;padding:20px"><h2>AI Matcher</h2><p>Dashboard storage error: ${escapeHtml(String(error?.message ?? error))}</p><p>Check DB binding in ai-matcher.json.</p></body></html>`, 500);
+        return html(`<h2>AI Matcher</h2><pre>${escapeHtml(String(error?.message ?? error))}</pre>`, 500);
       }
     }
 
-    // --------------------------------------------------------
-    // JSON STATUS
-    // --------------------------------------------------------
     if (url.pathname === "/status" && request.method === "GET") {
       return json({
         success: true,
@@ -1607,9 +1509,8 @@ export default {
         db_binding: Boolean(env.DB),
         tracker_binding: Boolean(env.TRACKER),
         model: MODEL,
-        history_limit: HISTORY_LIMIT,
-        max_signals_per_scan: MAX_SIGNALS_PER_SCAN,
-        architecture: "TRACKER/BET_WORKER -> RAW CLOUDBET LIVE -> BATCHED AI IDENTITY MATCH -> HARD CATEGORY GUARD -> D1 LAST 500",
+        architecture: "LOCKED CANDIDATE DIRECT VERIFY -> GENERIC LIVE + 1H + 0:0 AI FALLBACK -> HARD CATEGORY GUARD",
+        fallback_filter: "LIVE + 1H + 0:0; missing period allowed only with minute <=45",
         endpoints: {
           dashboard: "GET /",
           status: "GET /status",
@@ -1623,16 +1524,9 @@ export default {
       });
     }
 
-    // --------------------------------------------------------
-    // MANUAL TRACKER SCAN
-    // --------------------------------------------------------
     if (url.pathname === "/scan" && request.method === "GET") {
       try {
-        return json({
-          worker: "ai-matcher",
-          version: VERSION,
-          ...(await scanTracker(env))
-        });
+        return json({ worker: "ai-matcher", version: VERSION, ...(await scanTracker(env)) });
       } catch (error: any) {
         return json({
           success: false,
@@ -1644,9 +1538,6 @@ export default {
       }
     }
 
-    // --------------------------------------------------------
-    // HISTORY JSON
-    // --------------------------------------------------------
     if (url.pathname === "/api/history" && request.method === "GET") {
       try {
         await ensureSchema(env);
@@ -1660,33 +1551,32 @@ export default {
           history: rows
         });
       } catch (error: any) {
-        return json({
-          success: false,
-          error: "HISTORY_FAILED",
-          message: String(error?.message ?? error)
-        }, 500);
+        return json({ success: false, error: "HISTORY_FAILED", message: String(error?.message ?? error) }, 500);
       }
     }
 
-    // --------------------------------------------------------
-    // RAW LIVE DIAGNOSTIC — NO AI
-    // --------------------------------------------------------
     if (url.pathname === "/live-test" && request.method === "GET") {
       try {
         const events = await getRawCloudbetLive();
-        const candidates = events
+        const allCandidates = events
           .map((event, index) => compactCandidate(event, index))
           .filter(candidate => Boolean(candidate.event_id && candidate.home && candidate.away));
+        const filtered = allCandidates.filter(c => fallbackCandidateDecision(c).ok === true);
 
         return json({
           success: true,
           worker: "ai-matcher",
           version: VERSION,
-          action: "RAW_CLOUDBET_LIVE_TEST",
+          action: "LIVE_1H_0_0_FILTER_TEST",
           betting: "DISABLED",
           raw_events: events.length,
-          usable_candidates: candidates.length,
-          sample: candidates.slice(0, 20)
+          identity_candidates: allCandidates.length,
+          filtered_1h_0_0: filtered.length,
+          sample: filtered.slice(0, 30),
+          rejected_sample: allCandidates
+            .filter(c => !fallbackCandidateDecision(c).ok)
+            .slice(0, 15)
+            .map(c => ({ ...c, filter_reason: fallbackCandidateDecision(c).reason }))
         });
       } catch (error: any) {
         return json({
@@ -1699,13 +1589,8 @@ export default {
       }
     }
 
-    // --------------------------------------------------------
-    // DYNAMIC GET MATCH — ALSO STORED IN HISTORY
-    // --------------------------------------------------------
     if (url.pathname === "/match-get" && request.method === "GET") {
-      if (!env.AI) {
-        return json({ success: false, error: "AI_BINDING_MISSING" }, 500);
-      }
+      if (!env.AI) return json({ success: false, error: "AI_BINDING_MISSING" }, 500);
 
       const signal = normalizeSignal({
         home: url.searchParams.get("home"),
@@ -1727,9 +1612,7 @@ export default {
 
       try {
         await ensureSchema(env);
-        const forcedKey = `manual:${crypto.randomUUID()}`;
-        const processed = await processOneSignal(env, signal, forcedKey);
-
+        const processed = await processOneSignal(env, signal, `manual:${crypto.randomUUID()}`);
         return json({
           success: true,
           worker: "ai-matcher",
@@ -1740,24 +1623,12 @@ export default {
           ...processed
         });
       } catch (error: any) {
-        return json({
-          success: false,
-          error: "AI_MATCH_FAILED",
-          message: String(error?.message ?? error)
-        }, 500);
+        return json({ success: false, error: "AI_MATCH_FAILED", message: String(error?.message ?? error) }, 500);
       }
     }
 
-    // --------------------------------------------------------
-    // V1.3.3 RESOLVE FOR BET WORKER
-    // - Uses current-version D1 cache when available
-    // - Otherwise performs a fresh AI match and stores it
-    // - READ ONLY: never places a bet
-    // --------------------------------------------------------
     if (url.pathname === "/resolve" && request.method === "POST") {
-      if (!env.AI) {
-        return json({ success: false, error: "AI_BINDING_MISSING" }, 500);
-      }
+      if (!env.AI) return json({ success: false, error: "AI_BINDING_MISSING" }, 500);
 
       let body: AnyObj;
       try {
@@ -1768,11 +1639,7 @@ export default {
 
       const signal = normalizeSignal(body);
       if (!signalValid(signal)) {
-        return json({
-          success: false,
-          error: "INVALID_SIGNAL",
-          received_signal: signal
-        }, 400);
+        return json({ success: false, error: "INVALID_SIGNAL", received_signal: signal }, 400);
       }
 
       try {
@@ -1780,22 +1647,15 @@ export default {
 
         const key = signalKey(body, signal);
         const existing = await getHistoryRowByKey(env, key);
+        const resolveMode = requestedResolveMode(body);
 
-        const resolveMode =
-          requestedResolveMode(
-            body
-          );
-
-        // Locked verification is candidate-specific and must not reuse a
-        // general cached AI choice for the same Hunter signal.
+        // Generic current-version result can be cached.
+        // Locked candidate verification is always candidate-specific.
         if (
-          resolveMode !==
-            "VERIFY_LOCKED_EVENT" &&
+          resolveMode !== "VERIFY_LOCKED_EVENT" &&
           existing &&
           str(existing?.matcher_version) === VERSION
         ) {
-          const cached = cachedResultFromRow(existing);
-
           return json({
             success: true,
             worker: "ai-matcher",
@@ -1805,7 +1665,7 @@ export default {
             betting: "DISABLED",
             processed: true,
             signal,
-            result: cached,
+            result: cachedResultFromRow(existing),
             cache_hit: true,
             signal_key: key,
             processing_ms: 0
@@ -1813,24 +1673,11 @@ export default {
         }
 
         const effectiveKey =
-          resolveMode ===
-            "VERIFY_LOCKED_EVENT"
-            ? key +
-              "|locked:" +
-              (
-                requestedLockedEventId(
-                  body
-                ) ||
-                "missing"
-              )
+          resolveMode === "VERIFY_LOCKED_EVENT"
+            ? `${key}|locked:${requestedLockedEventId(body) || "missing"}`
             : key;
 
-        const processed =
-          await processOneSignal(
-            env,
-            body,
-            effectiveKey
-          );
+        const processed = await processOneSignal(env, body, effectiveKey);
 
         return json({
           success: true,
@@ -1854,13 +1701,8 @@ export default {
       }
     }
 
-    // --------------------------------------------------------
-    // POST MATCH — ALSO STORED IN HISTORY
-    // --------------------------------------------------------
     if (url.pathname === "/match" && request.method === "POST") {
-      if (!env.AI) {
-        return json({ success: false, error: "AI_BINDING_MISSING" }, 500);
-      }
+      if (!env.AI) return json({ success: false, error: "AI_BINDING_MISSING" }, 500);
 
       let body: AnyObj;
       try {
@@ -1877,7 +1719,6 @@ export default {
       try {
         await ensureSchema(env);
         const processed = await processOneSignal(env, body);
-
         return json({
           success: true,
           worker: "ai-matcher",
@@ -1887,18 +1728,23 @@ export default {
           ...processed
         });
       } catch (error: any) {
-        return json({
-          success: false,
-          error: "AI_MATCH_FAILED",
-          message: String(error?.message ?? error)
-        }, 500);
+        return json({ success: false, error: "AI_MATCH_FAILED", message: String(error?.message ?? error) }, 500);
       }
     }
 
     return json({
       success: false,
       error: "NOT_FOUND",
-      endpoints: ["GET /", "GET /status", "GET /scan", "GET /api/history", "GET /live-test", "GET /match-get", "POST /resolve", "POST /match"]
+      endpoints: [
+        "GET /",
+        "GET /status",
+        "GET /scan",
+        "GET /api/history",
+        "GET /live-test",
+        "GET /match-get",
+        "POST /resolve",
+        "POST /match"
+      ]
     }, 404);
   },
 
