@@ -147,7 +147,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.23 MATCHER SYNC + PENDING ODDS CALLBACK - BETTING OFF";
+  "V7.6.24 PENDING CRON + CALLBACK RETRY SAFE - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -4679,6 +4679,47 @@ async function processPending(
         current
       );
 
+    // V7.6.24 — callback is a required part of completing a pending odds row.
+    // If Tracker cannot persist/acknowledge the recovered odds, keep the
+    // pending row and retry it on the next cron tick. Never silently delete it.
+    if (
+      trackerNotification?.success !== true
+    ) {
+      const retry =
+        await incrementPendingRetry(
+          env,
+          row,
+          "TRACKER_ODDS_CALLBACK_FAILED"
+        );
+
+      results.push({
+        pending_id:
+          row.id,
+        cloudbet_id:
+          cloudbetId,
+        action:
+          "TRACKER_CALLBACK_RETRY",
+        odds_transition:
+          "PENDING_ODDS_FOUND_CALLBACK_FAILED",
+        current,
+        archive,
+        tracker_notification:
+          trackerNotification,
+        ...retry
+      });
+
+      if (
+        retry.action ===
+        "EXPIRED"
+      ) {
+        expired++;
+      } else {
+        rescheduled++;
+      }
+
+      continue;
+    }
+
     const handoff =
       buildTradingHandoff(
         bet,
@@ -8856,6 +8897,65 @@ export default {
         500
       );
     }
+  },
+
+  // V7.6.24 — automatic pending-odds retry.
+  // Requires a Cloudflare Cron Trigger (recommended: * * * * *).
+  // This intentionally processes ONLY the pending queue; it does not rerun
+  // the full Hunter scan or create duplicate ENTRY processing.
+  async scheduled(
+    _event: any,
+    env: Env,
+    ctx: ExecutionContext
+  ): Promise<void> {
+    ctx.waitUntil(
+      (async () => {
+        try {
+          const schema =
+            await ensureDatabaseSchema(env);
+
+          if (!schema.success) {
+            console.error(
+              "PENDING CRON DATABASE_SCHEMA_MIGRATION_FAILED",
+              schema
+            );
+            return;
+          }
+
+          const account =
+            await fetchAccountSnapshot(env);
+
+          const result =
+            await processPending(
+              env,
+              account
+            );
+
+          console.log(
+            "PENDING CRON RESULT",
+            JSON.stringify({
+              pending_found:
+                result?.pending_found ?? 0,
+              completed:
+                result?.completed ?? 0,
+              rescheduled:
+                result?.rescheduled ?? 0,
+              expired:
+                result?.expired ?? 0,
+              missing:
+                result?.missing ?? 0
+            })
+          );
+        } catch (error) {
+          console.error(
+            "PENDING CRON ERROR",
+            error instanceof Error
+              ? error.message
+              : String(error)
+          );
+        }
+      })()
+    );
   }
 };
 
