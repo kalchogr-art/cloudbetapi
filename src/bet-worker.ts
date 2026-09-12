@@ -138,6 +138,8 @@ type Obj = Record<string, any>;
 // - Accepted AI match + unavailable exact odds => persistent PENDING_ODDS.
 // - Existing pending_odds row owns retries; /run does not duplicate checks.
 // - Terminal failures (goal, 1H ended, outside window, changed event) do not retry.
+// - V7.6.26: pending rows hard-expire by ENTRY-minute wall clock at end of 42'.
+// - V7.6.26: explicit finished/resulted/cancelled Cloudbet states are terminal.
 // - SAME AI event_id / exact 1H O0.5 / all final safety gates preserved.
 // - NORMAL BETTING REMAINS OFF; existing one-shot keys are NOT rearmed.
 // ============================================================
@@ -147,7 +149,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.25 PENDING TIME + CRON + CALLBACK RETRY SAFE - BETTING OFF";
+  "V7.6.26 PENDING LIFECYCLE + TIME + CRON FIX - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -240,6 +242,11 @@ const ODDS_EVENT_MAX_RETRIES =
 
 const ODDS_EVENT_RETRY_DELAY_MS =
   30_000;
+
+// V7.6.26 — pending odds must never live beyond the Hunter window.
+// +45s absorbs feed/API timing jitter while still expiring around the end of 42'.
+const PENDING_WINDOW_GRACE_MS =
+  45_000;
 
 const MAX_MISSING_CHECKS =
   3;
@@ -1758,6 +1765,40 @@ function eventStillValidForTarget(
   const score = cloudbetScore(event);
   const period = cloudbetPeriod(event);
   const minute = cloudbetMinute(event);
+
+  // V7.6.26 — explicit Cloudbet lifecycle state is terminal when present.
+  // Do not treat ordinary suspended/disabled markets as ended; those may reopen.
+  const eventStatus = safe(
+    event?.status ??
+    event?.event_status ??
+    event?.eventStatus ??
+    ""
+  ).toUpperCase();
+
+  const terminalStatusHints = [
+    "FINISHED",
+    "RESULTED",
+    "SETTLED",
+    "ENDED",
+    "FINAL",
+    "CANCELLED",
+    "CANCELED",
+    "ABANDONED"
+  ];
+
+  if (
+    terminalStatusHints.some(
+      hint => eventStatus.includes(hint)
+    )
+  ) {
+    return {
+      valid: false,
+      reason: "EVENT_FINISHED",
+      score,
+      period,
+      minute
+    };
+  }
 
   // HARD GATE #1 — if Cloudbet exposes the score, it must still be exactly 0:0.
   // Some live Cloudbet events do not expose a live score at all. In that case
@@ -3560,6 +3601,8 @@ interface PendingRow {
   retry_count?: number;
   missing_count?: number;
   next_check_at?: string;
+  created_at?: string;
+  updated_at?: string;
 }
 
 interface PendingPayload {
@@ -3762,6 +3805,82 @@ async function loadPending(
     result.results ||
     []
   );
+}
+
+// V7.6.26 — hard lifecycle guard for PENDING_ODDS.
+// We cannot rely only on Cloudbet minute/period because many events expose
+// period="" and minute=null. The original Hunter ENTRY minute + row creation
+// time provides a deterministic upper bound: once real time has passed the
+// end of minute 42, there is no valid Hunter opportunity left to recover.
+function pendingHunterWindowState(
+  row: PendingRow
+): {
+  expired: boolean;
+  reason: string | null;
+  entry_minute: number | null;
+  age_ms: number | null;
+  max_age_ms: number | null;
+} {
+  const entryMinute =
+    numberOrNull(row.entry_minute);
+
+  const createdMs =
+    row.created_at
+      ? Date.parse(row.created_at)
+      : NaN;
+
+  if (
+    entryMinute === null ||
+    !Number.isFinite(createdMs)
+  ) {
+    return {
+      expired: false,
+      reason: null,
+      entry_minute: entryMinute,
+      age_ms: Number.isFinite(createdMs)
+        ? Math.max(0, Date.now() - createdMs)
+        : null,
+      max_age_ms: null
+    };
+  }
+
+  if (
+    entryMinute < BET_MINUTE_FROM ||
+    entryMinute > BET_MINUTE_TO
+  ) {
+    return {
+      expired: true,
+      reason: "PENDING_ENTRY_MINUTE_OUTSIDE_WINDOW",
+      entry_minute: entryMinute,
+      age_ms: Math.max(0, Date.now() - createdMs),
+      max_age_ms: 0
+    };
+  }
+
+  // Allow through the whole 42nd minute. Example: ENTRY 39 can live until
+  // approximately 43:00, plus a small API/feed jitter grace.
+  const minutesRemaining =
+    Math.max(
+      0,
+      (BET_MINUTE_TO + 1) - entryMinute
+    );
+
+  const maxAgeMs =
+    minutesRemaining * 60_000 +
+    PENDING_WINDOW_GRACE_MS;
+
+  const ageMs =
+    Math.max(0, Date.now() - createdMs);
+
+  return {
+    expired: ageMs > maxAgeMs,
+    reason: ageMs > maxAgeMs
+      ? "PENDING_HUNTER_WINDOW_EXPIRED"
+      : null,
+    entry_minute: entryMinute,
+    age_ms: ageMs,
+    max_age_ms: maxAgeMs
+  };
 }
 
 async function incrementPendingRetry(
@@ -4493,6 +4612,33 @@ async function processPending(
     const row
     of rows
   ) {
+    // V7.6.26 — expire stale pending rows BEFORE any Cloudbet/API work.
+    // This cleans old backlog immediately and guarantees no retry can survive
+    // beyond the Hunter 10–42 minute opportunity window.
+    const windowState =
+      pendingHunterWindowState(row);
+
+    if (windowState.expired) {
+      const terminal =
+        await removePendingRow(
+          env,
+          row.id,
+          windowState.reason ||
+          "PENDING_HUNTER_WINDOW_EXPIRED"
+        );
+
+      results.push({
+        pending_id: row.id,
+        cloudbet_id: normalizeEventId(row.cloudbet_id),
+        action: "REMOVED_WINDOW_EXPIRED",
+        lifecycle: windowState,
+        ...terminal
+      });
+
+      expired++;
+      continue;
+    }
+
     const cloudbetId =
       normalizeEventId(
         row.cloudbet_id
