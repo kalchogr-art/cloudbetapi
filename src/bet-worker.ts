@@ -166,7 +166,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.30 OLD MATCHER PRIMARY + AI WEAK RESCUE - BETTING OFF";
+  "V7.6.31 AI IDENTITY HARD GUARD - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -1110,17 +1110,24 @@ async function resolveAiMatch(
   }
 }
 
-function aiHistorySignalIds(signal: any): string[] {
-  const ids = [
-    signal?.id,
-    signal?.signal_id,
-    signal?.match_id,
-    signal?.v27_id
-  ]
-    .map(value => safe(value))
-    .filter(Boolean);
+function aiHistorySignalIds(signal: any): {
+  signalId: string | null;
+  matchId: string | null;
+} {
+  return {
+    signalId:
+      safe(signal?.signal_id ?? signal?.id) || null,
+    matchId:
+      safe(signal?.match_id ?? signal?.v27_id) || null
+  };
+}
 
-  return Array.from(new Set(ids));
+function isCurrentAiMatcherVersion(value: any): boolean {
+  const version = safe(value).toUpperCase();
+
+  // V7.6.31: accept current/new AI Matcher V1.3.x history.
+  // Do not pin Bet Worker to the obsolete V1.3.3 string.
+  return version.startsWith("AI-MATCHER-V1.3.");
 }
 
 async function fetchAiHistory(
@@ -1201,41 +1208,36 @@ function findAiHistoryMatch(
   signal: any,
   rows: any[]
 ): AiMatchResolution {
-  const ids =
+  const identity =
     aiHistorySignalIds(signal);
 
-  const home =
-    safe(signalHome(signal))
-      .toLowerCase();
-
-  const away =
-    safe(signalAway(signal))
-      .toLowerCase();
-
+  // V7.6.31 HARD IDENTITY GUARD:
+  // Never reuse AI history by team names alone.
+  // The row must belong to THIS signal_id or THIS V27 match_id.
   const row =
     rows.find((item: any) => {
-      const rowIds = [
-        item?.signal_id,
-        item?.match_id
-      ]
-        .map((value: any) => safe(value))
-        .filter(Boolean);
+      const rowSignalId =
+        safe(item?.signal_id) || null;
+      const rowMatchId =
+        safe(item?.match_id) || null;
 
       if (
-        ids.length &&
-        rowIds.some((id: string) =>
-          ids.includes(id)
-        )
+        identity.signalId &&
+        rowSignalId &&
+        identity.signalId === rowSignalId
       ) {
         return true;
       }
 
-      return (
-        home &&
-        away &&
-        safe(item?.hunter_home).toLowerCase() === home &&
-        safe(item?.hunter_away).toLowerCase() === away
-      );
+      if (
+        identity.matchId &&
+        rowMatchId &&
+        identity.matchId === rowMatchId
+      ) {
+        return true;
+      }
+
+      return false;
     }) ?? null;
 
   if (!row) {
@@ -1245,7 +1247,7 @@ function findAiHistoryMatch(
       event_id: null,
       cloudbet_match: null,
       confidence: null,
-      reason: "AI_MATCH_PENDING_HISTORY",
+      reason: "AI_MATCH_PENDING_HISTORY_FOR_THIS_SIGNAL",
       category_guard_ok: false,
       cache_hit: false,
       raw: null
@@ -1256,20 +1258,37 @@ function findAiHistoryMatch(
     numberOrNull(row?.confidence);
 
   const eventId =
-    normalizeEventId(
-      row?.cloudbet_event_id
-    );
+    normalizeEventId(row?.cloudbet_event_id);
 
   const categoryGuardOk =
     Number(row?.category_guard_ok) === 1;
 
   const currentVersion =
-    safe(row?.matcher_version) ===
-    "AI-MATCHER-V1.3.3-BET-WORKER-RESOLVE-HISTORY-500";
+    isCurrentAiMatcherVersion(row?.matcher_version);
+
+  const rowSignalId =
+    safe(row?.signal_id) || null;
+  const rowMatchId =
+    safe(row?.match_id) || null;
+
+  // Re-check identity after row selection. Fail closed.
+  const exactIdentity =
+    (
+      identity.signalId !== null &&
+      rowSignalId !== null &&
+      identity.signalId === rowSignalId
+    ) ||
+    (
+      identity.matchId !== null &&
+      rowMatchId !== null &&
+      identity.matchId === rowMatchId
+    );
 
   const accepted =
+    exactIdentity &&
     currentVersion &&
     Number(row?.ai_accepted) === 1 &&
+    Number(row?.ai_matched) === 1 &&
     eventId !== null &&
     confidence !== null &&
     confidence >= 0.90 &&
@@ -1278,22 +1297,34 @@ function findAiHistoryMatch(
   return {
     ok: true,
     accepted,
-    event_id: eventId,
+
+    // CRITICAL: rejected/0%-confidence AI rows expose NO event_id downstream.
+    event_id:
+      accepted ? eventId : null,
     cloudbet_match:
-      safe(row?.cloudbet_match) || null,
+      accepted
+        ? safe(row?.cloudbet_match) || null
+        : null,
     confidence,
     reason:
       accepted
-        ? safe(row?.reason) || "AI_HISTORY_ACCEPTED"
+        ? safe(row?.reason) || "AI_HISTORY_ACCEPTED_EXACT_IDENTITY"
+        : !exactIdentity
+        ? "AI_HISTORY_IDENTITY_MISMATCH"
         : !currentVersion
-        ? "AI_HISTORY_OLD_VERSION"
-        : safe(row?.reason) || "AI_HISTORY_NOT_ACCEPTED",
+        ? "AI_HISTORY_UNSUPPORTED_VERSION"
+        : Number(row?.ai_accepted) !== 1 || Number(row?.ai_matched) !== 1
+        ? "AI_HISTORY_NOT_ACCEPTED"
+        : confidence === null || confidence < 0.90
+        ? "AI_CONFIDENCE_BELOW_090"
+        : !categoryGuardOk
+        ? "AI_CATEGORY_GUARD_FAILED"
+        : "AI_HISTORY_REJECTED",
     category_guard_ok: categoryGuardOk,
     cache_hit: true,
     raw: row
   };
 }
-
 
 function isAiResolutionPending(
   aiMatch: AiMatchResolution | null | undefined
@@ -1307,7 +1338,10 @@ function isAiResolutionPending(
     return false;
   }
 
-  if (reason === "AI_MATCH_PENDING_HISTORY") {
+  if (
+    reason === "AI_MATCH_PENDING_HISTORY" ||
+    reason === "AI_MATCH_PENDING_HISTORY_FOR_THIS_SIGNAL"
+  ) {
     return true;
   }
 
@@ -1391,6 +1425,25 @@ function buildAiSelectedCloudbetData(
   signal: any,
   aiMatch: AiMatchResolution
 ): TrackerCloudbetData {
+  // V7.6.31: fail closed. A non-accepted or low-confidence AI result
+  // must never become an authoritative Cloudbet event downstream.
+  if (
+    aiMatch?.accepted !== true ||
+    !aiMatch?.event_id ||
+    numberOrNull(aiMatch?.confidence) === null ||
+    Number(aiMatch?.confidence) < 0.90 ||
+    aiMatch?.category_guard_ok !== true
+  ) {
+    return {
+      event_id: null,
+      entry_odds: null,
+      max_stake: null,
+      match: null,
+      odds_available: false,
+      matcher_score: null
+    } as TrackerCloudbetData;
+  }
+
   const previous =
     trackerCloudbetData(signal);
 
