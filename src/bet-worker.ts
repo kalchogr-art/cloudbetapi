@@ -166,7 +166,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.28 WEAK MATCH -> AI LOCKED VERIFY + DIRECT EVENT ODDS - BETTING OFF";
+  "V7.6.30 OLD MATCHER PRIMARY + AI WEAK RESCUE - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -210,7 +210,7 @@ const REAL_TEST_CONFIRM = "PLACE_0_10_USDT_ONCE";
 // V7.6.11 — automatic end-to-end proof test.
 // Normal betting stays OFF. Exactly one automatic real 0.10 USDT request
 // may be sent from the normal Hunter -> /run flow after ALL safety gates pass.
-const AUTO_E2E_TEST_ENABLED = true;
+const AUTO_E2E_TEST_ENABLED = false;
 const AUTO_E2E_TEST_STAKE = "0.10";
 const AUTO_E2E_TEST_KEY = "V7.6.18_SECOND_AUTO_E2E_ONE_SHOT_0_10_USDT";
 
@@ -8064,8 +8064,9 @@ async function runDirectPreflight(
       ? enrichedInput.matcher_sync
       : {};
 
+  // V7.6.30 — an event_id supplied by Tracker/old Matcher is authoritative.
+  // AI may diagnose it, but cannot replace/reject it.
   const oldMatcherLocked =
-    matcherSync?.old_matcher_locked === true &&
     requestedEventId !== null;
 
   // V7.6.28:
@@ -8427,9 +8428,9 @@ async function runDirectPreflight(
       ai_match: effectiveAiMatch,
       requested_event_id: requestedEventId,
       source: {
-        identity: "AI_MATCHER /resolve",
+        identity: oldMatcherLocked ? "OLD_MATCHER_PRIMARY" : "AI_RESCUE",
         previous_tracker_event_id: requestedEventId,
-        event: "AI_MATCHER_EVENT_ID",
+        event: oldMatcherLocked ? "OLD_MATCHER_EVENT_ID" : "AI_RESCUE_EVENT_ID",
         state: "/event?id=SAME_AI_EVENT_ID",
         odds: "MATCHER /live EXACT SAME AI EVENT_ID"
       },
@@ -8507,9 +8508,9 @@ async function runDirectPreflight(
     ai_match: effectiveAiMatch,
     requested_event_id: requestedEventId,
     source: {
-      identity: "AI_MATCHER /resolve",
+      identity: oldMatcherLocked ? "OLD_MATCHER_PRIMARY" : "AI_RESCUE",
       previous_tracker_event_id: requestedEventId,
-      event: "AI_MATCHER_EVENT_ID",
+      event: oldMatcherLocked ? "OLD_MATCHER_EVENT_ID" : "AI_RESCUE_EVENT_ID",
       state: "/event?id=SAME_AI_EVENT_ID",
       odds: "MATCHER /live EXACT SAME AI EVENT_ID"
     },
@@ -8635,11 +8636,53 @@ async function runWorker(
       const previousTrackerCloudbet =
         trackerCloudbetData(signal);
 
-      const aiMatch =
-        findAiHistoryMatch(
-          signal,
-          aiHistory.rows
-        );
+      // V7.6.30 — deterministic/old Matcher is PRIMARY again.
+      // If Tracker already carries a Cloudbet event_id, AI is NOT allowed
+      // to turn that secure match into UNMATCHED. AI is used only when
+      // there is no deterministic event_id (weak/no-match rescue).
+      const trackerPrimaryEventId =
+        normalizeEventId(previousTrackerCloudbet.event_id);
+
+      let weakCandidate: AnyObj | null = null;
+      let aiMatch: any;
+
+      if (trackerPrimaryEventId) {
+        aiMatch = {
+          ok: true,
+          accepted: true,
+          event_id: trackerPrimaryEventId,
+          confidence: previousTrackerCloudbet.matcher_score,
+          cloudbet_match: previousTrackerCloudbet.match,
+          reason: "OLD_MATCHER_PRIMARY",
+          category_guard: { ok: true },
+          source: "TRACKER_OLD_MATCHER_EVENT_ID"
+        };
+      } else {
+        // Only unmatched/weak signals are allowed to enter AI rescue.
+        weakCandidate = await fetchWeakMatcherCandidate(env, signal);
+        const weakEventId = normalizeEventId(weakCandidate?.event_id);
+
+        if (weakEventId) {
+          aiMatch = await resolveAiMatch(env, {
+            ...signal,
+            locked_event_id: weakEventId,
+            resolve_mode: "VERIFY_LOCKED_EVENT",
+            matcher_sync: {
+              ai_mode: "VERIFY_LOCKED_EVENT",
+              old_matcher_event_id: weakEventId,
+              old_matcher_locked: false,
+              weak_candidate_locked_for_ai: true,
+              weak_candidate: weakCandidate
+            }
+          });
+        } else {
+          // No deterministic candidate: keep the existing AI history/fallback result.
+          aiMatch = findAiHistoryMatch(
+            signal,
+            aiHistory.rows
+          );
+        }
+      }
 
       aiResolved++;
 
@@ -8880,8 +8923,8 @@ async function runWorker(
       target_submarket: TARGET_SUBMARKET,
       target_outcome: TARGET_OUTCOME,
       target_params: TARGET_PARAMS,
-      tracker_is_match_source: false,
-      ai_matcher_is_primary_match_source: true,
+      tracker_is_match_source: true,
+      ai_matcher_is_primary_match_source: false,
       ai_matcher_endpoint: "/api/history (RUN) + /resolve (DIRECT PREFLIGHT)",
       ai_accept_confidence: 0.90,
       ai_hard_category_guard_required: true,
@@ -8889,8 +8932,8 @@ async function runWorker(
       direct_preflight_endpoint: "/preflight",
       d1_auto_migration: true,
       matcher_lookup: true,
-      matcher_used_for_matching: false,
-      old_tracker_match_retained_for_diagnostics: true,
+      matcher_used_for_matching: true,
+      old_tracker_match_retained_for_diagnostics: false,
       matcher_used_for_exact_odds: true,
       matcher_odds_endpoint: "/live",
       matcher_odds_event_lock: "EXACT_EVENT_ID_ONLY",
@@ -8925,11 +8968,11 @@ async function runWorker(
     source: {
       tracker: "/entries",
       identity:
-        "AI_MATCHER /api/history -> accepted event_id",
+        "OLD MATCHER PRIMARY; AI ONLY FOR WEAK/NO-MATCH RESCUE",
       previous_tracker_match:
-        "DIAGNOSTIC ONLY",
+        "PRIMARY WHEN EVENT_ID EXISTS",
       cloudbet_event:
-        "/event?id=AI_MATCHER_EVENT_ID",
+        "/event?id=LOCKED_EVENT_ID",
       current_odds:
         "MATCHER /live -> EXACT SAME AI EVENT_ID"
     },
@@ -9115,7 +9158,7 @@ function healthResponse():
       direct_event_preflight: true,
       direct_preflight_endpoint: "/preflight",
       matcher_lookup: true,
-      matcher_used_for_matching: false,
+      matcher_used_for_matching: true,
       matcher_used_for_exact_odds: true,
       matcher_odds_endpoint: "/live",
       fuzzy_matching: false,
