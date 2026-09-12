@@ -1,4 +1,14 @@
 // ============================================================
+// V7.6.28 WEAK -> AI LOCKED RESCUE
+// - WEAK_TWO_SIDED_SIMILARITY keeps diagnostic best_candidate.event_id.
+// - Candidate is NOT trusted as a match by itself.
+// - AI receives VERIFY_LOCKED_EVENT for that one candidate.
+// - AI acceptance + same event_id are mandatory for weak-candidate rescue.
+// - Then V7.6.27 direct event-id odds verification runs unchanged.
+// - Betting remains OFF.
+// ============================================================
+
+// ============================================================
 // CLOUDBET BET WORKER V7.3.4
 // DRY RUN · TRACKER READY CANDIDATE · EXACT MATCHER ODDS REFRESH
 // EXACT 1H TOTAL GOALS OVER 0.5
@@ -156,7 +166,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.27 DIRECT EVENT-ID ODDS FIRST + MATCHER FALLBACK - BETTING OFF";
+  "V7.6.28 WEAK MATCH -> AI LOCKED VERIFY + DIRECT EVENT ODDS - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -7846,6 +7856,174 @@ async function realTestStatus(env: Env): Promise<any> {
 // V7.6.0 source below without behavioral changes.
 // ============================================================
 
+
+// ============================================================
+// V7.6.28 — WEAK MATCH -> AI LOCKED VERIFICATION
+// The deterministic matcher may reject a candidate as
+// WEAK_TWO_SIDED_SIMILARITY while still exposing a useful best_candidate.
+// This helper NEVER promotes that candidate to a secure match.
+// It only forwards the candidate event_id to AI for one-event verification.
+// ============================================================
+
+async function fetchWeakMatcherCandidate(
+  env: Env,
+  signal: AnyObj
+): Promise<AnyObj | null> {
+  try {
+    const encoded =
+      encodeURIComponent(
+        JSON.stringify([
+          {
+            type:
+              signal?.type ??
+              "HUNTER_ENTRY",
+            match:
+              signal?.match ??
+              null,
+            match_id:
+              signal?.match_id ??
+              null,
+            home:
+              signal?.home ??
+              null,
+            away:
+              signal?.away ??
+              null,
+            competition:
+              signal?.competition ??
+              signal?.league ??
+              null,
+            entry_minute:
+              signal?.entry_minute ??
+              null,
+            current_minute:
+              signal?.current_minute ??
+              signal?.entry_minute ??
+              null,
+            period:
+              signal?.period ??
+              "1H",
+            hunter_score:
+              signal?.hunter_score ??
+              null
+          }
+        ])
+      );
+
+    const result =
+      await fetchServiceJSON(
+        env.MATCHER,
+        `/match?signals=${encoded}`,
+        SERVICE_TIMEOUT_MS
+      );
+
+    if (!result.ok) {
+      return null;
+    }
+
+    const rows =
+      Array.isArray(result.data?.hunter_results)
+        ? result.data.hunter_results
+        : Array.isArray(result.data?.results)
+        ? result.data.results
+        : [];
+
+    const row =
+      rows[0] ??
+      null;
+
+    if (!row) {
+      return null;
+    }
+
+    const reason =
+      safe(
+        row?.reason ??
+        row?.classification ??
+        ""
+      ).toUpperCase();
+
+    // Rescue ONLY the intended weak-two-sided failure.
+    if (
+      reason !==
+        "WEAK_TWO_SIDED_SIMILARITY" &&
+      safe(row?.classification).toUpperCase() !==
+        "WEAK_TWO_SIDED_SIMILARITY"
+    ) {
+      return null;
+    }
+
+    const best =
+      row?.diagnostics?.best_candidate ??
+      null;
+
+    const candidateEventId =
+      normalizeEventId(
+        best?.event_id ??
+        row?.cloudbet?.event_id ??
+        row?.cloudbet?.id ??
+        null
+      );
+
+    if (!candidateEventId) {
+      return null;
+    }
+
+    const minuteDiff =
+      numberOrNull(
+        best?.minute_difference ??
+        row?.diagnostics?.minute_difference
+      );
+
+    // Keep the existing close-minute safety boundary.
+    if (
+      minuteDiff !== null &&
+      minuteDiff > 5
+    ) {
+      return null;
+    }
+
+    return {
+      event_id:
+        candidateEventId,
+      match:
+        safe(best?.match) ||
+        safe(row?.cloudbet?.match) ||
+        null,
+      home:
+        safe(best?.home) ||
+        safe(row?.cloudbet?.home) ||
+        null,
+      away:
+        safe(best?.away) ||
+        safe(row?.cloudbet?.away) ||
+        null,
+      minute:
+        numberOrNull(
+          best?.minute ??
+          row?.diagnostics?.cloudbet_minute
+        ),
+      minute_difference:
+        minuteDiff,
+      scoring:
+        best?.scoring ??
+        row?.matcher_scoring ??
+        null,
+      competition:
+        best?.competition ??
+        row?.cloudbet?.competition ??
+        null,
+      matcher_reason:
+        "WEAK_TWO_SIDED_SIMILARITY",
+      source:
+        "MATCHER_DIAGNOSTIC_BEST_CANDIDATE"
+    };
+  } catch {
+    return null;
+  }
+}
+
+
 async function runDirectPreflight(
   env: Env,
   input: DirectPreflightInput
@@ -7890,26 +8068,54 @@ async function runDirectPreflight(
     matcherSync?.old_matcher_locked === true &&
     requestedEventId !== null;
 
-  // V7.6.23:
-  // - secure deterministic matcher => AI verifies the SAME event only
-  // - no secure deterministic match => AI keeps its normal fallback search
+  // V7.6.28:
+  // If there is no secure deterministic event_id, ask the deterministic
+  // matcher for its diagnostic best candidate ONLY when the failure is
+  // WEAK_TWO_SIDED_SIMILARITY. This candidate is NOT trusted yet.
+  const weakCandidate =
+    !oldMatcherLocked &&
+    requestedEventId === null
+      ? await fetchWeakMatcherCandidate(
+          env,
+          signal
+        )
+      : null;
+
+  const weakCandidateEventId =
+    normalizeEventId(
+      weakCandidate?.event_id
+    );
+
+  const aiLockedEventId =
+    oldMatcherLocked
+      ? requestedEventId
+      : weakCandidateEventId;
+
+  const aiVerifyLockedCandidate =
+    aiLockedEventId !== null;
+
   const aiRequest = {
     ...signal,
     matcher_sync: {
       ...matcherSync,
       old_matcher_event_id:
-        requestedEventId ??
+        aiLockedEventId ??
         matcherSync?.old_matcher_event_id ??
         null,
       old_matcher_locked:
-        oldMatcherLocked
+        oldMatcherLocked,
+      weak_candidate_locked_for_ai:
+        !oldMatcherLocked &&
+        weakCandidateEventId !== null,
+      weak_candidate:
+        weakCandidate
     },
     locked_event_id:
-      oldMatcherLocked
-        ? requestedEventId
+      aiVerifyLockedCandidate
+        ? aiLockedEventId
         : null,
     resolve_mode:
-      oldMatcherLocked
+      aiVerifyLockedCandidate
         ? "VERIFY_LOCKED_EVENT"
         : "FALLBACK_SEARCH"
   };
@@ -7920,16 +8126,85 @@ async function runDirectPreflight(
       aiRequest
     );
 
+  const aiConfirmedLockedEvent =
+    aiVerifyLockedCandidate &&
+    aiMatch?.ok === true &&
+    aiMatch?.accepted === true &&
+    normalizeEventId(
+      aiMatch?.event_id
+    ) === aiLockedEventId;
+
+  // Secure old-matcher locks preserve the existing behavior.
+  // A WEAK candidate is different: AI confirmation is mandatory.
+  if (
+    weakCandidateEventId &&
+    !aiConfirmedLockedEvent
+  ) {
+    const aiPending =
+      isAiResolutionPending(
+        aiMatch
+      );
+
+    return {
+      success:
+        aiPending,
+      worker:
+        "cloudbet-bet-worker",
+      version:
+        VERSION,
+      action:
+        aiPending
+          ? "WAITING_AI"
+          : "DIRECT_PREFLIGHT",
+      ready:
+        false,
+      pending:
+        aiPending,
+      requested_event_id:
+        requestedEventId,
+      event_id:
+        weakCandidateEventId,
+      reason:
+        aiPending
+          ? "AI_MATCH_PENDING"
+          : (
+              aiMatch?.reason ||
+              "AI_DID_NOT_CONFIRM_WEAK_CANDIDATE"
+            ),
+      ai_reason:
+        aiMatch?.reason ??
+        null,
+      ai_match:
+        aiMatch,
+      matcher_sync: {
+        old_matcher_locked:
+          false,
+        weak_candidate_locked_for_ai:
+          true,
+        weak_candidate_event_id:
+          weakCandidateEventId,
+        weak_candidate:
+          weakCandidate,
+        source:
+          "WEAK_TWO_SIDED_SIMILARITY_AI_VERIFY"
+      },
+      processing_ms:
+        Date.now() -
+        started
+    };
+  }
+
   const synchronizedEventId =
     oldMatcherLocked
       ? requestedEventId
+      : weakCandidateEventId
+      ? weakCandidateEventId
       : aiMatch.event_id;
 
-  // When the deterministic matcher locked an event, AI disagreement is
-  // diagnostic only. It is not allowed to replace or reject that identity.
-  // When there is no lock, existing AI acceptance rules remain mandatory.
+  // Normal AI fallback still requires an accepted AI identity.
   if (
     !oldMatcherLocked &&
+    !weakCandidateEventId &&
     (
       !aiMatch.ok ||
       !aiMatch.accepted ||
@@ -7956,6 +8231,8 @@ async function runDirectPreflight(
       ai_match: aiMatch,
       matcher_sync: {
         old_matcher_locked:
+          false,
+        weak_candidate_locked_for_ai:
           false,
         source:
           "AI_FALLBACK"
@@ -8010,6 +8287,16 @@ async function runDirectPreflight(
               ? "OLD_MATCHER_AI_CONFIRMED"
               : "OLD_MATCHER_LOCK"
         }
+      : weakCandidateEventId
+      ? {
+          ...aiMatch,
+          event_id:
+            synchronizedEventId,
+          accepted:
+            true,
+          synchronization_source:
+            "WEAK_MATCHER_CANDIDATE_AI_CONFIRMED"
+        }
       : aiMatch;
 
   const trackerCloudbet =
@@ -8039,6 +8326,30 @@ async function runDirectPreflight(
               matcherSync?.old_matcher_score ??
               enrichedInput?.matcher_score
             )
+        }
+      : weakCandidateEventId
+      ? {
+          event_id:
+            synchronizedEventId,
+          match:
+            safe(
+              weakCandidate?.match ??
+              aiMatch?.cloudbet_match ??
+              ""
+            ) || null,
+          entry_odds:
+            null,
+          max_stake:
+            null,
+          odds_available:
+            false,
+          matcher_score:
+            numberOrNull(
+              weakCandidate?.scoring?.total ??
+              enrichedInput?.matcher_score
+            ),
+          weak_candidate_ai_confirmed:
+            true
         }
       : buildAiSelectedCloudbetData(
           signal,
