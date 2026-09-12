@@ -144,12 +144,19 @@ type Obj = Record<string, any>;
 // - NORMAL BETTING REMAINS OFF; existing one-shot keys are NOT rearmed.
 // ============================================================
 
+// V7.6.27:
+// - Exact odds are read FIRST from the already-fetched authoritative Cloudbet event_id.
+// - Uses existing findTargetSelection() for exact 1H Total Goals OVER 0.5.
+// - Legacy MATCHER /live is fallback only when the direct event payload omits the target market.
+// - No alternate event, no fuzzy fallback, no safety-gate relaxation.
+// - Normal betting remains OFF.
+//
 // ============================================================
 // CONFIG
 // ============================================================
 
 const VERSION =
-  "V7.6.26 PENDING LIFECYCLE + TIME + CRON FIX - BETTING OFF";
+  "V7.6.27 DIRECT EVENT-ID ODDS FIRST + MATCHER FALLBACK - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -2642,6 +2649,139 @@ async function verifySameEventAndOdds(
       };
     }
 
+    // V7.6.27 FIX:
+    // The AI-selected Cloudbet event_id is authoritative.
+    // We already fetched that SAME event above, so first read the exact
+    // 1H Total Goals OVER 0.5 selection directly from its market payload.
+    // Only if the direct event payload does not expose the target selection
+    // do we fall back to the legacy MATCHER /live exact-event lookup.
+    const directSelection =
+      findTargetSelection(
+        event
+      );
+
+    if (directSelection) {
+      const directPrice =
+        extractPrice(
+          directSelection
+        );
+
+      const directEnabled =
+        selectionEnabled(
+          directSelection
+        );
+
+      const directStatus =
+        safe(
+          directSelection?.status ??
+          directSelection?.state ??
+          ""
+        ).toUpperCase() ||
+        (directEnabled
+          ? "SELECTION_ENABLED"
+          : "SELECTION_DISABLED");
+
+      const directMarketUrl =
+        safe(
+          directSelection?.market_url ??
+          directSelection?.marketUrl ??
+          ""
+        ) ||
+        TARGET_MARKET_URL;
+
+      const exactMarketUrl =
+        directMarketUrl ===
+        TARGET_MARKET_URL;
+
+      if (
+        exactMarketUrl &&
+        directEnabled &&
+        directPrice !== null &&
+        directPrice > 1
+      ) {
+        return {
+          success:
+            true,
+          event_id:
+            expectedEventId,
+          current_odds:
+            directPrice,
+          max_stake:
+            selectionMaxStake(
+              directSelection
+            ),
+          min_stake:
+            selectionMinStake(
+              directSelection
+            ),
+          selection_status:
+            directStatus,
+          market_url:
+            directMarketUrl,
+          event,
+          validation: {
+            ...validation,
+            odds_source:
+              "CLOUDBET_EVENT_DIRECT_EXACT_EVENT_ID",
+            exact_event_id:
+              true,
+            exact_market_url:
+              true,
+            selection_enabled:
+              true,
+            matcher_fallback_used:
+              false
+          }
+        };
+      }
+
+      // The target selection exists in the exact event, but is currently
+      // suspended/disabled/invalid. Do NOT switch to another event.
+      return {
+        success:
+          false,
+        event_id:
+          expectedEventId,
+        current_odds:
+          directPrice,
+        max_stake:
+          selectionMaxStake(
+            directSelection
+          ),
+        min_stake:
+          selectionMinStake(
+            directSelection
+          ),
+        selection_status:
+          directStatus,
+        market_url:
+          directMarketUrl,
+        event,
+        validation: {
+          ...validation,
+          odds_source:
+            "CLOUDBET_EVENT_DIRECT_EXACT_EVENT_ID",
+          exact_event_id:
+            true,
+          exact_market_url:
+            exactMarketUrl,
+          selection_enabled:
+            directEnabled,
+          matcher_fallback_used:
+            false
+        },
+        error:
+          !exactMarketUrl
+            ? "EXACT_MARKET_URL_MISMATCH"
+            : !directEnabled
+            ? "SELECTION_NOT_ENABLED"
+            : "CURRENT_ODDS_INVALID"
+      };
+    }
+
+    // Legacy fallback:
+    // Some /event payload variants may omit markets even while /live has
+    // the exact same event_id + exact 1H O0.5 selection.
     const matcherOdds =
       await fetchExactMatcherOdds(
         env,
@@ -2670,8 +2810,12 @@ async function verifySameEventAndOdds(
         validation: {
           ...validation,
           odds_source:
-            "MATCHER_LIVE_EXACT_EVENT_ID",
+            "MATCHER_LIVE_EXACT_EVENT_ID_FALLBACK",
           exact_event_id:
+            true,
+          direct_event_target_found:
+            false,
+          matcher_fallback_used:
             true
         },
         error:
@@ -2680,31 +2824,66 @@ async function verifySameEventAndOdds(
       };
     }
 
-    // HARD GATE #4 — exact market/selection/odds must match the intended bet.
-    const exactMarketUrl = safe(matcherOdds.market_url) === TARGET_MARKET_URL;
-    const selectionEnabled = safe(matcherOdds.selection_status) === "SELECTION_ENABLED";
-    const livePrice = numberOrNull(matcherOdds.current_odds);
+    const exactMarketUrl =
+      safe(
+        matcherOdds.market_url
+      ) ===
+      TARGET_MARKET_URL;
 
-    if (!exactMarketUrl || !selectionEnabled || livePrice === null || livePrice <= 1) {
+    const matcherSelectionEnabled =
+      safe(
+        matcherOdds.selection_status
+      ) ===
+      "SELECTION_ENABLED";
+
+    const livePrice =
+      numberOrNull(
+        matcherOdds.current_odds
+      );
+
+    if (
+      !exactMarketUrl ||
+      !matcherSelectionEnabled ||
+      livePrice === null ||
+      livePrice <= 1
+    ) {
       return {
-        success: false,
-        event_id: expectedEventId,
-        current_odds: livePrice,
-        max_stake: matcherOdds.max_stake,
-        min_stake: matcherOdds.min_stake,
-        selection_status: matcherOdds.selection_status,
-        market_url: matcherOdds.market_url,
+        success:
+          false,
+        event_id:
+          expectedEventId,
+        current_odds:
+          livePrice,
+        max_stake:
+          matcherOdds.max_stake,
+        min_stake:
+          matcherOdds.min_stake,
+        selection_status:
+          matcherOdds.selection_status,
+        market_url:
+          matcherOdds.market_url,
         event,
         validation: {
           ...validation,
-          exact_event_id: true,
-          exact_market_url: exactMarketUrl,
-          selection_enabled: selectionEnabled,
-          odds_source: "MATCHER_LIVE_EXACT_EVENT_ID"
+          exact_event_id:
+            true,
+          exact_market_url:
+            exactMarketUrl,
+          selection_enabled:
+            matcherSelectionEnabled,
+          odds_source:
+            "MATCHER_LIVE_EXACT_EVENT_ID_FALLBACK",
+          direct_event_target_found:
+            false,
+          matcher_fallback_used:
+            true
         },
-        error: !exactMarketUrl
-          ? "EXACT_MARKET_URL_MISMATCH"
-          : (!selectionEnabled ? "SELECTION_NOT_ENABLED" : "CURRENT_ODDS_INVALID")
+        error:
+          !exactMarketUrl
+            ? "EXACT_MARKET_URL_MISMATCH"
+            : !matcherSelectionEnabled
+            ? "SELECTION_NOT_ENABLED"
+            : "CURRENT_ODDS_INVALID"
       };
     }
 
@@ -2727,8 +2906,12 @@ async function verifySameEventAndOdds(
       validation: {
         ...validation,
         odds_source:
-          "MATCHER_LIVE_EXACT_EVENT_ID",
+          "MATCHER_LIVE_EXACT_EVENT_ID_FALLBACK",
         exact_event_id:
+          true,
+        direct_event_target_found:
+          false,
+        matcher_fallback_used:
           true
       }
     };
