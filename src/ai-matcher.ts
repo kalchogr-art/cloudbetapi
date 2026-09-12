@@ -1,10 +1,11 @@
 // ============================================================
-// V1.3.6 TOLERANT METADATA + NAME SHORTLIST
-// - Missing Cloudbet score is UNKNOWN, not automatic rejection.
-// - Explicit non-zero score / 2H / terminal status still rejected.
-// - Missing period can recover by minute <=45; missing minute+period stays eligible.
-// - Generic fallback is name-shortlisted before AI (max 24 candidates).
-// - Locked-candidate direct verification from V1.3.5 is preserved.
+// V1.3.7 AI-FIRST MATCHING — NO HARD NAME/METADATA FILTER
+// - Generic fallback gives AI ALL usable RAW Cloudbet LIVE soccer events.
+// - Name similarity, score, period, minute and competition are context only.
+// - No name shortlist/cutoff can hide the real fixture from AI.
+// - AI selects one event_id; returned id must exist in the supplied set.
+// - Hard youth/women/reserve guard still runs after AI selection.
+// - Direct locked-candidate verification from V1.3.5 is preserved.
 // - READ ONLY / NO BETTING.
 // ============================================================
 
@@ -31,7 +32,7 @@ interface Env {
   TRACKER: any;
 }
 
-const VERSION = "AI-MATCHER-V1.3.6-TOLERANT-METADATA-NAME-SHORTLIST";
+const VERSION = "AI-MATCHER-V1.3.7-AI-FIRST-NO-HARD-NAME-FILTER";
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 const CLOUDBET_BASE = "https://www.cloudbet.com";
@@ -39,10 +40,8 @@ const SPORTS_EVENTS_PATH = "/sports-api/c/v6/sports/events";
 const CLOUDBET_TIMEOUT_MS = 8000;
 const LIVE_LIMIT = 200;
 
-const AI_BATCH_SIZE = 20;
-const AI_FINALISTS_LIMIT = 10;
-const FALLBACK_SHORTLIST_LIMIT = 24;
-const FALLBACK_MIN_NAME_SCORE = 0.28;
+const AI_BATCH_SIZE = 35;
+const AI_FINALISTS_LIMIT = 12;
 const AI_ACCEPT_CONFIDENCE = 0.90;
 
 const HISTORY_LIMIT = 500;
@@ -500,44 +499,6 @@ function fixtureNameScore(signal: AnyObj, candidate: AnyObj): AnyObj {
   };
 }
 
-function shortlistFallbackCandidates(signal: AnyObj, candidates: AnyObj[]): AnyObj[] {
-  if (candidates.length <= FALLBACK_SHORTLIST_LIMIT) {
-    return candidates.map(candidate => ({
-      ...candidate,
-      name_shortlist: fixtureNameScore(signal, candidate)
-    }));
-  }
-
-  const scored = candidates
-    .map(candidate => ({
-      ...candidate,
-      name_shortlist: fixtureNameScore(signal, candidate)
-    }))
-    .sort((a, b) =>
-      Number(b?.name_shortlist?.score ?? 0) -
-      Number(a?.name_shortlist?.score ?? 0)
-    );
-
-  const strong = scored.filter(
-    candidate => Number(candidate?.name_shortlist?.score ?? 0) >= FALLBACK_MIN_NAME_SCORE
-  );
-
-  // If aliases/transliteration make every token score weak, do not return an empty
-  // set. Keep the best limited pool so AI can still resolve provider aliases.
-  return (strong.length ? strong : scored)
-    .slice(0, FALLBACK_SHORTLIST_LIMIT);
-}
-
-function genericFallbackCandidates(rawEvents: AnyObj[], signal?: AnyObj): AnyObj[] {
-  const metadataCandidates = rawEvents
-    .map((event, index) => compactCandidate(event, index))
-    .filter(candidate => fallbackCandidateDecision(candidate).ok === true);
-
-  return signal
-    ? shortlistFallbackCandidates(signal, metadataCandidates)
-    : metadataCandidates;
-}
-
 // ============================================================
 // HARD CATEGORY GUARD
 // ============================================================
@@ -804,15 +765,13 @@ function chunks<T>(items: T[], size: number): T[][] {
 }
 
 async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promise<AnyObj> {
-  const allCompact = rawEvents
+  // V1.3.7 AI-FIRST:
+  // Every usable RAW Cloudbet LIVE soccer event reaches AI.
+  // We intentionally do NOT use name score, minute, score, period or competition
+  // as a hard pre-filter. Those fields are evidence for AI, not a gate.
+  const candidates = rawEvents
     .map((event, index) => compactCandidate(event, index))
     .filter(candidate => Boolean(candidate.event_id && candidate.home && candidate.away));
-
-  const metadataCandidates = allCompact.filter(
-    candidate => fallbackCandidateDecision(candidate).ok === true
-  );
-
-  const candidates = shortlistFallbackCandidates(signal, metadataCandidates);
 
   if (candidates.length === 0) {
     return {
@@ -820,17 +779,14 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
       accepted: false,
       event_id: null,
       confidence: 0,
-      reason: "NO_TOLERANT_LIVE_1H_0_0_CLOUDBET_CANDIDATES",
+      reason: "NO_RAW_CLOUDBET_CANDIDATES",
       cloudbet_match: null,
       candidate: null,
       category_guard: { ok: false, conflicts: [] },
       diagnostics: {
         raw_events: rawEvents.length,
-        raw_identity_candidates: allCompact.length,
         usable_candidates: 0,
-        candidate_filter: "TOLERANT_LIVE_1H_0_0_UNKNOWN_OK + NAME_SHORTLIST",
-        metadata_candidates: metadataCandidates.length,
-        shortlist_limit: FALLBACK_SHORTLIST_LIMIT,
+        candidate_filter: "AI_FIRST_ALL_RAW_LIVE_NO_HARD_NAME_FILTER",
         batches: 0,
         ai_calls: 0
       }
@@ -870,17 +826,14 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
       accepted: false,
       event_id: null,
       confidence: 0,
-      reason: "AI_NO_MATCH_ACROSS_TOLERANT_1H_0_0_SHORTLIST",
+      reason: "AI_NO_MATCH_ACROSS_ALL_RAW_LIVE_BATCHES",
       cloudbet_match: null,
       candidate: null,
       category_guard: { ok: false, conflicts: [] },
       diagnostics: {
         raw_events: rawEvents.length,
-        raw_identity_candidates: allCompact.length,
         usable_candidates: candidates.length,
-        candidate_filter: "TOLERANT_LIVE_1H_0_0_UNKNOWN_OK + NAME_SHORTLIST",
-        metadata_candidates: metadataCandidates.length,
-        shortlist_limit: FALLBACK_SHORTLIST_LIMIT,
+        candidate_filter: "AI_FIRST_ALL_RAW_LIVE_NO_HARD_NAME_FILTER",
         batches: batches.length,
         ai_calls: batches.length,
         finalists: 0,
@@ -908,11 +861,8 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
       category_guard: { ok: false, conflicts: [] },
       diagnostics: {
         raw_events: rawEvents.length,
-        raw_identity_candidates: allCompact.length,
         usable_candidates: candidates.length,
-        candidate_filter: "TOLERANT_LIVE_1H_0_0_UNKNOWN_OK + NAME_SHORTLIST",
-        metadata_candidates: metadataCandidates.length,
-        shortlist_limit: FALLBACK_SHORTLIST_LIMIT,
+        candidate_filter: "AI_FIRST_ALL_RAW_LIVE_NO_HARD_NAME_FILTER",
         batches: batches.length,
         ai_calls: batches.length + 1,
         finalists: finalists.length,
@@ -924,6 +874,8 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
   }
 
   const candidate = finalChecked.candidate;
+
+  // Deterministic safety guard only AFTER AI has selected the fixture.
   const categoryGuard = hardCategoryGuard(signal, candidate);
 
   if (!categoryGuard.ok) {
@@ -943,11 +895,8 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
       category_guard: categoryGuard,
       diagnostics: {
         raw_events: rawEvents.length,
-        raw_identity_candidates: allCompact.length,
         usable_candidates: candidates.length,
-        candidate_filter: "TOLERANT_LIVE_1H_0_0_UNKNOWN_OK + NAME_SHORTLIST",
-        metadata_candidates: metadataCandidates.length,
-        shortlist_limit: FALLBACK_SHORTLIST_LIMIT,
+        candidate_filter: "AI_FIRST_ALL_RAW_LIVE_NO_HARD_NAME_FILTER",
         batches: batches.length,
         ai_calls: batches.length + 1,
         finalists: finalists.length,
@@ -973,11 +922,8 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
     category_guard: categoryGuard,
     diagnostics: {
       raw_events: rawEvents.length,
-      raw_identity_candidates: allCompact.length,
       usable_candidates: candidates.length,
-      candidate_filter: "TOLERANT_LIVE_1H_0_0_UNKNOWN_OK + NAME_SHORTLIST",
-        metadata_candidates: metadataCandidates.length,
-        shortlist_limit: FALLBACK_SHORTLIST_LIMIT,
+      candidate_filter: "AI_FIRST_ALL_RAW_LIVE_NO_HARD_NAME_FILTER",
       batches: batches.length,
       ai_calls: batches.length + 1,
       finalists: finalists.length,
@@ -1641,7 +1587,7 @@ export default {
         tracker_binding: Boolean(env.TRACKER),
         model: MODEL,
         architecture: "LOCKED CANDIDATE DIRECT VERIFY -> GENERIC LIVE + 1H + 0:0 AI FALLBACK -> HARD CATEGORY GUARD",
-        fallback_filter: "LIVE + 1H + 0:0; missing period allowed only with minute <=45",
+        fallback_filter: "AI-FIRST: all usable RAW live soccer candidates; metadata is context only",
         endpoints: {
           dashboard: "GET /",
           status: "GET /status",
