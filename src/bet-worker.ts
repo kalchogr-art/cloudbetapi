@@ -8,7 +8,17 @@
 // - Betting remains OFF.
 // ============================================================
 
-// V7.6.33:
+// V7.6.34:
+// - Generic odds diagnostic for ANY locked Cloudbet event_id.
+// - New GET /odds-debug?event_id=EVENT_ID.
+// - Reads SAME Cloudbet event payload + SAME-event Matcher /live row.
+// - Returns compact market/selection candidates and exact-target parser result.
+// - Diagnostic is event-id generic; it is NOT hardcoded to one fixture.
+// - No alternate event / fuzzy fallback.
+// - Keeps V7.6.33 Alternative Lines parser and V7.6.32 aggressive recovery.
+// - Normal betting remains OFF.
+//
+// // V7.6.33:
 // - Keeps V7.6.32 aggressive SAME-event odds recovery.
 // - Adds exact 1H O0.5 parsing for Cloudbet Alternative Lines.
 // - Accepts legacy soccer.total_goals_period_first_half.
@@ -184,7 +194,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.33 ALTERNATIVE LINES FIX - BETTING OFF";
+  "V7.6.34 GENERIC ODDS DIAGNOSTIC - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -2932,6 +2942,561 @@ async function fetchExactMatcherOdds(
       ) || null,
     available:
       true
+  };
+}
+
+
+// ============================================================
+// V7.6.34 — GENERIC ODDS DIAGNOSTIC
+// Works for ANY exact Cloudbet event_id.
+// ============================================================
+
+function compactDiagnosticObject(value: any): any {
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value !== "object"
+  ) {
+    return value;
+  }
+
+  const out: Obj = {};
+
+  const keys = [
+    "id",
+    "event_id",
+    "eventId",
+    "key",
+    "name",
+    "title",
+    "label",
+    "description",
+    "market",
+    "market_key",
+    "marketKey",
+    "market_name",
+    "marketName",
+    "submarket",
+    "submarket_key",
+    "submarketKey",
+    "period",
+    "period_key",
+    "periodKey",
+    "outcome",
+    "side",
+    "type",
+    "selection",
+    "params",
+    "total",
+    "line",
+    "handicap",
+    "points",
+    "value",
+    "threshold",
+    "price",
+    "odds",
+    "decimal_odds",
+    "raw_price",
+    "status",
+    "state",
+    "available",
+    "enabled",
+    "marketUrl",
+    "market_url",
+    "url",
+    "maxStake",
+    "max_stake",
+    "minStake",
+    "min_stake"
+  ];
+
+  for (const key of keys) {
+    if (
+      Object.prototype.hasOwnProperty.call(
+        value,
+        key
+      )
+    ) {
+      const v = value[key];
+
+      if (
+        v !== undefined &&
+        v !== null &&
+        typeof v !== "object"
+      ) {
+        out[key] = v;
+      } else if (
+        v &&
+        typeof v === "object" &&
+        !Array.isArray(v)
+      ) {
+        // Params/limits are useful but keep diagnostic compact.
+        try {
+          const text = JSON.stringify(v);
+          if (text.length <= 500) {
+            out[key] = v;
+          }
+        } catch {}
+      }
+    }
+  }
+
+  return out;
+}
+
+function objectLooksMarketRelevant(
+  value: any,
+  path: string
+): boolean {
+  if (
+    !value ||
+    typeof value !== "object" ||
+    Array.isArray(value)
+  ) {
+    return false;
+  }
+
+  const text =
+    [
+      path,
+      value?.key,
+      value?.name,
+      value?.title,
+      value?.label,
+      value?.description,
+      value?.market,
+      value?.market_key,
+      value?.marketKey,
+      value?.market_name,
+      value?.marketName,
+      value?.submarket,
+      value?.submarket_key,
+      value?.period,
+      value?.outcome,
+      value?.side,
+      value?.type,
+      value?.selection,
+      value?.params,
+      value?.marketUrl,
+      value?.market_url,
+      value?.url
+    ]
+      .map(safe)
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+
+  const hasPrice =
+    extractPrice(value) !== null;
+
+  const hasLine =
+    selectionLineIsHalf(value);
+
+  return (
+    text.includes("goal") ||
+    text.includes("total") ||
+    text.includes("over") ||
+    text.includes("under") ||
+    text.includes("first half") ||
+    text.includes("1st half") ||
+    text.includes("1h") ||
+    text.includes("alternative") ||
+    hasPrice ||
+    hasLine
+  );
+}
+
+function collectMarketDiagnostics(
+  root: any,
+  maxRows = 250
+): any[] {
+  const rows: any[] = [];
+  const seen = new Set<any>();
+
+  function walk(
+    value: any,
+    path: string,
+    depth: number
+  ): void {
+    if (
+      rows.length >= maxRows ||
+      value === null ||
+      value === undefined ||
+      depth > 14
+    ) {
+      return;
+    }
+
+    if (
+      typeof value !== "object"
+    ) {
+      return;
+    }
+
+    if (seen.has(value)) {
+      return;
+    }
+    seen.add(value);
+
+    if (Array.isArray(value)) {
+      for (
+        let i = 0;
+        i < value.length &&
+        rows.length < maxRows;
+        i++
+      ) {
+        walk(
+          value[i],
+          `${path}[${i}]`,
+          depth + 1
+        );
+      }
+
+      return;
+    }
+
+    if (
+      objectLooksMarketRelevant(
+        value,
+        path
+      )
+    ) {
+      rows.push({
+        path,
+        data:
+          compactDiagnosticObject(
+            value
+          ),
+        parser: {
+          market_target:
+            isTargetMarket(
+              value?.market ??
+              value?.market_key ??
+              value?.marketKey ??
+              value?.market_name ??
+              value?.marketName ??
+              value?.key ??
+              value?.name ??
+              value?.title ??
+              null
+            ),
+          first_half:
+            isTargetSubmarket(
+              explicitPeriodFromObject(
+                value
+              )
+            ) ||
+            marketImpliesFirstHalf(
+              value?.market ??
+              value?.market_key ??
+              value?.marketKey ??
+              value?.market_name ??
+              value?.marketName ??
+              value?.key ??
+              value?.name ??
+              value?.title ??
+              null
+            ),
+          over:
+            selectionOutcomeIsOver(
+              value
+            ),
+          line_0_5:
+            selectionLineIsHalf(
+              value
+            ),
+          price:
+            extractPrice(
+              value
+            ),
+          enabled:
+            selectionEnabled(
+              value
+            )
+        }
+      });
+    }
+
+    for (
+      const [key, child]
+      of Object.entries(value)
+    ) {
+      if (
+        rows.length >= maxRows
+      ) {
+        break;
+      }
+
+      if (
+        child !== null &&
+        child !== undefined &&
+        typeof child === "object"
+      ) {
+        walk(
+          child,
+          path
+            ? `${path}.${key}`
+            : key,
+          depth + 1
+        );
+      }
+    }
+  }
+
+  walk(root, "$", 0);
+
+  return rows;
+}
+
+async function runOddsDebug(
+  env: Env,
+  eventIdInput: any
+): Promise<any> {
+  const eventId =
+    normalizeEventId(
+      eventIdInput
+    );
+
+  if (!eventId) {
+    return {
+      success: false,
+      worker: "cloudbet-bet-worker",
+      version: VERSION,
+      diagnostic:
+        "GENERIC_ODDS_DEBUG",
+      error:
+        "EVENT_ID_REQUIRED",
+      usage:
+        "/odds-debug?event_id=36213346"
+    };
+  }
+
+  let event: any = null;
+  let eventError: string | null = null;
+
+  try {
+    event =
+      await fetchCloudbetEvent(
+        env,
+        eventId
+      );
+  } catch (error: any) {
+    eventError =
+      safe(
+        error?.message ??
+        error
+      ) ||
+      "CLOUDBET_EVENT_FAILED";
+  }
+
+  const directSelection =
+    event
+      ? findTargetSelection(
+          event
+        )
+      : null;
+
+  const matcher =
+    await fetchServiceJSON(
+      env.MATCHER,
+      "/live",
+      SERVICE_TIMEOUT_MS
+    );
+
+  const matcherMatches =
+    matcher.ok
+      ? matcherLiveMatches(
+          matcher.data
+        )
+      : [];
+
+  const exactMatcherRow =
+    matcherMatches.find(
+      row =>
+        normalizeEventId(
+          row?.event_id ??
+          row?.eventId ??
+          row?.id ??
+          null
+        ) === eventId
+    ) ?? null;
+
+  const exactMatcherOdds =
+    exactMatcherRow?.odds ??
+    null;
+
+  const marketRows =
+    event
+      ? collectMarketDiagnostics(
+          event,
+          250
+        )
+      : [];
+
+  const strongestRows =
+    marketRows
+      .filter((row: any) => {
+        const p =
+          row?.parser ?? {};
+
+        return (
+          p.market_target ||
+          p.first_half ||
+          p.line_0_5 ||
+          p.over
+        );
+      })
+      .slice(0, 120);
+
+  return {
+    success:
+      Boolean(event) ||
+      Boolean(exactMatcherRow),
+    worker:
+      "cloudbet-bet-worker",
+    version:
+      VERSION,
+    diagnostic:
+      "GENERIC_ODDS_DEBUG",
+    event_id:
+      eventId,
+    same_event_only:
+      true,
+    cloudbet_event: {
+      fetched:
+        Boolean(event),
+      error:
+        eventError,
+      returned_event_id:
+        event
+          ? getCloudbetEventId(
+              event
+            )
+          : null,
+      same_event_id:
+        event
+          ? isSameEventId(
+              eventId,
+              event
+            )
+          : false,
+      match:
+        event
+          ? [
+              cloudbetHome(event),
+              cloudbetAway(event)
+            ]
+              .filter(Boolean)
+              .join(" v ")
+          : null,
+      exact_target_found:
+        Boolean(
+          directSelection
+        ),
+      exact_target:
+        directSelection
+          ? {
+              selection:
+                compactDiagnosticObject(
+                  directSelection
+                ),
+              price:
+                extractPrice(
+                  directSelection
+                ),
+              enabled:
+                selectionEnabled(
+                  directSelection
+                ),
+              max_stake:
+                selectionMaxStake(
+                  directSelection
+                ),
+              min_stake:
+                selectionMinStake(
+                  directSelection
+                )
+            }
+          : null,
+      relevant_market_nodes:
+        strongestRows,
+      relevant_market_nodes_count:
+        strongestRows.length,
+      scanned_market_nodes_count:
+        marketRows.length
+    },
+    matcher_live: {
+      request_ok:
+        matcher.ok,
+      request_error:
+        matcher.ok
+          ? null
+          : matcher.error ??
+            "MATCHER_LIVE_FAILED",
+      live_match_count:
+        matcherMatches.length,
+      exact_event_found:
+        Boolean(
+          exactMatcherRow
+        ),
+      exact_event:
+        exactMatcherRow
+          ? {
+              event_id:
+                normalizeEventId(
+                  exactMatcherRow?.event_id ??
+                  exactMatcherRow?.eventId ??
+                  exactMatcherRow?.id ??
+                  null
+                ),
+              match:
+                exactMatcherRow?.match ??
+                null,
+              home:
+                exactMatcherRow?.home ??
+                null,
+              away:
+                exactMatcherRow?.away ??
+                null,
+              minute:
+                exactMatcherRow?.minute ??
+                null,
+              period:
+                exactMatcherRow?.period ??
+                exactMatcherRow?.event_status ??
+                null,
+              score:
+                exactMatcherRow?.score ??
+                null,
+              odds:
+                exactMatcherOdds
+            }
+          : null
+    },
+    conclusion: {
+      event_endpoint_has_target:
+        Boolean(
+          directSelection
+        ),
+      matcher_live_has_event:
+        Boolean(
+          exactMatcherRow
+        ),
+      matcher_live_has_odds:
+        Boolean(
+          exactMatcherOdds
+        ),
+      target_price:
+        directSelection
+          ? extractPrice(
+              directSelection
+            )
+          : numberOrNull(
+              exactMatcherOdds?.price ??
+              exactMatcherOdds?.raw_price ??
+              null
+            )
+    }
   };
 }
 
@@ -9666,6 +10231,7 @@ function healthResponse():
       "/rest-post-diagnostic",
       "/trading-payload-preview",
       "/diagnostic",
+      "/odds-debug?event_id=EVENT_ID",
       "/entries"
     ]
   });
@@ -9771,6 +10337,7 @@ export default {
             "/rest-post-diagnostic",
             "/trading-payload-preview",
             "/diagnostic",
+            "/odds-debug?event_id=EVENT_ID",
             "/entries"
           ]
         });
@@ -9784,6 +10351,33 @@ export default {
         return json(
           await runEntriesProxy(
             env
+          )
+        );
+      }
+
+      if (path === "/odds-debug") {
+        if (request.method !== "GET") {
+          return json(
+            {
+              success: false,
+              worker: "cloudbet-bet-worker",
+              version: VERSION,
+              error: "METHOD_NOT_ALLOWED",
+              expected_method: "GET"
+            },
+            405
+          );
+        }
+
+        return json(
+          await runOddsDebug(
+            env,
+            url.searchParams.get(
+              "event_id"
+            ) ??
+            url.searchParams.get(
+              "id"
+            )
           )
         );
       }
