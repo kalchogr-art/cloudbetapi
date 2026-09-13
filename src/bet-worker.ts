@@ -8,7 +8,17 @@
 // - Betting remains OFF.
 // ============================================================
 
-// V7.6.32:
+// V7.6.33:
+// - Keeps V7.6.32 aggressive SAME-event odds recovery.
+// - Adds exact 1H O0.5 parsing for Cloudbet Alternative Lines.
+// - Accepts legacy soccer.total_goals_period_first_half.
+// - Accepts soccer.total_goals when period=1h is explicit.
+// - Accepts textual "1st Half / First Half Total Goals" market names.
+// - Selection remains STRICT: OVER + line/total exactly 0.5.
+// - Event ID stays locked; no alternate event / fuzzy odds fallback.
+// - Normal betting remains OFF.
+//
+// // V7.6.32:
 // - Aggressive SAME-event exact-odds recovery after AI identity lock.
 // - Initial check + 3s + 5s + 10s burst for EXACT 1H O0.5.
 // - Persistent pending cadence reduced from 30s to 15s.
@@ -174,7 +184,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.32 AGGRESSIVE ODDS RECOVERY - BETTING OFF";
+  "V7.6.33 ALTERNATIVE LINES FIX - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -1983,27 +1993,317 @@ function eventStillValidForTarget(
 
 // ============================================================
 // TARGET MARKET / SELECTION
+// V7.6.33 — supports Cloudbet 1H Alternative Lines while keeping
+// the target STRICTLY FIRST HALF + OVER + EXACT 0.5.
 // ============================================================
+
+function marketText(
+  value: any
+): string {
+  return norm(value);
+}
+
+function marketImpliesFirstHalf(
+  value: any
+): boolean {
+  const text =
+    marketText(value);
+
+  if (!text) {
+    return false;
+  }
+
+  return (
+    text ===
+      norm(TARGET_MARKET) ||
+    text.includes(
+      "total goals period first half"
+    ) ||
+    (
+      (
+        text.includes("1st half") ||
+        text.includes("first half") ||
+        text.includes("period 1h") ||
+        text.includes("period=1h")
+      ) &&
+      text.includes("total goal")
+    )
+  );
+}
 
 function isTargetMarket(
   value: any
 ): boolean {
-  return (
-    norm(value) ===
-    norm(
-      TARGET_MARKET
+  const text =
+    marketText(value);
+
+  if (!text) {
+    return false;
+  }
+
+  if (
+    text ===
+    norm(TARGET_MARKET)
+  ) {
+    return true;
+  }
+
+  if (
+    text ===
+    norm("soccer.total_goals")
+  ) {
+    return true;
+  }
+
+  // Human-readable Cloudbet market labels, including:
+  // "1st Half Total Goals"
+  // "1st Half Total Goals - Alternative lines"
+  if (
+    marketImpliesFirstHalf(
+      value
     )
-  );
+  ) {
+    return true;
+  }
+
+  return false;
 }
 
 function isTargetSubmarket(
   value: any
 ): boolean {
-  return (
+  const text =
     safe(value)
       .toLowerCase()
-      .trim() ===
-    TARGET_SUBMARKET
+      .trim();
+
+  if (!text) {
+    return false;
+  }
+
+  return (
+    text === TARGET_SUBMARKET ||
+    text === "1h" ||
+    text === "1st half" ||
+    text === "first half" ||
+    text === "period 1h" ||
+    text === "period=1h" ||
+    text.includes("period=1h") ||
+    text.includes("period 1h")
+  );
+}
+
+function explicitPeriodFromObject(
+  value: any
+): any {
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value !== "object"
+  ) {
+    return null;
+  }
+
+  const direct =
+    value.submarket_key ??
+    value.submarketKey ??
+    value.submarket_name ??
+    value.submarket ??
+    value.period_key ??
+    value.periodKey ??
+    value.period_name ??
+    value.periodName ??
+    value.period ??
+    value.time_period ??
+    value.timePeriod ??
+    null;
+
+  if (direct !== null && direct !== undefined) {
+    return direct;
+  }
+
+  const params =
+    value.params;
+
+  if (
+    typeof params === "string" &&
+    /(?:^|[?&;\s])period\s*=\s*1h(?:$|[&;\s])/i.test(params)
+  ) {
+    return "period=1h";
+  }
+
+  if (
+    params &&
+    typeof params === "object"
+  ) {
+    const p =
+      safe(
+        params.period ??
+        params.time_period ??
+        params.timePeriod
+      ).toLowerCase();
+
+    if (
+      p === "1h" ||
+      p === "first half" ||
+      p === "1st half"
+    ) {
+      return "period=1h";
+    }
+  }
+
+  return null;
+}
+
+function selectionOutcomeIsOver(
+  selection: any
+): boolean {
+  const explicit =
+    safe(
+      selection?.outcome ??
+      selection?.side ??
+      selection?.type ??
+      selection?.selection ??
+      ""
+    )
+      .toLowerCase()
+      .trim();
+
+  if (
+    explicit === "over" ||
+    explicit === "o"
+  ) {
+    return true;
+  }
+
+  const label =
+    [
+      selection?.name,
+      selection?.label,
+      selection?.title,
+      selection?.display_name,
+      selection?.displayName,
+      selection?.description
+    ]
+      .map(safe)
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+
+  return (
+    /\bover\b/.test(label) ||
+    /\bo\s*0[.,]5\b/.test(label)
+  );
+}
+
+function selectionLineIsHalf(
+  selection: any
+): boolean {
+  const directValues =
+    [
+      selection?.total,
+      selection?.line,
+      selection?.handicap,
+      selection?.points,
+      selection?.value,
+      selection?.threshold
+    ];
+
+  for (
+    const value
+    of directValues
+  ) {
+    const n =
+      numberOrNull(value);
+
+    if (
+      n !== null &&
+      Math.abs(n - 0.5) <
+        0.000001
+    ) {
+      return true;
+    }
+  }
+
+  const params =
+    selection?.params;
+
+  if (
+    typeof params ===
+    "string"
+  ) {
+    const normalized =
+      params.replace(",", ".");
+
+    if (
+      /(?:^|[?&;\s])total\s*=\s*0\.5(?:$|[&;\s])/i.test(
+        normalized
+      ) ||
+      /(?:^|[?&;\s])line\s*=\s*0\.5(?:$|[&;\s])/i.test(
+        normalized
+      )
+    ) {
+      return true;
+    }
+  }
+
+  if (
+    params &&
+    typeof params ===
+    "object"
+  ) {
+    const n =
+      numberOrNull(
+        params.total ??
+        params.line ??
+        params.handicap ??
+        params.points ??
+        params.value
+      );
+
+    if (
+      n !== null &&
+      Math.abs(n - 0.5) <
+        0.000001
+    ) {
+      return true;
+    }
+  }
+
+  const url =
+    safe(
+      selection?.marketUrl ??
+      selection?.market_url ??
+      selection?.url
+    )
+      .replace(",", ".")
+      .toLowerCase();
+
+  if (
+    /(?:[?&])total=0\.5(?:&|$)/.test(url) ||
+    /(?:[?&])line=0\.5(?:&|$)/.test(url)
+  ) {
+    return true;
+  }
+
+  const label =
+    [
+      selection?.name,
+      selection?.label,
+      selection?.title,
+      selection?.display_name,
+      selection?.displayName,
+      selection?.description
+    ]
+      .map(safe)
+      .filter(Boolean)
+      .join(" ")
+      .replace(",", ".")
+      .toLowerCase();
+
+  return (
+    /\bover\s*0\.5\b/.test(label) ||
+    /\bo\s*0\.5\b/.test(label)
   );
 }
 
@@ -2014,21 +2314,13 @@ function isTargetSelection(
     return false;
   }
 
-  const outcome =
-    safe(
-      selection.outcome
-    ).toLowerCase();
-
-  const params =
-    safe(
-      selection.params
-    ).toLowerCase();
-
   return (
-    outcome ===
-      TARGET_OUTCOME &&
-    params ===
-      TARGET_PARAMS
+    selectionOutcomeIsOver(
+      selection
+    ) &&
+    selectionLineIsHalf(
+      selection
+    )
   );
 }
 
@@ -2165,11 +2457,9 @@ function searchTargetRecursive(
     marketContext;
 
   const currentSubmarket =
-    value.submarket_key ||
-    value.submarketKey ||
-    value.submarket_name ||
-    value.submarket ||
-    value.period ||
+    explicitPeriodFromObject(
+      value
+    ) ||
     submarketContext;
 
   const marketMatches =
@@ -2184,6 +2474,9 @@ function searchTargetRecursive(
   const submarketMatches =
     isTargetSubmarket(
       currentSubmarket
+    ) ||
+    marketImpliesFirstHalf(
+      currentMarket
     );
 
   if (
@@ -2250,8 +2543,13 @@ function searchTargetRecursive(
       }
 
       if (
-        !isTargetSubmarket(
-          selectionSubmarket
+        !(
+          isTargetSubmarket(
+            selectionSubmarket
+          ) ||
+          marketImpliesFirstHalf(
+            selectionMarket
+          )
         )
       ) {
         continue;
@@ -2299,6 +2597,13 @@ function searchTargetRecursive(
     "markets",
     "odds",
     "lines",
+    "alternativeLines",
+    "alternative_lines",
+    "outcomes",
+    "prices",
+    "runners",
+    "options",
+    "variants",
     "market",
     "submarkets",
     "data"
