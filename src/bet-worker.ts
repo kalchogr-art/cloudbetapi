@@ -8,6 +8,12 @@
 // - Betting remains OFF.
 // ============================================================
 
+// V7.6.37:
+// - Fixes stale /event odds blocking a valid SAME-event /live refresh.
+// - If /event has exact 1H O0.5 but price=0 / disabled, do not stop early.
+// - Refresh MATCHER /live for EXACT SAME event_id and require EXACT marketUrl.
+// - No alternate event, no fuzzy odds fallback, betting remains OFF.
+//
 // V7.6.36:
 // - Exact marketUrl is now a HARD requirement for any accepted 1H O0.5 selection.
 // - Prevents a wrong O0.5 from team totals / 2H / another market leaking through.
@@ -214,7 +220,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.36 EXACT MARKET URL HARD LOCK - BETTING OFF";
+  "V7.6.37 MATCHER LIVE FALLBACK ON DISABLED DIRECT - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -3678,6 +3684,11 @@ async function verifySameEventAndOdds(
         event
       );
 
+    // V7.6.37: keep the direct-event rejection only as diagnostics.
+    // If the SAME event_id target is disabled/stale in /event, we still allow
+    // an EXACT SAME event_id + EXACT marketUrl refresh from MATCHER /live.
+    let directRejected: CurrentOddsResult | null = null;
+
     if (directSelection) {
       const directPrice =
         extractPrice(
@@ -3753,9 +3764,11 @@ async function verifySameEventAndOdds(
         };
       }
 
-      // The target selection exists in the exact event, but is currently
-      // suspended/disabled/invalid. Do NOT switch to another event.
-      return {
+      // The target selection exists in the exact event, but /event can lag
+      // behind the live odds feed and show price=0 / SELECTION_DISABLED.
+      // Do NOT switch event. Preserve this rejection, then refresh the EXACT
+      // SAME event_id from MATCHER /live before declaring odds unavailable.
+      directRejected = {
         success:
           false,
         event_id:
@@ -3780,7 +3793,7 @@ async function verifySameEventAndOdds(
         validation: {
           ...validation,
           odds_source:
-            "CLOUDBET_EVENT_DIRECT_EXACT_EVENT_ID",
+            "CLOUDBET_EVENT_DIRECT_EXACT_EVENT_ID_REJECTED",
           exact_event_id:
             true,
           exact_market_url:
@@ -3788,7 +3801,9 @@ async function verifySameEventAndOdds(
           selection_enabled:
             directEnabled,
           matcher_fallback_used:
-            false,
+            true,
+          matcher_fallback_reason:
+            "DIRECT_EVENT_SELECTION_STALE_OR_DISABLED",
           rejected_candidate_odds:
             !exactMarketUrl
               ? directPrice
@@ -3844,10 +3859,20 @@ async function verifySameEventAndOdds(
           direct_event_target_found:
             false,
           matcher_fallback_used:
-            true
+            true,
+          direct_event_rejection:
+            directRejected
+              ? {
+                  error: directRejected.error ?? null,
+                  selection_status: directRejected.selection_status,
+                  current_odds: directRejected.current_odds,
+                  market_url: directRejected.market_url
+                }
+              : null
         },
         error:
           matcherOdds.error ||
+          directRejected?.error ||
           "TARGET_ODDS_NOT_AVAILABLE"
       };
     }
