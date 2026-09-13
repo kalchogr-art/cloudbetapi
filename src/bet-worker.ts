@@ -8,7 +8,17 @@
 // - Betting remains OFF.
 // ============================================================
 
-// V7.6.35:
+// V7.6.36:
+// - Exact marketUrl is now a HARD requirement for any accepted 1H O0.5 selection.
+// - Prevents a wrong O0.5 from team totals / 2H / another market leaking through.
+// - Rejected mismatched prices are kept only in validation diagnostics,
+//   never exposed as current_odds / Entry odds.
+// - Alternative Lines still work because Cloudbet uses the same exact marketUrl:
+//   soccer.total_goals_period_first_half/over?total=0.5
+// - Keeps V7.6.35 nested market-key traversal and generic /odds-debug.
+// - Normal betting remains OFF.
+//
+// // V7.6.35:
 // - Fixes nested Cloudbet market traversal discovered by /odds-debug.
 // - Cloudbet stores market identity in OBJECT KEYS, e.g.
 //   markets.soccer.total_goals_period_first_half.submarkets.period=1h.
@@ -204,7 +214,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.35 NESTED MARKET KEY FIX - BETTING OFF";
+  "V7.6.36 EXACT MARKET URL HARD LOCK - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -2327,6 +2337,40 @@ function selectionLineIsHalf(
   );
 }
 
+function normalizeMarketUrl(
+  value: any
+): string {
+  return safe(value)
+    .trim()
+    .toLowerCase()
+    .replace(/%2e/g, ".")
+    .replace(/%3d/g, "=")
+    .replace(/%26/g, "&");
+}
+
+function selectionExactTargetMarketUrl(
+  selection: any
+): boolean {
+  const marketUrl =
+    normalizeMarketUrl(
+      selection?.marketUrl ??
+      selection?.market_url ??
+      selection?.url ??
+      null
+    );
+
+  if (!marketUrl) {
+    return false;
+  }
+
+  return (
+    marketUrl ===
+    normalizeMarketUrl(
+      TARGET_MARKET_URL
+    )
+  );
+}
+
 function isTargetSelection(
   selection: any
 ): boolean {
@@ -2339,6 +2383,9 @@ function isTargetSelection(
       selection
     ) &&
     selectionLineIsHalf(
+      selection
+    ) &&
+    selectionExactTargetMarketUrl(
       selection
     )
   );
@@ -3714,7 +3761,9 @@ async function verifySameEventAndOdds(
         event_id:
           expectedEventId,
         current_odds:
-          directPrice,
+          exactMarketUrl
+            ? directPrice
+            : null,
         max_stake:
           selectionMaxStake(
             directSelection
@@ -3739,7 +3788,15 @@ async function verifySameEventAndOdds(
           selection_enabled:
             directEnabled,
           matcher_fallback_used:
-            false
+            false,
+          rejected_candidate_odds:
+            !exactMarketUrl
+              ? directPrice
+              : null,
+          rejected_market_url:
+            !exactMarketUrl
+              ? directMarketUrl
+              : null
         },
         error:
           !exactMarketUrl
@@ -3824,7 +3881,9 @@ async function verifySameEventAndOdds(
         event_id:
           expectedEventId,
         current_odds:
-          livePrice,
+          exactMarketUrl
+            ? livePrice
+            : null,
         max_stake:
           matcherOdds.max_stake,
         min_stake:
@@ -3847,7 +3906,15 @@ async function verifySameEventAndOdds(
           direct_event_target_found:
             false,
           matcher_fallback_used:
-            true
+            true,
+          rejected_candidate_odds:
+            !exactMarketUrl
+              ? livePrice
+              : null,
+          rejected_market_url:
+            !exactMarketUrl
+              ? matcherOdds.market_url
+              : null
         },
         error:
           !exactMarketUrl
