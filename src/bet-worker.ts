@@ -8,7 +8,15 @@
 // - Betting remains OFF.
 // ============================================================
 
-// ============================================================
+// V7.6.32:
+// - Aggressive SAME-event exact-odds recovery after AI identity lock.
+// - Initial check + 3s + 5s + 10s burst for EXACT 1H O0.5.
+// - Persistent pending cadence reduced from 30s to 15s.
+// - Event ID stays locked; no alternate event / fuzzy odds fallback.
+// - Terminal score/period/minute safety gates remain unchanged.
+// - Normal betting remains OFF.
+//
+// // ============================================================
 // CLOUDBET BET WORKER V7.3.4
 // DRY RUN · TRACKER READY CANDIDATE · EXACT MATCHER ODDS REFRESH
 // EXACT 1H TOTAL GOALS OVER 0.5
@@ -166,7 +174,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.31 AI IDENTITY HARD GUARD - BETTING OFF";
+  "V7.6.32 AGGRESSIVE ODDS RECOVERY - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -258,7 +266,12 @@ const ODDS_EVENT_MAX_RETRIES =
   20;
 
 const ODDS_EVENT_RETRY_DELAY_MS =
-  30_000;
+  15_000;
+
+// V7.6.32 — immediate recovery burst after a SAME-event AI match.
+// The event_id NEVER changes. Only EXACT 1H O0.5 is retried.
+const AGGRESSIVE_ODDS_RETRY_DELAYS_MS =
+  [3_000, 5_000, 10_000];
 
 // V7.6.26 — pending odds must never live beyond the Hunter window.
 // +45s absorbs feed/API timing jitter while still expiring around the end of 42'.
@@ -3006,6 +3019,101 @@ async function verifySameEventAndOdds(
           : String(error)
     };
   }
+}
+
+
+// ============================================================
+// V7.6.32 — AGGRESSIVE SAME-EVENT ODDS RECOVERY
+// 0s initial check is performed by the caller.
+// If EXACT 1H O0.5 is temporarily missing, retry SAME event_id after
+// 3s -> 5s -> 10s. No alternate event, no fuzzy fallback.
+// ============================================================
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function isRecoverableOddsFailure(error: any): boolean {
+  const value = safe(error).toUpperCase();
+
+  return (
+    value === "EXACT_ODDS_EVENT_NOT_FOUND" ||
+    value === "TARGET_ODDS_STILL_UNAVAILABLE" ||
+    value === "TARGET_ODDS_NOT_AVAILABLE" ||
+    value === "TARGET_SELECTION_NOT_FOUND" ||
+    value === "TARGET_MARKET_NOT_FOUND" ||
+    value === "EXACT_MARKET_NOT_FOUND" ||
+    value === "ODDS_NOT_AVAILABLE" ||
+    value === "SELECTION_DISABLED"
+  );
+}
+
+async function verifySameEventAndOddsAggressive(
+  env: Env,
+  expectedEventId: string,
+  hunterEntryMinute: number | null = null
+): Promise<CurrentOddsResult & { recovery?: any }> {
+  let current =
+    await verifySameEventAndOdds(
+      env,
+      expectedEventId,
+      hunterEntryMinute
+    );
+
+  const attempts: any[] = [{
+    attempt: 1,
+    delay_ms: 0,
+    success: current.success,
+    error: current.error ?? null,
+    odds: current.current_odds ?? null
+  }];
+
+  if (current.success || !isRecoverableOddsFailure(current.error)) {
+    return {
+      ...current,
+      recovery: {
+        mode: "AGGRESSIVE_SAME_EVENT",
+        event_id_locked: expectedEventId,
+        attempts
+      }
+    };
+  }
+
+  for (let i = 0; i < AGGRESSIVE_ODDS_RETRY_DELAYS_MS.length; i++) {
+    const delayMs = AGGRESSIVE_ODDS_RETRY_DELAYS_MS[i];
+
+    await sleepMs(delayMs);
+
+    current =
+      await verifySameEventAndOdds(
+        env,
+        expectedEventId,
+        hunterEntryMinute
+      );
+
+    attempts.push({
+      attempt: i + 2,
+      delay_ms: delayMs,
+      success: current.success,
+      error: current.error ?? null,
+      odds: current.current_odds ?? null
+    });
+
+    if (current.success || !isRecoverableOddsFailure(current.error)) {
+      break;
+    }
+  }
+
+  return {
+    ...current,
+    recovery: {
+      mode: "AGGRESSIVE_SAME_EVENT",
+      event_id_locked: expectedEventId,
+      schedule_ms: AGGRESSIVE_ODDS_RETRY_DELAYS_MS,
+      attempts,
+      recovered: current.success === true
+    }
+  };
 }
 
 // ============================================================
@@ -8418,7 +8526,7 @@ async function runDirectPreflight(
 
   const account = await fetchAccountSnapshot(env);
   const current =
-    await verifySameEventAndOdds(
+    await verifySameEventAndOddsAggressive(
       env,
       eventId,
       numberOrNull(
@@ -8804,7 +8912,7 @@ async function runWorker(
       }
 
       const current =
-        await verifySameEventAndOdds(
+        await verifySameEventAndOddsAggressive(
           env,
           cloudbetId,
           numberOrNull(
