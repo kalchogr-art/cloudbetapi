@@ -231,7 +231,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.38 RAW LIVE ODDS FALLBACK - BETTING OFF";
+  "V7.6.39 CONTEXT EXACT 1H O0.5 FIX - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -2421,6 +2421,25 @@ function isTargetSelection(
   );
 }
 
+// V7.6.39 FIX:
+// /event and raw live payloads do not always repeat marketUrl on each selection.
+// searchTargetRecursive() already proves the parent market is EXACTLY the target
+// 1H Total Goals market + period=1h, so inside that locked context we only need
+// the selection identity (OVER + 0.5). This does NOT allow team totals / FT / 2H
+// because those fail the parent market/submarket gates before this helper is used.
+function isTargetSelectionInLockedContext(
+  selection: any
+): boolean {
+  if (!selection) {
+    return false;
+  }
+
+  return (
+    selectionOutcomeIsOver(selection) &&
+    selectionLineIsHalf(selection)
+  );
+}
+
 function extractPrice(
   selection: any
 ): number | null {
@@ -2579,7 +2598,7 @@ function searchTargetRecursive(
   if (
     marketMatches &&
     submarketMatches &&
-    isTargetSelection(
+    isTargetSelectionInLockedContext(
       value
     ) &&
     selectionEnabled(
@@ -2600,7 +2619,10 @@ function searchTargetRecursive(
         market:
           TARGET_MARKET,
         submarket:
-          TARGET_SUBMARKET
+          TARGET_SUBMARKET,
+        market_url:
+          safe(value?.market_url ?? value?.marketUrl ?? "") ||
+          TARGET_MARKET_URL
       };
     }
   }
@@ -2653,7 +2675,7 @@ function searchTargetRecursive(
       }
 
       if (
-        !isTargetSelection(
+        !isTargetSelectionInLockedContext(
           selection
         )
       ) {
@@ -2685,7 +2707,10 @@ function searchTargetRecursive(
         market:
           TARGET_MARKET,
         submarket:
-          TARGET_SUBMARKET
+          TARGET_SUBMARKET,
+        market_url:
+          safe(selection?.market_url ?? selection?.marketUrl ?? "") ||
+          TARGET_MARKET_URL
       };
     }
   }
