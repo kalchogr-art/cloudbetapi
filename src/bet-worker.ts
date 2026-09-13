@@ -8,7 +8,17 @@
 // - Betting remains OFF.
 // ============================================================
 
-// V7.6.34:
+// V7.6.35:
+// - Fixes nested Cloudbet market traversal discovered by /odds-debug.
+// - Cloudbet stores market identity in OBJECT KEYS, e.g.
+//   markets.soccer.total_goals_period_first_half.submarkets.period=1h.
+// - Parser now propagates those object keys as market/submarket context.
+// - This allows SAME-event direct parsing of 1H OVER 0.5 Alternative Lines.
+// - Team totals / 2H / FT remain rejected by strict target checks.
+// - Keeps generic /odds-debug + aggressive recovery.
+// - No alternate event / fuzzy fallback. Normal betting remains OFF.
+//
+// // V7.6.34:
 // - Generic odds diagnostic for ANY locked Cloudbet event_id.
 // - New GET /odds-debug?event_id=EVENT_ID.
 // - Reads SAME Cloudbet event payload + SAME-event Matcher /live row.
@@ -194,7 +204,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.34 GENERIC ODDS DIAGNOSTIC - BETTING OFF";
+  "V7.6.35 NESTED MARKET KEY FIX - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -2603,51 +2613,66 @@ function searchTargetRecursive(
     }
   }
 
-  const containers = [
-    "markets",
-    "odds",
-    "lines",
-    "alternativeLines",
-    "alternative_lines",
-    "outcomes",
-    "prices",
-    "runners",
-    "options",
-    "variants",
-    "market",
-    "submarkets",
-    "data"
-  ];
-
+  // V7.6.35:
+  // Cloudbet's event JSON often stores market/submarket identity in PROPERTY KEYS
+  // instead of inside the child object:
+  //   markets.soccer.total_goals_period_first_half
+  //     .submarkets["period=1h"].selections[]
+  //
+  // Therefore we must traverse arbitrary nested object keys and propagate
+  // target market / period context from those keys.
   for (
-    const key
-    of containers
+    const [childKey, child]
+    of Object.entries(value)
   ) {
-    const child =
-      value[key];
-
     if (
-      child ===
-        undefined ||
-      child ===
-        null
+      child === null ||
+      child === undefined ||
+      typeof child !== "object"
     ) {
       continue;
+    }
+
+    let nextMarket =
+      currentMarket
+        ? String(currentMarket)
+        : marketContext;
+
+    let nextSubmarket =
+      currentSubmarket
+        ? String(currentSubmarket)
+        : submarketContext;
+
+    const keyText =
+      safe(childKey);
+
+    // A property key can itself BE the Cloudbet market key.
+    // Only promote it when it is our exact target market family.
+    if (
+      isTargetMarket(
+        keyText
+      ) ||
+      keyText === TARGET_MARKET
+    ) {
+      nextMarket =
+        keyText;
+    }
+
+    // A property key can itself BE the period/submarket key.
+    if (
+      isTargetSubmarket(
+        keyText
+      )
+    ) {
+      nextSubmarket =
+        keyText;
     }
 
     const found =
       searchTargetRecursive(
         child,
-        currentMarket
-          ? String(
-              currentMarket
-            )
-          : marketContext,
-        currentSubmarket
-          ? String(
-              currentSubmarket
-            )
-          : submarketContext
+        nextMarket,
+        nextSubmarket
       );
 
     if (found) {
