@@ -1,10 +1,12 @@
 // ============================================================
-// V1.3.7 AI-FIRST MATCHING — NO HARD NAME/METADATA FILTER
+// V1.3.8 AI-FIRST MATCHING — COMPETITION-AWARE CATEGORY GUARD
 // - Generic fallback gives AI ALL usable RAW Cloudbet LIVE soccer events.
 // - Name similarity, score, period, minute and competition are context only.
 // - No name shortlist/cutoff can hide the real fixture from AI.
 // - AI selects one event_id; returned id must exist in the supplied set.
-// - Hard youth/women/reserve guard still runs after AI selection.
+// - Youth/women/reserve guard runs after AI selection.
+// - Women's category may be inherited from a clearly women's competition.
+// - Youth/reserve category may be inherited from competition context.
 // - Direct locked-candidate verification from V1.3.5 is preserved.
 // - READ ONLY / NO BETTING.
 // ============================================================
@@ -32,7 +34,7 @@ interface Env {
   TRACKER: any;
 }
 
-const VERSION = "AI-MATCHER-V1.3.7-AI-FIRST-NO-HARD-NAME-FILTER";
+const VERSION = "AI-MATCHER-V1.3.8-COMPETITION-AWARE-CATEGORY-GUARD";
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 const CLOUDBET_BASE = "https://www.cloudbet.com";
@@ -393,8 +395,6 @@ function fallbackCandidateDecision(candidate: AnyObj): AnyObj {
     return { ok: false, reason: "IDENTITY_FIELDS_MISSING" };
   }
 
-  // Reject only explicit terminal/non-live states. Missing or unusual status is tolerated
-  // because this endpoint is already requested with live=true.
   const status = str(candidate?.status).toUpperCase();
   if (
     /(FINISHED|RESULTED|CANCELLED|CANCELED|ABANDONED|POSTPONED|ENDED)/.test(status)
@@ -406,10 +406,6 @@ function fallbackCandidateDecision(candidate: AnyObj): AnyObj {
     return { ok: false, reason: "EXPLICIT_NOT_LIVE" };
   }
 
-  // V1.3.6 TOLERANT SCORE RULE:
-  // - explicit non-zero score => reject
-  // - 0:0 => accept score gate
-  // - one/both score sides missing => keep as UNKNOWN instead of rejecting
   const sh = numOrNull(candidate?.score_home);
   const sa = numOrNull(candidate?.score_away);
 
@@ -433,7 +429,6 @@ function fallbackCandidateDecision(candidate: AnyObj): AnyObj {
     return { ok: true, reason: `${scoreState}_EXPLICIT_1H` };
   }
 
-  // Missing period metadata: use minute when available.
   const minute = parseMinute(candidate?.minute);
   if (minute !== null) {
     if (minute >= 0 && minute <= 45) {
@@ -443,9 +438,6 @@ function fallbackCandidateDecision(candidate: AnyObj): AnyObj {
     return { ok: false, reason: "MINUTE_OUTSIDE_FIRST_HALF" };
   }
 
-  // Both period and minute are missing. Keep the candidate only for the name
-  // shortlist; AI still has to prove identity. This prevents metadata omissions
-  // from deleting the real fixture before AI sees it.
   return { ok: true, reason: `${scoreState}_PERIOD_MINUTE_UNKNOWN` };
 }
 
@@ -500,14 +492,23 @@ function fixtureNameScore(signal: AnyObj, candidate: AnyObj): AnyObj {
 }
 
 // ============================================================
-// HARD CATEGORY GUARD
+// V1.3.8 HARD CATEGORY GUARD
+// COMPETITION-AWARE WOMEN / YOUTH / RESERVE
 // ============================================================
 
 type TeamCategoryProfile = {
   youth_age: string | null;
   women: boolean;
+  women_explicit: boolean;
   reserve: boolean;
+  reserve_explicit: boolean;
   reserve_marker: string | null;
+};
+
+type CompetitionCategoryProfile = {
+  women: boolean;
+  youth_age: string | null;
+  reserve: boolean;
 };
 
 function normalizedCategoryText(value: any): string {
@@ -521,7 +522,7 @@ function normalizedCategoryText(value: any): string {
     .trim();
 }
 
-function teamCategoryProfile(value: any): TeamCategoryProfile {
+function competitionCategoryProfile(value: any): CompetitionCategoryProfile {
   const text = normalizedCategoryText(value);
 
   const youthMatch =
@@ -531,6 +532,40 @@ function teamCategoryProfile(value: any): TeamCategoryProfile {
   const youthAge = youthMatch ? `U${youthMatch[1]}` : null;
 
   const women =
+    /(?:^|\s)(women|woman|womens|ladies|female|femenino|femenina)(?:\s|$)/i.test(text) ||
+    /(?:^|\s)w(?:\s|$)/i.test(text) ||
+    /\bwsl\b/i.test(text) ||
+    /\bswpl\b/i.test(text) ||
+    /\bnwsl\b/i.test(text) ||
+    /\bliga\s+f\b/i.test(text) ||
+    /\bfrauen\b/i.test(text) ||
+    /\bfemminile\b/i.test(text) ||
+    /\bfeminina\b/i.test(text) ||
+    /\bfemenina\b/i.test(text);
+
+  const reserve =
+    /(?:^|\s)(reserve|reserves|res)(?:\s|$)/i.test(text) ||
+    /(?:^|\s)(academy)(?:\s|$)/i.test(text) ||
+    /(?:^|\s)(second team)(?:\s|$)/i.test(text) ||
+    /(?:^|\s)(b teams?|team b)(?:\s|$)/i.test(text);
+
+  return {
+    women,
+    youth_age: youthAge,
+    reserve
+  };
+}
+
+function teamCategoryProfile(value: any): TeamCategoryProfile {
+  const text = normalizedCategoryText(value);
+
+  const youthMatch =
+    text.match(/(?:^|\s)u[\s-]?(\d{2})(?:\s|$)/i) ??
+    text.match(/(?:^|\s)under[\s-]?(\d{2})(?:\s|$)/i);
+
+  const youthAge = youthMatch ? `U${youthMatch[1]}` : null;
+
+  const womenExplicit =
     /(?:^|\s)(women|woman|womens|ladies|female|femenino|femenina)(?:\s|$)/i.test(text) ||
     /(?:^|\s)w(?:\s|$)/i.test(text);
 
@@ -556,21 +591,55 @@ function teamCategoryProfile(value: any): TeamCategoryProfile {
 
   return {
     youth_age: youthAge,
-    women,
+    women: womenExplicit,
+    women_explicit: womenExplicit,
     reserve,
+    reserve_explicit: reserve,
     reserve_marker: reserveMarker
+  };
+}
+
+function effectiveTeamCategory(
+  team: any,
+  competition: any
+): TeamCategoryProfile {
+  const teamProfile = teamCategoryProfile(team);
+  const competitionProfile = competitionCategoryProfile(competition);
+
+  return {
+    ...teamProfile,
+    women: teamProfile.women || competitionProfile.women,
+    youth_age: teamProfile.youth_age ?? competitionProfile.youth_age,
+    reserve: teamProfile.reserve || competitionProfile.reserve
   };
 }
 
 function compareTeamCategory(
   hunterTeam: any,
+  hunterCompetition: any,
   cloudbetTeam: any,
+  cloudbetCompetition: any,
   side: "HOME" | "AWAY"
 ): AnyObj | null {
-  const hunter = teamCategoryProfile(hunterTeam);
-  const cloudbet = teamCategoryProfile(cloudbetTeam);
+  const hunter = effectiveTeamCategory(hunterTeam, hunterCompetition);
+  const cloudbet = effectiveTeamCategory(cloudbetTeam, cloudbetCompetition);
 
-  if (hunter.youth_age !== cloudbet.youth_age && (hunter.youth_age || cloudbet.youth_age)) {
+  if (
+    hunter.youth_age &&
+    cloudbet.youth_age &&
+    hunter.youth_age !== cloudbet.youth_age
+  ) {
+    return {
+      side,
+      type: "YOUTH_AGE_CONFLICT",
+      hunter_team: str(hunterTeam),
+      cloudbet_team: str(cloudbetTeam),
+      hunter_category: hunter,
+      cloudbet_category: cloudbet
+    };
+  }
+
+  if (Boolean(hunter.youth_age) !== Boolean(cloudbet.youth_age)) {
     return {
       side,
       type: "YOUTH_CATEGORY_CONFLICT",
@@ -587,6 +656,8 @@ function compareTeamCategory(
       type: "WOMEN_CATEGORY_CONFLICT",
       hunter_team: str(hunterTeam),
       cloudbet_team: str(cloudbetTeam),
+      hunter_competition: str(hunterCompetition),
+      cloudbet_competition: str(cloudbetCompetition),
       hunter_category: hunter,
       cloudbet_category: cloudbet
     };
@@ -598,6 +669,8 @@ function compareTeamCategory(
       type: "RESERVE_CATEGORY_CONFLICT",
       hunter_team: str(hunterTeam),
       cloudbet_team: str(cloudbetTeam),
+      hunter_competition: str(hunterCompetition),
+      cloudbet_competition: str(cloudbetCompetition),
       hunter_category: hunter,
       cloudbet_category: cloudbet
     };
@@ -609,13 +682,45 @@ function compareTeamCategory(
 function hardCategoryGuard(signal: AnyObj, candidate: AnyObj): AnyObj {
   const conflicts: AnyObj[] = [];
 
-  const homeConflict = compareTeamCategory(signal?.home, candidate?.home, "HOME");
-  const awayConflict = compareTeamCategory(signal?.away, candidate?.away, "AWAY");
+  const hunterCompetition =
+    signal?.competition ??
+    signal?.league ??
+    null;
+
+  const cloudbetCompetition =
+    candidate?.competition ??
+    candidate?.competition_key ??
+    null;
+
+  const homeConflict = compareTeamCategory(
+    signal?.home,
+    hunterCompetition,
+    candidate?.home,
+    cloudbetCompetition,
+    "HOME"
+  );
+
+  const awayConflict = compareTeamCategory(
+    signal?.away,
+    hunterCompetition,
+    candidate?.away,
+    cloudbetCompetition,
+    "AWAY"
+  );
 
   if (homeConflict) conflicts.push(homeConflict);
   if (awayConflict) conflicts.push(awayConflict);
 
-  return { ok: conflicts.length === 0, conflicts };
+  return {
+    ok: conflicts.length === 0,
+    conflicts,
+    context: {
+      hunter_competition: hunterCompetition,
+      cloudbet_competition: cloudbetCompetition,
+      hunter_competition_category: competitionCategoryProfile(hunterCompetition),
+      cloudbet_competition_category: competitionCategoryProfile(cloudbetCompetition)
+    }
+  };
 }
 
 // ============================================================
@@ -765,10 +870,6 @@ function chunks<T>(items: T[], size: number): T[][] {
 }
 
 async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promise<AnyObj> {
-  // V1.3.7 AI-FIRST:
-  // Every usable RAW Cloudbet LIVE soccer event reaches AI.
-  // We intentionally do NOT use name score, minute, score, period or competition
-  // as a hard pre-filter. Those fields are evidence for AI, not a gate.
   const candidates = rawEvents
     .map((event, index) => compactCandidate(event, index))
     .filter(candidate => Boolean(candidate.event_id && candidate.home && candidate.away));
@@ -874,8 +975,6 @@ async function matchWithAi(env: Env, signal: AnyObj, rawEvents: AnyObj[]): Promi
   }
 
   const candidate = finalChecked.candidate;
-
-  // Deterministic safety guard only AFTER AI has selected the fixture.
   const categoryGuard = hardCategoryGuard(signal, candidate);
 
   if (!categoryGuard.ok) {
@@ -1432,14 +1531,12 @@ async function processOneSignal(
   const resolveMode = requestedResolveMode(rawSignal);
   let result: AnyObj;
 
-  // V1.3.5: if matcher supplied the concrete candidate, verify it directly.
   if (resolveMode === "VERIFY_LOCKED_EVENT") {
     const direct = await verifyLockedCandidateDirect(env, rawSignal, signal);
 
     if (direct) {
       result = direct;
     } else {
-      // Backward-compatible fallback for callers that send only event_id.
       const rawEvents = await getRawCloudbetLive();
       result = await verifyLockedEventFromRawFeed(env, rawSignal, signal, rawEvents);
     }
@@ -1586,7 +1683,7 @@ export default {
         db_binding: Boolean(env.DB),
         tracker_binding: Boolean(env.TRACKER),
         model: MODEL,
-        architecture: "LOCKED CANDIDATE DIRECT VERIFY -> GENERIC LIVE + 1H + 0:0 AI FALLBACK -> HARD CATEGORY GUARD",
+        architecture: "LOCKED CANDIDATE DIRECT VERIFY -> RAW LIVE AI FALLBACK -> COMPETITION-AWARE HARD CATEGORY GUARD",
         fallback_filter: "AI-FIRST: all usable RAW live soccer candidates; metadata is context only",
         endpoints: {
           dashboard: "GET /",
@@ -1726,8 +1823,6 @@ export default {
         const existing = await getHistoryRowByKey(env, key);
         const resolveMode = requestedResolveMode(body);
 
-        // Generic current-version result can be cached.
-        // Locked candidate verification is always candidate-specific.
         if (
           resolveMode !== "VERIFY_LOCKED_EVENT" &&
           existing &&
