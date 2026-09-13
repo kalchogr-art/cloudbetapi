@@ -216,11 +216,22 @@ type Obj = Record<string, any>;
 // - Normal betting remains OFF.
 //
 // ============================================================
+// V7.6.38 — RAW LIVE ODDS FALLBACK
+// - Keeps SAME locked Cloudbet event_id at every stage.
+// - Order: /event -> MATCHER /live -> RAW Cloudbet live sports/events.
+// - RAW fallback uses the same public live source family used by AI Matcher.
+// - RAW fallback accepts ONLY exact event_id + exact 1H O0.5 marketUrl.
+// - No name matching, no alternate event, no fuzzy odds lookup.
+// - Team totals / 2H / FT remain rejected.
+// - Normal betting remains OFF.
+// ============================================================
+
+// ============================================================
 // CONFIG
 // ============================================================
 
 const VERSION =
-  "V7.6.37 MATCHER LIVE FALLBACK ON DISABLED DIRECT - BETTING OFF";
+  "V7.6.38 RAW LIVE ODDS FALLBACK - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -298,6 +309,19 @@ const TARGET_MARKET_URL =
 
 const CLOUDBET_EVENT_PATH =
   "/event?id=";
+
+// V7.6.38 — same RAW Cloudbet live source family used by AI Matcher.
+const RAW_CLOUDBET_BASE =
+  "https://www.cloudbet.com";
+
+const RAW_CLOUDBET_EVENTS_PATH =
+  "/sports-api/c/v6/sports/events";
+
+const RAW_CLOUDBET_LIVE_LIMIT =
+  200;
+
+const RAW_CLOUDBET_TIMEOUT_MS =
+  8_000;
 
 const SERVICE_TIMEOUT_MS =
   10_000;
@@ -3025,6 +3049,283 @@ async function fetchExactMatcherOdds(
 
 
 // ============================================================
+// V7.6.38 — EXACT ODDS FROM RAW CLOUDBET LIVE
+//
+// This is NOT a matcher. The event_id is already locked upstream.
+// We scan the raw live feed only to locate that exact event_id and then
+// accept ONLY the exact 1H Total Goals OVER 0.5 marketUrl.
+// ============================================================
+
+async function fetchExactRawLiveOdds(
+  expectedEventId: string
+): Promise<MatcherOddsResult> {
+  const expected =
+    normalizeEventId(expectedEventId);
+
+  if (!expected) {
+    return {
+      success: false,
+      event_id: null,
+      match: null,
+      current_odds: null,
+      max_stake: null,
+      min_stake: null,
+      selection_status: null,
+      market_url: null,
+      available: false,
+      error: "RAW_LIVE_EVENT_ID_REQUIRED"
+    };
+  }
+
+  const controller =
+    new AbortController();
+
+  const timeout =
+    setTimeout(
+      () => controller.abort(),
+      RAW_CLOUDBET_TIMEOUT_MS
+    );
+
+  try {
+    const url =
+      new URL(
+        RAW_CLOUDBET_EVENTS_PATH,
+        RAW_CLOUDBET_BASE
+      );
+
+    url.searchParams.set(
+      "sports",
+      "soccer"
+    );
+    url.searchParams.set(
+      "live",
+      "true"
+    );
+    url.searchParams.set(
+      "limit",
+      String(RAW_CLOUDBET_LIVE_LIMIT)
+    );
+    url.searchParams.set(
+      "locale",
+      "en"
+    );
+
+    const response =
+      await fetch(
+        url.toString(),
+        {
+          method: "GET",
+          signal: controller.signal,
+          headers: {
+            accept: "application/json"
+          }
+        }
+      );
+
+    const text =
+      await response.text();
+
+    if (!response.ok) {
+      return {
+        success: false,
+        event_id: expected,
+        match: null,
+        current_odds: null,
+        max_stake: null,
+        min_stake: null,
+        selection_status: null,
+        market_url: null,
+        available: false,
+        error: `RAW_LIVE_HTTP_${response.status}`
+      };
+    }
+
+    let data: any = null;
+
+    try {
+      data =
+        text
+          ? JSON.parse(text)
+          : null;
+    } catch {
+      return {
+        success: false,
+        event_id: expected,
+        match: null,
+        current_odds: null,
+        max_stake: null,
+        min_stake: null,
+        selection_status: null,
+        market_url: null,
+        available: false,
+        error: "RAW_LIVE_INVALID_JSON"
+      };
+    }
+
+    let exactEvent: any = null;
+
+    const sports =
+      Array.isArray(data?.sports)
+        ? data.sports
+        : [];
+
+    outer:
+    for (const sport of sports) {
+      const competitions =
+        Array.isArray(sport?.competitions)
+          ? sport.competitions
+          : [];
+
+      for (const competition of competitions) {
+        const events =
+          Array.isArray(competition?.events)
+            ? competition.events
+            : [];
+
+        for (const event of events) {
+          const eventId =
+            normalizeEventId(
+              getCloudbetEventId(event) ??
+              event?.id ??
+              event?.eventId ??
+              event?.event_id
+            );
+
+          if (eventId === expected) {
+            exactEvent = event;
+            break outer;
+          }
+        }
+      }
+    }
+
+    if (!exactEvent) {
+      return {
+        success: false,
+        event_id: expected,
+        match: null,
+        current_odds: null,
+        max_stake: null,
+        min_stake: null,
+        selection_status: null,
+        market_url: null,
+        available: false,
+        error: "RAW_LIVE_EXACT_EVENT_NOT_FOUND"
+      };
+    }
+
+    const selection =
+      findTargetSelection(
+        exactEvent
+      );
+
+    if (!selection) {
+      return {
+        success: false,
+        event_id: expected,
+        match: null,
+        current_odds: null,
+        max_stake: null,
+        min_stake: null,
+        selection_status: null,
+        market_url: null,
+        available: false,
+        error: "RAW_LIVE_TARGET_NOT_FOUND"
+      };
+    }
+
+    const marketUrl =
+      safe(
+        selection?.market_url ??
+        selection?.marketUrl ??
+        ""
+      );
+
+    const exactMarketUrl =
+      marketUrl ===
+      TARGET_MARKET_URL;
+
+    const enabled =
+      selectionEnabled(
+        selection
+      );
+
+    const price =
+      extractPrice(
+        selection
+      );
+
+    const status =
+      safe(
+        selection?.status ??
+        selection?.state ??
+        ""
+      ).toUpperCase() ||
+      (enabled
+        ? "SELECTION_ENABLED"
+        : "SELECTION_DISABLED");
+
+    if (
+      !exactMarketUrl ||
+      !enabled ||
+      price === null ||
+      price <= 1
+    ) {
+      return {
+        success: false,
+        event_id: expected,
+        match: null,
+        current_odds: exactMarketUrl
+          ? price
+          : null,
+        max_stake: selectionMaxStake(selection),
+        min_stake: selectionMinStake(selection),
+        selection_status: status,
+        market_url: marketUrl || null,
+        available: false,
+        error: !exactMarketUrl
+          ? "RAW_LIVE_EXACT_MARKET_URL_MISMATCH"
+          : !enabled
+          ? "RAW_LIVE_SELECTION_NOT_ENABLED"
+          : "RAW_LIVE_CURRENT_ODDS_INVALID"
+      };
+    }
+
+    return {
+      success: true,
+      event_id: expected,
+      match: null,
+      current_odds: price,
+      max_stake: selectionMaxStake(selection),
+      min_stake: selectionMinStake(selection),
+      selection_status: status,
+      market_url: marketUrl,
+      available: true
+    };
+  } catch (error: any) {
+    return {
+      success: false,
+      event_id: expected,
+      match: null,
+      current_odds: null,
+      max_stake: null,
+      min_stake: null,
+      selection_status: null,
+      market_url: null,
+      available: false,
+      error:
+        error?.name === "AbortError"
+          ? "RAW_LIVE_TIMEOUT"
+          : safe(error?.message ?? error) ||
+            "RAW_LIVE_FAILED"
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+
+// ============================================================
 // V7.6.34 — GENERIC ODDS DIAGNOSTIC
 // Works for ANY exact Cloudbet event_id.
 // ============================================================
@@ -3834,32 +4135,86 @@ async function verifySameEventAndOdds(
     if (
       !matcherOdds.success
     ) {
+      // V7.6.38: MATCHER /live can omit an AI-found event even while the
+      // Cloudbet website still exposes a tradable live market. Use the same
+      // RAW live sports/events source family as AI Matcher, but keep the event
+      // ID and exact marketUrl hard-locked.
+      const rawLiveOdds =
+        await fetchExactRawLiveOdds(
+          expectedEventId
+        );
+
+      if (rawLiveOdds.success) {
+        return {
+          success: true,
+          event_id: expectedEventId,
+          current_odds: rawLiveOdds.current_odds,
+          max_stake: rawLiveOdds.max_stake,
+          min_stake: rawLiveOdds.min_stake,
+          selection_status: rawLiveOdds.selection_status,
+          market_url: rawLiveOdds.market_url,
+          event,
+          validation: {
+            ...validation,
+            odds_source:
+              "RAW_CLOUDBET_LIVE_EXACT_EVENT_ID_FALLBACK",
+            exact_event_id: true,
+            exact_market_url: true,
+            matcher_fallback_used: true,
+            matcher_fallback_error:
+              matcherOdds.error ?? null,
+            raw_live_fallback_used: true,
+            raw_live_event_lock: expectedEventId,
+            direct_event_rejection:
+              directRejected
+                ? {
+                    error: directRejected.error ?? null,
+                    selection_status: directRejected.selection_status,
+                    current_odds: directRejected.current_odds,
+                    market_url: directRejected.market_url
+                  }
+                : null
+          }
+        };
+      }
+
       return {
         success:
           false,
         event_id:
           expectedEventId,
         current_odds:
+          rawLiveOdds.current_odds ??
           matcherOdds.current_odds,
         max_stake:
+          rawLiveOdds.max_stake ??
           matcherOdds.max_stake,
         min_stake:
+          rawLiveOdds.min_stake ??
           matcherOdds.min_stake,
         selection_status:
+          rawLiveOdds.selection_status ??
           matcherOdds.selection_status,
         market_url:
+          rawLiveOdds.market_url ??
           matcherOdds.market_url,
         event,
         validation: {
           ...validation,
           odds_source:
-            "MATCHER_LIVE_EXACT_EVENT_ID_FALLBACK",
+            "RAW_CLOUDBET_LIVE_AFTER_MATCHER_FAILURE",
           exact_event_id:
             true,
           direct_event_target_found:
             false,
           matcher_fallback_used:
             true,
+          matcher_fallback_error:
+            matcherOdds.error ?? null,
+          raw_live_fallback_used:
+            true,
+          raw_live_error:
+            rawLiveOdds.error ?? null,
           direct_event_rejection:
             directRejected
               ? {
@@ -3871,6 +4226,7 @@ async function verifySameEventAndOdds(
               : null
         },
         error:
+          rawLiveOdds.error ||
           matcherOdds.error ||
           directRejected?.error ||
           "TARGET_ODDS_NOT_AVAILABLE"
@@ -3900,6 +4256,40 @@ async function verifySameEventAndOdds(
       livePrice === null ||
       livePrice <= 1
     ) {
+      const rawLiveOdds =
+        await fetchExactRawLiveOdds(
+          expectedEventId
+        );
+
+      if (rawLiveOdds.success) {
+        return {
+          success: true,
+          event_id: expectedEventId,
+          current_odds: rawLiveOdds.current_odds,
+          max_stake: rawLiveOdds.max_stake,
+          min_stake: rawLiveOdds.min_stake,
+          selection_status: rawLiveOdds.selection_status,
+          market_url: rawLiveOdds.market_url,
+          event,
+          validation: {
+            ...validation,
+            exact_event_id: true,
+            exact_market_url: true,
+            selection_enabled: true,
+            odds_source:
+              "RAW_CLOUDBET_LIVE_EXACT_EVENT_ID_FALLBACK",
+            matcher_fallback_used: true,
+            raw_live_fallback_used: true,
+            matcher_candidate_rejected: {
+              exact_market_url: exactMarketUrl,
+              selection_enabled: matcherSelectionEnabled,
+              current_odds: livePrice,
+              market_url: matcherOdds.market_url
+            }
+          }
+        };
+      }
+
       return {
         success:
           false,
@@ -3908,15 +4298,15 @@ async function verifySameEventAndOdds(
         current_odds:
           exactMarketUrl
             ? livePrice
-            : null,
+            : rawLiveOdds.current_odds,
         max_stake:
-          matcherOdds.max_stake,
+          rawLiveOdds.max_stake ?? matcherOdds.max_stake,
         min_stake:
-          matcherOdds.min_stake,
+          rawLiveOdds.min_stake ?? matcherOdds.min_stake,
         selection_status:
-          matcherOdds.selection_status,
+          rawLiveOdds.selection_status ?? matcherOdds.selection_status,
         market_url:
-          matcherOdds.market_url,
+          rawLiveOdds.market_url ?? matcherOdds.market_url,
         event,
         validation: {
           ...validation,
@@ -3927,11 +4317,15 @@ async function verifySameEventAndOdds(
           selection_enabled:
             matcherSelectionEnabled,
           odds_source:
-            "MATCHER_LIVE_EXACT_EVENT_ID_FALLBACK",
+            "MATCHER_LIVE_THEN_RAW_LIVE_REJECTED",
           direct_event_target_found:
             false,
           matcher_fallback_used:
             true,
+          raw_live_fallback_used:
+            true,
+          raw_live_error:
+            rawLiveOdds.error ?? null,
           rejected_candidate_odds:
             !exactMarketUrl
               ? livePrice
@@ -3942,11 +4336,12 @@ async function verifySameEventAndOdds(
               : null
         },
         error:
-          !exactMarketUrl
+          rawLiveOdds.error ||
+          (!exactMarketUrl
             ? "EXACT_MARKET_URL_MISMATCH"
             : !matcherSelectionEnabled
             ? "SELECTION_NOT_ENABLED"
-            : "CURRENT_ODDS_INVALID"
+            : "CURRENT_ODDS_INVALID")
       };
     }
 
