@@ -216,7 +216,7 @@ type Obj = Record<string, any>;
 // - Normal betting remains OFF.
 //
 // ============================================================
-// V7.6.38 — RAW LIVE ODDS FALLBACK
+// V7.6.39 — SEMANTIC 1H O0.5 MARKET PARSER
 // - Keeps SAME locked Cloudbet event_id at every stage.
 // - Order: /event -> MATCHER /live -> RAW Cloudbet live sports/events.
 // - RAW fallback uses the same public live source family used by AI Matcher.
@@ -226,12 +226,22 @@ type Obj = Record<string, any>;
 // - Normal betting remains OFF.
 // ============================================================
 
+// V7.6.39 FIX:
+// - Fixes RAW_LIVE_TARGET_NOT_FOUND when Cloudbet omits marketUrl on each selection.
+// - Parent market context must prove FIRST HALF + TOTAL GOALS.
+// - Inside that proven context, selection is identified semantically as OVER + 0.5.
+// - Returned selection is canonicalized to the exact locked marketUrl used by all
+//   downstream safety gates and Trading API handoff.
+// - A standalone selection without proven parent context still requires exact marketUrl.
+// - SAME event_id lock remains mandatory; no alternate event / fuzzy odds fallback.
+// - Team totals / FT / 2H remain rejected. Betting remains OFF.
+
 // ============================================================
 // CONFIG
 // ============================================================
 
 const VERSION =
-  "V7.6.39 CONTEXT EXACT 1H O0.5 FIX - BETTING OFF";
+  "V7.6.39 SEMANTIC 1H O0.5 PARSER - BETTING OFF";
 
 const MODE =
   "DRY_RUN";
@@ -2401,7 +2411,7 @@ function selectionExactTargetMarketUrl(
   );
 }
 
-function isTargetSelection(
+function isTargetSelectionSemantic(
   selection: any
 ): boolean {
   if (!selection) {
@@ -2414,6 +2424,24 @@ function isTargetSelection(
     ) &&
     selectionLineIsHalf(
       selection
+    )
+  );
+}
+
+function isTargetSelection(
+  selection: any
+): boolean {
+  if (!selection) {
+    return false;
+  }
+
+  // Standalone selection validation stays HARD-LOCKED to the exact URL.
+  // The recursive market parser may accept the same semantic selection
+  // without a duplicated marketUrl only when the PARENT context has already
+  // proven FIRST HALF + TOTAL GOALS.
+  return (
+    isTargetSelectionSemantic(
+      selection
     ) &&
     selectionExactTargetMarketUrl(
       selection
@@ -2421,23 +2449,31 @@ function isTargetSelection(
   );
 }
 
-// V7.6.39 FIX:
-// /event and raw live payloads do not always repeat marketUrl on each selection.
-// searchTargetRecursive() already proves the parent market is EXACTLY the target
-// 1H Total Goals market + period=1h, so inside that locked context we only need
-// the selection identity (OVER + 0.5). This does NOT allow team totals / FT / 2H
-// because those fail the parent market/submarket gates before this helper is used.
-function isTargetSelectionInLockedContext(
-  selection: any
-): boolean {
-  if (!selection) {
-    return false;
-  }
+function canonicalTargetSelection(
+  selection: any,
+  sourceMarket: any,
+  sourceSubmarket: any
+): any {
+  const originalMarketUrl =
+    safe(
+      selection?.marketUrl ??
+      selection?.market_url ??
+      selection?.url ??
+      ""
+    ) || null;
 
-  return (
-    selectionOutcomeIsOver(selection) &&
-    selectionLineIsHalf(selection)
-  );
+  return {
+    ...selection,
+    market: TARGET_MARKET,
+    market_key: TARGET_MARKET,
+    submarket: TARGET_SUBMARKET,
+    submarket_key: TARGET_SUBMARKET,
+    marketUrl: TARGET_MARKET_URL,
+    market_url: TARGET_MARKET_URL,
+    source_market: safe(sourceMarket) || null,
+    source_submarket: safe(sourceSubmarket) || null,
+    source_market_url: originalMarketUrl
+  };
 }
 
 function extractPrice(
@@ -2598,7 +2634,7 @@ function searchTargetRecursive(
   if (
     marketMatches &&
     submarketMatches &&
-    isTargetSelectionInLockedContext(
+    isTargetSelectionSemantic(
       value
     ) &&
     selectionEnabled(
@@ -2614,15 +2650,12 @@ function searchTargetRecursive(
       price !== null
     ) {
       return {
-        ...value,
-        price,
-        market:
-          TARGET_MARKET,
-        submarket:
-          TARGET_SUBMARKET,
-        market_url:
-          safe(value?.market_url ?? value?.marketUrl ?? "") ||
-          TARGET_MARKET_URL
+        ...canonicalTargetSelection(
+          value,
+          currentMarket,
+          currentSubmarket
+        ),
+        price
       };
     }
   }
@@ -2675,7 +2708,7 @@ function searchTargetRecursive(
       }
 
       if (
-        !isTargetSelectionInLockedContext(
+        !isTargetSelectionSemantic(
           selection
         )
       ) {
@@ -2702,15 +2735,12 @@ function searchTargetRecursive(
       }
 
       return {
-        ...selection,
-        price,
-        market:
-          TARGET_MARKET,
-        submarket:
-          TARGET_SUBMARKET,
-        market_url:
-          safe(selection?.market_url ?? selection?.marketUrl ?? "") ||
-          TARGET_MARKET_URL
+        ...canonicalTargetSelection(
+          selection,
+          selectionMarket,
+          selectionSubmarket
+        ),
+        price
       };
     }
   }
