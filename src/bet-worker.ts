@@ -241,7 +241,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.41 AUTO NEXT BET READY ONE-SHOT 0.10 USDT TEST";
+  "V7.6.42 AUTO E2E ONE-SHOT 0.10 USDT REARM";
 
 const MODE =
   "DRY_RUN";
@@ -287,7 +287,7 @@ const REAL_TEST_CONFIRM = "PLACE_0_10_USDT_ONCE";
 // may be sent from the normal Hunter -> /run flow after ALL safety gates pass.
 const AUTO_E2E_TEST_ENABLED = true;
 const AUTO_E2E_TEST_STAKE = "0.10";
-const AUTO_E2E_TEST_KEY = "V7.6.18_SECOND_AUTO_E2E_ONE_SHOT_0_10_USDT";
+const AUTO_E2E_TEST_KEY = "V7.6.42_AUTO_E2E_ONE_SHOT_0_10_USDT_2026_09_15";
 
 // Legacy display/archive value preserved from V7.0.2.
 const BET_STAKE_EUR =
