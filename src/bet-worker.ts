@@ -241,7 +241,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.43 AUTO E2E REARM + AI TIMEOUT FIX";
+  "V7.6.44 READ ONLY EGRESS DIAGNOSTIC";
 
 const MODE =
   "DRY_RUN";
@@ -9428,6 +9428,116 @@ function v4StraightPayloadPreview(): any {
   };
 }
 
+
+// ============================================================
+// V7.6.44 — READ-ONLY CLOUDFLARE EGRESS DIAGNOSTIC
+// - NO Cloudbet placeBet request
+// - NO wager
+// - NO mutation of one-shot guards
+// - Checks public outbound IP using independent echo services
+// ============================================================
+
+async function runEgressDiagnostic(request: Request): Promise<any> {
+  const started = Date.now();
+
+  const incomingCf: any = (request as any).cf ?? {};
+  const checks: any[] = [];
+
+  const targets = [
+    {
+      name: "CLOUDFLARE_TRACE",
+      url: "https://www.cloudflare.com/cdn-cgi/trace"
+    },
+    {
+      name: "IPIFY",
+      url: "https://api.ipify.org?format=json"
+    }
+  ];
+
+  for (const target of targets) {
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+
+      try {
+        const response = await fetch(target.url, {
+          method: "GET",
+          headers: {
+            "Accept": "application/json,text/plain,*/*",
+            "Cache-Control": "no-cache"
+          },
+          signal: controller.signal,
+          redirect: "manual"
+        });
+
+        const raw = await response.text();
+
+        let parsed: any = null;
+
+        if (target.name === "IPIFY") {
+          try {
+            parsed = JSON.parse(raw);
+          } catch {
+            parsed = { raw: raw.slice(0, 1000) };
+          }
+        } else {
+          const trace: Record<string, string> = {};
+          for (const line of raw.split(/\r?\n/)) {
+            const pos = line.indexOf("=");
+            if (pos > 0) {
+              trace[line.slice(0, pos)] = line.slice(pos + 1);
+            }
+          }
+          parsed = trace;
+        }
+
+        checks.push({
+          name: target.name,
+          ok: response.ok,
+          http_status: response.status,
+          result: parsed
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch (error) {
+      checks.push({
+        name: target.name,
+        ok: false,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  return {
+    success: true,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    action: "READ_ONLY_EGRESS_DIAGNOSTIC",
+    safe_read_only: true,
+    wager_sent: false,
+    placebet_request_sent: false,
+    one_shot_guard_modified: false,
+
+    incoming_request_cf: {
+      colo: incomingCf?.colo ?? null,
+      country: incomingCf?.country ?? null,
+      region: incomingCf?.region ?? null,
+      city: incomingCf?.city ?? null,
+      timezone: incomingCf?.timezone ?? null,
+      asn: incomingCf?.asn ?? null,
+      as_organization: incomingCf?.asOrganization ?? null
+    },
+
+    outbound_checks: checks,
+
+    note:
+      "incoming_request_cf describes the client request reaching this Worker. outbound_checks show what independent public services observe for Worker fetch traffic.",
+
+    processing_ms: Date.now() - started
+  };
+}
+
 async function realTestStatus(env: Env): Promise<any> {
   await ensureRealTestTable(env);
   const row = await env.DB.prepare(`
@@ -10997,7 +11107,13 @@ export default {
         );
       }
 
-      if (path === "/real-test-status") {
+      if (path === "/egress-diagnostic") {
+  return json(
+    await runEgressDiagnostic(request)
+  );
+}
+
+if (path === "/real-test-status") {
         return json(
           await realTestStatus(env)
         );
