@@ -241,7 +241,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.40 EXPLICIT ONE-SHOT 0.10 USDT TEST";
+  "V7.6.41 AUTO NEXT BET READY ONE-SHOT 0.10 USDT TEST";
 
 const MODE =
   "DRY_RUN";
@@ -279,13 +279,13 @@ const TRADING_TRANSPORT =
 // Exactly one 0.10 USDT request can be sent through the explicit confirmed route.
 const REAL_TEST_ENABLED = true;
 const REAL_TEST_STAKE = 0.10;
-const REAL_TEST_KEY = "V7.6.40_EXPLICIT_ONE_SHOT_0_10_USDT_2026_09_15"; // unique one-shot guard
+const REAL_TEST_KEY = "V7.6.41_AUTO_NEXT_BET_READY_ONE_SHOT_0_10_USDT_2026_09_15"; // unique global one-shot guard
 const REAL_TEST_CONFIRM = "PLACE_0_10_USDT_ONCE";
 
 // V7.6.11 — automatic end-to-end proof test.
 // Normal betting stays OFF. Exactly one automatic real 0.10 USDT request
 // may be sent from the normal Hunter -> /run flow after ALL safety gates pass.
-const AUTO_E2E_TEST_ENABLED = false;
+const AUTO_E2E_TEST_ENABLED = true;
 const AUTO_E2E_TEST_STAKE = "0.10";
 const AUTO_E2E_TEST_KEY = "V7.6.18_SECOND_AUTO_E2E_ONE_SHOT_0_10_USDT";
 
