@@ -241,7 +241,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.46 CLOUDBET NETWORK DIAGNOSTIC API BASE FIX";
+  "V7.6.47 PROVEN TRADING GET NETWORK DIAGNOSTIC";
 
 const MODE =
   "DRY_RUN";
@@ -9540,84 +9540,34 @@ async function runEgressDiagnostic(request: Request): Promise<any> {
 
 
 // ============================================================
-// V7.6.45 — CLOUDBET READ-ONLY NETWORK DIAGNOSTIC
-// Authenticated GET only. Never calls placeBet.
+// V7.6.47 — PROVEN CLOUDBET TRADING GET DIAGNOSTIC
+// Reuses the worker's existing tradingDiagnostic(), which calls:
+// GET https://sports-api.cloudbet.com/pub/v4/bets?limit=1&offset=0
+// with the existing X-API-Key authentication.
+// NO POST. NO placeBet. NO wager. NO guard mutation.
 // ============================================================
 async function runCloudbetNetworkDiagnostic(env: Env): Promise<any> {
   const started = Date.now();
-  const apiKey = safe(env.CLOUDBET_API_KEY);
 
-  if (!apiKey) {
-    return {
-      success: false,
-      worker: "cloudbet-bet-worker",
-      version: VERSION,
-      action: "CLOUDBET_READ_ONLY_NETWORK_DIAGNOSTIC",
-      safe_read_only: true,
-      wager_sent: false,
-      error: "CLOUDBET_API_KEY_MISSING"
-    };
-  }
-
-  const targets = [
-    {
-      name: "PUBLIC_LIVE",
-      url: "https://sports-api.cloudbet.com/pub/v2/odds/events?limit=1",
-      authenticated: false
-    },
-    {
-      name: "AUTH_TRADING_HISTORY",
-      url: "https://sports-api.cloudbet.com/pub/v4/bets/history?limit=1",
-      authenticated: true
-    }
-  ];
-
-  const results:any[] = [];
-
-  for (const target of targets) {
-    try {
-      const response = await fetch(target.url, {
-        method: "GET",
-        headers: target.authenticated
-          ? { "Accept": "application/json", "X-API-KEY": apiKey }
-          : { "Accept": "application/json" },
-        redirect: "manual"
-      });
-
-      const raw = await response.text();
-      let body:any = null;
-      try { body = raw ? JSON.parse(raw) : null; }
-      catch { body = raw ? { raw: raw.slice(0, 1500) } : null; }
-
-      results.push({
-        name: target.name,
-        authenticated: target.authenticated,
-        ok: response.ok,
-        http_status: response.status,
-        headers: diagnosticHeaders(response.headers),
-        body
-      });
-    } catch (error) {
-      results.push({
-        name: target.name,
-        authenticated: target.authenticated,
-        ok: false,
-        error: error instanceof Error ? error.message : String(error)
-      });
-    }
-  }
+  const trading = await tradingDiagnostic(env);
 
   return {
     success: true,
     worker: "cloudbet-bet-worker",
     version: VERSION,
-    action: "CLOUDBET_READ_ONLY_NETWORK_DIAGNOSTIC",
+    action: "CLOUDBET_PROVEN_TRADING_GET_NETWORK_DIAGNOSTIC",
     safe_read_only: true,
     wager_sent: false,
     placebet_request_sent: false,
     one_shot_guard_modified: false,
-    api_key_present: true,
-    results,
+    diagnostic_source: "EXISTING_TRADING_DIAGNOSTIC_FUNCTION",
+    proven_endpoint:
+      "https://sports-api.cloudbet.com/pub/v4/bets?limit=1&offset=0",
+    trading,
+    conclusion_hint:
+      trading?.response?.ok === true
+        ? "AUTHENTICATED_TRADING_GET_OK"
+        : "CHECK_TRADING_DIAGNOSTIC_RESPONSE",
     processing_ms: Date.now() - started
   };
 }
