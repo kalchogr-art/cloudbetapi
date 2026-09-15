@@ -241,7 +241,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.45 CLOUDBET READ ONLY NETWORK DIAGNOSTIC";
+  "V7.6.46 CLOUDBET NETWORK DIAGNOSTIC API BASE FIX";
 
 const MODE =
   "DRY_RUN";
@@ -9562,7 +9562,7 @@ async function runCloudbetNetworkDiagnostic(env: Env): Promise<any> {
   const targets = [
     {
       name: "PUBLIC_LIVE",
-      url: `${API_BASE}/sports/events?limit=1`,
+      url: "https://sports-api.cloudbet.com/pub/v2/odds/events?limit=1",
       authenticated: false
     },
     {
