@@ -241,7 +241,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.39 SEMANTIC 1H O0.5 PARSER - BETTING OFF";
+  "V7.6.40 EXPLICIT ONE-SHOT 0.10 USDT TEST";
 
 const MODE =
   "DRY_RUN";
@@ -277,9 +277,9 @@ const TRADING_TRANSPORT =
 // ONE-SHOT REAL API TEST. This does not enable normal betting.
 // Dedicated one-shot real API test. Normal betting remains disabled.
 // Exactly one 0.10 USDT request can be sent through the explicit confirmed route.
-const REAL_TEST_ENABLED = false;
+const REAL_TEST_ENABLED = true;
 const REAL_TEST_STAKE = 0.10;
-const REAL_TEST_KEY = "V7.6.7_GRAPHQL_ONE_SHOT_0_10_USDT"; // keep consumed key; real test disabled
+const REAL_TEST_KEY = "V7.6.40_EXPLICIT_ONE_SHOT_0_10_USDT_2026_09_15"; // unique one-shot guard
 const REAL_TEST_CONFIRM = "PLACE_0_10_USDT_ONCE";
 
 // V7.6.11 — automatic end-to-end proof test.
