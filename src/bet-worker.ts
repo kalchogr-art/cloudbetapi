@@ -241,7 +241,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.42 AUTO E2E ONE-SHOT 0.10 USDT REARM";
+  "V7.6.43 AUTO E2E REARM + AI TIMEOUT FIX";
 
 const MODE =
   "DRY_RUN";
@@ -337,7 +337,7 @@ const SERVICE_TIMEOUT_MS =
   10_000;
 
 const AI_MATCHER_TIMEOUT_MS =
-  12_000;
+  25_000; // V7.6.43: slower AI resolve/history gets more time
 
 const AI_HISTORY_LIMIT =
   500;
