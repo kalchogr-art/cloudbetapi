@@ -47,7 +47,7 @@ interface Env {
   TRACKER: any;
 }
 
-const VERSION = "AI-MATCHER-V1.3.9-MECHANICAL-VERIFY-THEN-INDEPENDENT-AI-SEARCH";
+const VERSION = "AI-MATCHER-V1.4.0-DIRECT-CLOUDBET-AI-FIRST";
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 const CLOUDBET_BASE = "https://www.cloudbet.com";
@@ -62,6 +62,35 @@ const AI_ACCEPT_CONFIDENCE = 0.90;
 const HISTORY_LIMIT = 500;
 const TRACKER_TIMEOUT_MS = 8000;
 const MAX_SIGNALS_PER_SCAN = 5;
+
+function classifyResolveError(error: any): { code: string; retryable: boolean; message: string } {
+  const message = String(error?.message ?? error ?? "UNKNOWN_ERROR");
+  const upper = message.toUpperCase();
+
+  if (upper.includes("CLOUDBET_LIVE_FAILED:TIMEOUT") || upper.includes("ABORTERROR")) {
+    return { code: "CLOUDBET_TIMEOUT", retryable: true, message };
+  }
+  if (upper.includes("CLOUDBET_LIVE_FAILED:HTTP_")) {
+    return { code: "CLOUDBET_HTTP_ERROR", retryable: true, message };
+  }
+  if (upper.includes("CLOUDBET_LIVE_FAILED:INVALID_JSON")) {
+    return { code: "CLOUDBET_INVALID_JSON", retryable: true, message };
+  }
+  if (upper.includes("CLOUDBET_LIVE_FAILED")) {
+    return { code: "CLOUDBET_FETCH_ERROR", retryable: true, message };
+  }
+  if (upper.includes("AI_BINDING_MISSING")) {
+    return { code: "AI_BINDING_MISSING", retryable: true, message };
+  }
+  if (upper.includes("AI") || upper.includes("MODEL") || upper.includes("INFERENCE")) {
+    return { code: "AI_EXECUTION_ERROR", retryable: true, message };
+  }
+  if (upper.includes("DB") || upper.includes("D1") || upper.includes("SQL")) {
+    return { code: "DB_ERROR", retryable: true, message };
+  }
+
+  return { code: "RESOLVE_INTERNAL_ERROR", retryable: true, message };
+}
 
 // ============================================================
 // RESPONSE / GENERIC HELPERS
@@ -1542,67 +1571,66 @@ async function processOneSignal(
 
   const started = Date.now();
   const resolveMode = requestedResolveMode(rawSignal);
-  let result: AnyObj;
 
-  if (resolveMode === "VERIFY_LOCKED_EVENT") {
-    // V1.3.9:
-    // 1) Verify the mechanical matcher candidate first.
-    // 2) If AI accepts it, keep it.
-    // 3) If AI rejects / cannot confirm it, independently search ALL RAW live events.
-    //
-    // This means the mechanical candidate is a protected fast path, NOT a prison:
-    // a wrong mechanical candidate can no longer prevent AI from finding another event_id.
-    let mechanicalResult = await verifyLockedCandidateDirect(env, rawSignal, signal);
+  // V1.4.0 PRIMARY PATH:
+  // Hunter -> complete Cloudbet LIVE soccer feed -> independent AI identity search.
+  // Mechanical locked candidate is only a secondary fallback.
+  const rawEvents = await getRawCloudbetLive();
+  const directAi = await matchWithAi(env, signal, rawEvents);
 
-    if (!mechanicalResult) {
-      const rawEventsForLockedLookup = await getRawCloudbetLive();
-      mechanicalResult = await verifyLockedEventFromRawFeed(
-        env,
-        rawSignal,
-        signal,
-        rawEventsForLockedLookup
-      );
+  let result: AnyObj = {
+    ...directAi,
+    resolution_path: directAi?.accepted === true
+      ? "DIRECT_CLOUDBET_AI_MATCH"
+      : "DIRECT_CLOUDBET_AI_NO_MATCH",
+    direct_cloudbet_ai_search: {
+      attempted: true,
+      accepted: directAi?.accepted === true,
+      event_id: directAi?.event_id ?? null,
+      confidence: directAi?.confidence ?? 0,
+      reason: directAi?.reason ?? directAi?.ai_reason ?? null,
+      raw_events: rawEvents.length
+    }
+  };
 
-      if (mechanicalResult?.accepted === true) {
-        result = {
-          ...mechanicalResult,
-          resolution_path: "MECHANICAL_LOCKED_EVENT_AI_CONFIRMED",
-          mechanical_verification: {
-            attempted: true,
-            accepted: true,
-            event_id: mechanicalResult?.event_id ?? null,
-            confidence: mechanicalResult?.confidence ?? 0,
-            reason: mechanicalResult?.reason ?? null
-          }
-        };
-      } else {
-        const aiSearch = await matchWithAi(env, signal, rawEventsForLockedLookup);
-        result = {
-          ...aiSearch,
-          resolution_path: aiSearch?.accepted === true
-            ? "MECHANICAL_REJECTED_AI_INDEPENDENT_MATCH"
-            : "MECHANICAL_REJECTED_AI_INDEPENDENT_NO_MATCH",
-          mechanical_verification: {
-            attempted: true,
-            accepted: false,
-            event_id: mechanicalResult?.event_id ?? requestedLockedEventId(rawSignal),
-            confidence: mechanicalResult?.confidence ?? 0,
-            reason: mechanicalResult?.reason ?? "MECHANICAL_EVENT_NOT_CONFIRMED"
-          },
-          ai_independent_search: {
-            attempted: true,
-            accepted: aiSearch?.accepted === true,
-            event_id: aiSearch?.event_id ?? null,
-            confidence: aiSearch?.confidence ?? 0,
-            reason: aiSearch?.reason ?? null
-          }
-        };
+  // Only if direct AI did not accept a match do we use the old locked
+  // mechanical candidate as a secondary recovery path.
+  if (directAi?.accepted !== true && resolveMode === "VERIFY_LOCKED_EVENT") {
+    let mechanicalResult: AnyObj | null = null;
+
+    try {
+      mechanicalResult = await verifyLockedCandidateDirect(env, rawSignal, signal);
+
+      if (!mechanicalResult) {
+        mechanicalResult = await verifyLockedEventFromRawFeed(
+          env,
+          rawSignal,
+          signal,
+          rawEvents
+        );
       }
-    } else if (mechanicalResult?.accepted === true) {
+    } catch (mechanicalError: any) {
+      mechanicalResult = {
+        accepted: false,
+        matched: false,
+        reason: "MECHANICAL_FALLBACK_ERROR",
+        error: String(mechanicalError?.message ?? mechanicalError)
+      };
+    }
+
+    if (mechanicalResult?.accepted === true) {
       result = {
         ...mechanicalResult,
-        resolution_path: "MECHANICAL_LOCKED_CANDIDATE_AI_CONFIRMED",
-        mechanical_verification: {
+        resolution_path: "DIRECT_AI_NO_MATCH_MECHANICAL_FALLBACK_MATCH",
+        direct_cloudbet_ai_search: {
+          attempted: true,
+          accepted: false,
+          event_id: directAi?.event_id ?? null,
+          confidence: directAi?.confidence ?? 0,
+          reason: directAi?.reason ?? directAi?.ai_reason ?? null,
+          raw_events: rawEvents.length
+        },
+        mechanical_fallback: {
           attempted: true,
           accepted: true,
           event_id: mechanicalResult?.event_id ?? null,
@@ -1611,47 +1639,18 @@ async function processOneSignal(
         }
       };
     } else {
-      const rawEvents = await getRawCloudbetLive();
-      const aiSearch = await matchWithAi(env, signal, rawEvents);
-
       result = {
-        ...aiSearch,
-        resolution_path: aiSearch?.accepted === true
-          ? "MECHANICAL_REJECTED_AI_INDEPENDENT_MATCH"
-          : "MECHANICAL_REJECTED_AI_INDEPENDENT_NO_MATCH",
-        mechanical_verification: {
+        ...result,
+        mechanical_fallback: {
           attempted: true,
           accepted: false,
           event_id: mechanicalResult?.event_id ?? requestedLockedEventId(rawSignal),
           confidence: mechanicalResult?.confidence ?? 0,
-          reason: mechanicalResult?.reason ?? "MECHANICAL_EVENT_NOT_CONFIRMED"
-        },
-        ai_independent_search: {
-          attempted: true,
-          accepted: aiSearch?.accepted === true,
-          event_id: aiSearch?.event_id ?? null,
-          confidence: aiSearch?.confidence ?? 0,
-          reason: aiSearch?.reason ?? null
+          reason: mechanicalResult?.reason ?? "MECHANICAL_EVENT_NOT_CONFIRMED",
+          error: mechanicalResult?.error ?? null
         }
       };
     }
-  } else {
-    // No mechanical candidate was supplied: AI searches independently as before.
-    const rawEvents = await getRawCloudbetLive();
-    const aiSearch = await matchWithAi(env, signal, rawEvents);
-    result = {
-      ...aiSearch,
-      resolution_path: aiSearch?.accepted === true
-        ? "AI_INDEPENDENT_MATCH"
-        : "AI_INDEPENDENT_NO_MATCH",
-      ai_independent_search: {
-        attempted: true,
-        accepted: aiSearch?.accepted === true,
-        event_id: aiSearch?.event_id ?? null,
-        confidence: aiSearch?.confidence ?? 0,
-        reason: aiSearch?.reason ?? null
-      }
-    };
   }
 
   const processingMs = Date.now() - started;
@@ -1792,8 +1791,8 @@ export default {
         db_binding: Boolean(env.DB),
         tracker_binding: Boolean(env.TRACKER),
         model: MODEL,
-        architecture: "MECHANICAL LOCKED CANDIDATE -> AI VERIFY -> IF REJECTED: INDEPENDENT RAW LIVE AI SEARCH -> HARD CATEGORY GUARD",
-        fallback_filter: "MECHANICAL candidate is AI-verified first; rejection triggers independent AI search across all usable RAW live soccer candidates",
+        architecture: "HUNTER -> DIRECT CLOUDBET LIVE SOCCER -> AI INDEPENDENT SEARCH -> HARD CATEGORY GUARD -> MECHANICAL FALLBACK",
+        fallback_filter: "Direct Cloudbet AI search is primary; mechanical locked candidate is secondary fallback only",
         endpoints: {
           dashboard: "GET /",
           status: "GET /status",
@@ -1972,12 +1971,16 @@ export default {
           ...processed
         });
       } catch (error: any) {
+        const failure = classifyResolveError(error);
         return json({
           success: false,
           worker: "ai-matcher",
           version: VERSION,
-          error: "AI_RESOLVE_FAILED",
-          message: String(error?.message ?? error)
+          error: failure.code,
+          retryable: failure.retryable,
+          legacy_error: "AI_RESOLVE_FAILED",
+          stage: "DIRECT_CLOUDBET_AI_RESOLVE",
+          message: failure.message
         }, 500);
       }
     }
