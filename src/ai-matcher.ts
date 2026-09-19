@@ -47,7 +47,7 @@ interface Env {
   TRACKER: any;
 }
 
-const VERSION = "AI-MATCHER-V1.4.0-DIRECT-CLOUDBET-AI-FIRST";
+const VERSION = "AI-MATCHER-V1.4.1-CLOUDBET-HTTP-DIAGNOSTIC";
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 const CLOUDBET_BASE = "https://www.cloudbet.com";
@@ -90,6 +90,20 @@ function classifyResolveError(error: any): { code: string; retryable: boolean; m
   }
 
   return { code: "RESOLVE_INTERNAL_ERROR", retryable: true, message };
+}
+
+function parseCloudbetHttpDiagnostic(message: any): AnyObj | null {
+  const text = String(message ?? "");
+  const markerAt = text.indexOf("CLOUDBET_LIVE_FAILED:");
+  if (markerAt < 0) return null;
+  const jsonAt = text.indexOf(":{", markerAt);
+  if (jsonAt < 0) return null;
+  try {
+    const parsed = JSON.parse(text.slice(jsonAt + 1));
+    return parsed && typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 // ============================================================
@@ -310,8 +324,17 @@ async function fetchCloudbetJson(url: string): Promise<any> {
       return {
         ok: false,
         status: response.status,
+        status_text: response.statusText || null,
         error: `HTTP_${response.status}`,
+        endpoint: url,
         preview: text.slice(0, 500),
+        headers: {
+          cf_ray: response.headers.get("cf-ray"),
+          server: response.headers.get("server"),
+          content_type: response.headers.get("content-type"),
+          retry_after: response.headers.get("retry-after"),
+          location: response.headers.get("location")
+        },
         data: null
       };
     }
@@ -350,7 +373,23 @@ async function getRawCloudbetLive(): Promise<AnyObj[]> {
   url.searchParams.set("locale", "en");
 
   const result = await fetchCloudbetJson(url.toString());
-  if (!result.ok) throw new Error(`CLOUDBET_LIVE_FAILED:${result.error}`);
+  if (!result.ok) {
+    const diagnostic = {
+      error: result.error ?? "UNKNOWN",
+      http_status: result.status ?? 0,
+      status_text: result.status_text ?? null,
+      endpoint: result.endpoint ?? url.toString(),
+      cf_ray: result.headers?.cf_ray ?? null,
+      server: result.headers?.server ?? null,
+      content_type: result.headers?.content_type ?? null,
+      retry_after: result.headers?.retry_after ?? null,
+      location: result.headers?.location ?? null,
+      response_preview: result.preview ?? null
+    };
+    throw new Error(
+      `CLOUDBET_LIVE_FAILED:${result.error ?? "UNKNOWN"}:${JSON.stringify(diagnostic)}`
+    );
+  }
 
   const events: AnyObj[] = [];
   const sports = Array.isArray(result.data?.sports) ? result.data.sports : [];
