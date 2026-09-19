@@ -247,7 +247,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.49 LIVE UNMATCHED RETRY RESCUE";
+  "V7.6.51 ODDS RETRY DEEP DIAGNOSTICS";
 
 const MODE =
   "DRY_RUN";
@@ -5293,6 +5293,44 @@ async function ensureDatabaseSchema(
 
     await env.DB
       .prepare(`
+        CREATE TABLE IF NOT EXISTS odds_retry_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          signal_match_id TEXT,
+          cloudbet_id TEXT,
+          match TEXT,
+          attempt INTEGER DEFAULT 0,
+          success INTEGER DEFAULT 0,
+          reason TEXT,
+          current_odds REAL,
+          max_stake REAL,
+          raw_event_found INTEGER,
+          exact_1h_market_found INTEGER,
+          over_05_found INTEGER,
+          selection_enabled INTEGER,
+          diagnostic_json TEXT,
+          checked_at TEXT
+        )
+      `)
+      .run();
+
+    createdTables.push(
+      "odds_retry_log"
+    );
+
+    await env.DB
+      .prepare(`
+        CREATE INDEX IF NOT EXISTS
+        idx_odds_retry_log_match_time
+        ON odds_retry_log(signal_match_id, checked_at)
+      `)
+      .run();
+
+    indexesChecked.push(
+      "idx_odds_retry_log_match_time"
+    );
+
+    await env.DB
+      .prepare(`
         CREATE TABLE IF NOT EXISTS bet_archive (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           match_id TEXT,
@@ -6355,6 +6393,111 @@ async function notifyTrackerOddsFound(
 // PENDING RETRY
 // ============================================================
 
+function diagnosticFlag(obj: any, keys: string[]): number | null {
+  for (const key of keys) {
+    const parts = key.split(".");
+    let value: any = obj;
+    for (const part of parts) value = value?.[part];
+    if (value === true) return 1;
+    if (value === false) return 0;
+  }
+  return null;
+}
+
+async function logOddsRetryDiagnostic(
+  env: Env,
+  row: any,
+  current: any
+): Promise<void> {
+  try {
+    let payload: any = {};
+    try { payload = JSON.parse(row?.payload_json || "{}"); } catch {}
+    const signal = payload?.signal || {};
+    const reason = safe(current?.error || current?.reason || (current?.success ? "ODDS_FOUND" : "TARGET_ODDS_STILL_UNAVAILABLE"));
+    const odds = numberOrNull(current?.current_odds ?? current?.odds ?? current?.price);
+    const maxStake = numberOrNull(current?.max_stake ?? current?.maxStake);
+    const rawEventFound = diagnosticFlag(current, ["raw_event_found","diagnostics.raw_event_found","raw_live_event_found","diagnostics.raw_live_event_found","event_found","diagnostics.event_found"]);
+    const exactMarketFound = diagnosticFlag(current, ["exact_1h_market_found","diagnostics.exact_1h_market_found","target_market_found","diagnostics.target_market_found","market_found","diagnostics.market_found"]);
+    const over05Found = diagnosticFlag(current, ["over_05_found","diagnostics.over_05_found","target_selection_found","diagnostics.target_selection_found","selection_found","diagnostics.selection_found"]);
+    const selectionEnabled = diagnosticFlag(current, ["selection_enabled","diagnostics.selection_enabled","enabled","diagnostics.enabled"]);
+
+    await env.DB.prepare(`
+      INSERT INTO odds_retry_log (
+        signal_match_id, cloudbet_id, match, attempt, success, reason,
+        current_odds, max_stake, raw_event_found, exact_1h_market_found,
+        over_05_found, selection_enabled, diagnostic_json, checked_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      signal?.match_id ?? signal?.id ?? row?.signal_match_id ?? null,
+      normalizeEventId(row?.cloudbet_id),
+      signalMatch(signal) || row?.match || null,
+      Number(row?.retry_count || 0) + 1,
+      current?.success ? 1 : 0,
+      reason || null,
+      odds,
+      maxStake,
+      rawEventFound,
+      exactMarketFound,
+      over05Found,
+      selectionEnabled,
+      JSON.stringify(current ?? null),
+      nowISO()
+    ).run();
+  } catch {
+    // Diagnostics must never interrupt the betting pipeline.
+  }
+}
+
+async function loadDailyOddsRetryDiagnostics(env: Env, date?: string | null): Promise<any[]> {
+  const requested = safe(date || "");
+  // Tracker owns Sofia day filtering for Hunter rows. Here we keep the same
+  // practical UTC window used by the worker diagnostics and return enough
+  // history to identify every odds retry for the requested day.
+  const rows = await env.DB.prepare(`
+    SELECT * FROM odds_retry_log
+    WHERE (? = '' OR substr(checked_at, 1, 10) = ?)
+    ORDER BY checked_at ASC, id ASC
+    LIMIT 5000
+  `).bind(requested, requested).all<any>();
+
+  const grouped: Record<string, any> = {};
+  for (const r of (rows.results || [])) {
+    const key = safe(r.signal_match_id) || `event:${safe(r.cloudbet_id)}`;
+    if (!grouped[key]) grouped[key] = {
+      match_id: r.signal_match_id ?? null,
+      match: r.match ?? null,
+      cloudbet_id: r.cloudbet_id ?? null,
+      odds_attempts: 0,
+      last_odds_check: null,
+      last_odds_reason: null,
+      last_seen_odds: null,
+      raw_event_found: null,
+      exact_1h_market_found: null,
+      over_05_found: null,
+      selection_enabled: null,
+      history: []
+    };
+    const g = grouped[key];
+    g.odds_attempts += 1;
+    g.last_odds_check = r.checked_at;
+    g.last_odds_reason = r.reason;
+    if (r.current_odds != null) g.last_seen_odds = Number(r.current_odds);
+    if (r.raw_event_found != null) g.raw_event_found = Number(r.raw_event_found) === 1;
+    if (r.exact_1h_market_found != null) g.exact_1h_market_found = Number(r.exact_1h_market_found) === 1;
+    if (r.over_05_found != null) g.over_05_found = Number(r.over_05_found) === 1;
+    if (r.selection_enabled != null) g.selection_enabled = Number(r.selection_enabled) === 1;
+    g.history.push({
+      attempt: r.attempt,
+      checked_at: r.checked_at,
+      success: Number(r.success) === 1,
+      reason: r.reason,
+      odds: r.current_odds == null ? null : Number(r.current_odds),
+      max_stake: r.max_stake == null ? null : Number(r.max_stake)
+    });
+  }
+  return Object.values(grouped);
+}
+
 async function processPending(
   env: Env,
   account: AccountSnapshot,
@@ -6507,6 +6650,12 @@ async function processPending(
           row.entry_minute
         )
       );
+
+    await logOddsRetryDiagnostic(
+      env,
+      row,
+      current
+    );
 
     if (
       !current.success
@@ -10953,16 +11102,24 @@ async function runDailyDiagnosticsProxy(
     SERVICE_TIMEOUT_MS
   );
 
+  const oddsRetryDiagnostics =
+    await loadDailyOddsRetryDiagnostics(
+      env,
+      date
+    );
+
   return {
     success: result.ok,
     worker: "cloudbet-bet-worker",
     version: VERSION,
-    diagnostic: "ALL_HUNTER_MATCHES_FOR_DAY",
+    diagnostic: "ALL_HUNTER_MATCHES_FOR_DAY_PLUS_ODDS_RETRY_HISTORY",
     source: "TRACKER /diagnostics",
     date: date || "TODAY_EUROPE_SOFIA",
     status: result.status,
     latency_ms: result.latency_ms,
     data: result.data,
+    odds_retry_diagnostics: oddsRetryDiagnostics,
+    odds_retry_diagnostics_count: oddsRetryDiagnostics.length,
     error: result.error || null
   };
 }
