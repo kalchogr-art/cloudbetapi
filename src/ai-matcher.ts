@@ -48,7 +48,7 @@ interface Env {
   CLOUDBET_API_KEY?: string;
 }
 
-const VERSION = "AI-MATCHER-V1.4.2-OFFICIAL-V2-FEED-FIX";
+const VERSION = "AI-MATCHER-V1.4.3-V2-RAW-SHAPE-DIAGNOSTIC";
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 const CLOUDBET_BASE = "https://sports-api.cloudbet.com";
@@ -367,6 +367,47 @@ async function fetchCloudbetJson(url: string, apiKey?: string): Promise<any> {
   } finally {
     clearTimeout(timeout);
   }
+}
+
+
+async function getCloudbetV2RawDiagnostic(env?: Env): Promise<AnyObj> {
+  const url = new URL(SPORTS_EVENTS_PATH, CLOUDBET_BASE);
+  url.searchParams.set("sport", "soccer");
+  url.searchParams.set("live", "true");
+  url.searchParams.set("players", "false");
+  url.searchParams.set("limit", String(LIVE_LIMIT));
+
+  const result = await fetchCloudbetJson(url.toString(), env?.CLOUDBET_API_KEY);
+  if (!result.ok) {
+    return {
+      success: false,
+      error: result.error ?? "UNKNOWN",
+      http_status: result.status ?? 0,
+      endpoint: result.endpoint ?? url.toString(),
+      response_preview: result.preview ?? null
+    };
+  }
+
+  const data = result.data;
+  return {
+    success: true,
+    http_status: result.status,
+    endpoint: url.toString(),
+    root_type: Array.isArray(data) ? "array" : (data === null ? "null" : typeof data),
+    root_keys: data && typeof data === "object" && !Array.isArray(data) ? Object.keys(data).slice(0,50) : [],
+    root_array_length: Array.isArray(data) ? data.length : null,
+    common_lengths: {
+      sports: Array.isArray(data?.sports) ? data.sports.length : null,
+      events: Array.isArray(data?.events) ? data.events.length : null,
+      competitions: Array.isArray(data?.competitions) ? data.competitions.length : null,
+      data: Array.isArray(data?.data) ? data.data.length : null
+    },
+    sample: Array.isArray(data) ? data.slice(0,2)
+      : Array.isArray(data?.events) ? data.events.slice(0,2)
+      : Array.isArray(data?.data) ? data.data.slice(0,2)
+      : data && typeof data === "object" ? Object.fromEntries(Object.entries(data).slice(0,8))
+      : data
+  };
 }
 
 async function getRawCloudbetLive(env?: Env): Promise<AnyObj[]> {
@@ -1878,6 +1919,18 @@ export default {
       } catch (error: any) {
         return json({ success: false, error: "HISTORY_FAILED", message: String(error?.message ?? error) }, 500);
       }
+    }
+
+    // V1.4.3 — successful official V2 response shape diagnostic.
+    if (url.pathname === "/raw-shape" && request.method === "GET") {
+      const diagnostic = await getCloudbetV2RawDiagnostic(env);
+      return json({
+        worker: "ai-matcher",
+        version: VERSION,
+        action: "CLOUDBET_V2_RAW_SHAPE",
+        betting: "DISABLED",
+        ...diagnostic
+      }, diagnostic.success ? 200 : 502);
     }
 
     if (url.pathname === "/live-test" && request.method === "GET") {
