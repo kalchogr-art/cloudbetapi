@@ -247,7 +247,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.48 RAW LIVE RECOVERY FIX";
+  "V7.6.49 LIVE UNMATCHED RETRY RESCUE";
 
 const MODE =
   "DRY_RUN";
@@ -10441,11 +10441,50 @@ async function runWorker(
             }
           });
         } else {
-          // No deterministic candidate: keep the existing AI history/fallback result.
-          aiMatch = findAiHistoryMatch(
-            signal,
-            aiHistory.rows
-          );
+          // V7.6.48 — LIVE UNMATCHED RETRY RESCUE.
+          // IMPORTANT: an old AI history rejection must NOT permanently own an
+          // active Hunter signal. Cloudbet live events can appear a few minutes
+          // after the Hunter ENTRY, so every /run re-resolves signals that still
+          // have no deterministic event_id.
+          //
+          // This gives us the required lifecycle:
+          //   UNMATCHED -> retry match -> MATCHED -> PENDING_ODDS -> READY_TO_BET
+          //
+          // History is only a diagnostic fallback when the live resolver itself
+          // is temporarily unavailable/pending; it is no longer the primary
+          // decision for an active unmatched signal.
+          const liveRetry = await resolveAiMatch(env, {
+            ...signal,
+            resolve_mode: "LIVE_UNMATCHED_RETRY",
+            matcher_sync: {
+              ai_mode: "LIVE_UNMATCHED_RETRY",
+              old_matcher_event_id: null,
+              old_matcher_locked: false,
+              weak_candidate_locked_for_ai: false,
+              retry_unmatched: true
+            }
+          });
+
+          if (
+            liveRetry.ok &&
+            liveRetry.accepted &&
+            liveRetry.event_id
+          ) {
+            aiMatch = liveRetry;
+          } else {
+            const historyMatch = findAiHistoryMatch(
+              signal,
+              aiHistory.rows
+            );
+
+            // Prefer the fresh resolver result whenever it produced a real
+            // terminal decision. Use history only for temporary resolver
+            // failures/pending states, so a stale historical rejection cannot
+            // block a newly published Cloudbet fixture forever.
+            aiMatch = isAiResolutionPending(liveRetry)
+              ? historyMatch
+              : liveRetry;
+          }
         }
       }
 
