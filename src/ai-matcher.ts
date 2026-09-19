@@ -45,13 +45,14 @@ interface Env {
   AI: any;
   DB: any;
   TRACKER: any;
+  CLOUDBET_API_KEY?: string;
 }
 
-const VERSION = "AI-MATCHER-V1.4.1-CLOUDBET-HTTP-DIAGNOSTIC";
+const VERSION = "AI-MATCHER-V1.4.2-OFFICIAL-V2-FEED-FIX";
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
-const CLOUDBET_BASE = "https://www.cloudbet.com";
-const SPORTS_EVENTS_PATH = "/sports-api/c/v6/sports/events";
+const CLOUDBET_BASE = "https://sports-api.cloudbet.com";
+const SPORTS_EVENTS_PATH = "/pub/v2/odds/events";
 const CLOUDBET_TIMEOUT_MS = 8000;
 const LIVE_LIMIT = 200;
 
@@ -307,7 +308,7 @@ function signalValid(signal: AnyObj): boolean {
 // CLOUDBET LIVE
 // ============================================================
 
-async function fetchCloudbetJson(url: string): Promise<any> {
+async function fetchCloudbetJson(url: string, apiKey?: string): Promise<any> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), CLOUDBET_TIMEOUT_MS);
 
@@ -315,7 +316,10 @@ async function fetchCloudbetJson(url: string): Promise<any> {
     const response = await fetch(url, {
       method: "GET",
       signal: controller.signal,
-      headers: { accept: "application/json" }
+      headers: {
+        accept: "application/json",
+        ...(apiKey ? { "X-API-Key": apiKey } : {})
+      }
     });
 
     const text = await response.text();
@@ -365,14 +369,14 @@ async function fetchCloudbetJson(url: string): Promise<any> {
   }
 }
 
-async function getRawCloudbetLive(): Promise<AnyObj[]> {
+async function getRawCloudbetLive(env?: Env): Promise<AnyObj[]> {
   const url = new URL(SPORTS_EVENTS_PATH, CLOUDBET_BASE);
-  url.searchParams.set("sports", "soccer");
+  url.searchParams.set("sport", "soccer");
   url.searchParams.set("live", "true");
+  url.searchParams.set("players", "false");
   url.searchParams.set("limit", String(LIVE_LIMIT));
-  url.searchParams.set("locale", "en");
 
-  const result = await fetchCloudbetJson(url.toString());
+  const result = await fetchCloudbetJson(url.toString(), env?.CLOUDBET_API_KEY);
   if (!result.ok) {
     const diagnostic = {
       error: result.error ?? "UNKNOWN",
@@ -1614,7 +1618,7 @@ async function processOneSignal(
   // V1.4.0 PRIMARY PATH:
   // Hunter -> complete Cloudbet LIVE soccer feed -> independent AI identity search.
   // Mechanical locked candidate is only a secondary fallback.
-  const rawEvents = await getRawCloudbetLive();
+  const rawEvents = await getRawCloudbetLive(env);
   const directAi = await matchWithAi(env, signal, rawEvents);
 
   let result: AnyObj = {
@@ -1878,7 +1882,7 @@ export default {
 
     if (url.pathname === "/live-test" && request.method === "GET") {
       try {
-        const events = await getRawCloudbetLive();
+        const events = await getRawCloudbetLive(env);
         const allCandidates = events
           .map((event, index) => compactCandidate(event, index))
           .filter(candidate => Boolean(candidate.event_id && candidate.home && candidate.away));
