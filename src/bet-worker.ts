@@ -1,3 +1,9 @@
+// V7.6.48:
+// - RAW_LIVE_HTTP_400 and temporary RAW live failures are recoverable.
+// - Existing 0s -> 3s -> 5s -> 10s SAME-event odds recovery continues.
+// - Locked Cloudbet event_id never changes.
+// - No matcher, betting, stake, market, or one-shot safety logic changed.
+//
 // ============================================================
 // V7.6.28 WEAK -> AI LOCKED RESCUE
 // - WEAK_TWO_SIDED_SIMILARITY keeps diagnostic best_candidate.event_id.
@@ -241,7 +247,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.47 PROVEN TRADING GET NETWORK DIAGNOSTIC";
+  "V7.6.48 RAW LIVE RECOVERY FIX";
 
 const MODE =
   "DRY_RUN";
@@ -4481,7 +4487,24 @@ function isRecoverableOddsFailure(error: any): boolean {
     value === "TARGET_MARKET_NOT_FOUND" ||
     value === "EXACT_MARKET_NOT_FOUND" ||
     value === "ODDS_NOT_AVAILABLE" ||
-    value === "SELECTION_DISABLED"
+    value === "SELECTION_DISABLED" ||
+
+    // V7.6.48 — RAW LIVE is only a fallback.
+    // Temporary HTTP/feed/market availability failures must NOT terminate
+    // SAME-event recovery. The locked Cloudbet event_id remains unchanged.
+    value === "RAW_LIVE_HTTP_400" ||
+    value === "RAW_LIVE_HTTP_429" ||
+    value === "RAW_LIVE_HTTP_500" ||
+    value === "RAW_LIVE_HTTP_502" ||
+    value === "RAW_LIVE_HTTP_503" ||
+    value === "RAW_LIVE_HTTP_504" ||
+    value === "RAW_LIVE_TIMEOUT" ||
+    value === "RAW_LIVE_FAILED" ||
+    value === "RAW_LIVE_INVALID_JSON" ||
+    value === "RAW_LIVE_EXACT_EVENT_NOT_FOUND" ||
+    value === "RAW_LIVE_TARGET_NOT_FOUND" ||
+    value === "RAW_LIVE_SELECTION_NOT_ENABLED" ||
+    value === "RAW_LIVE_CURRENT_ODDS_INVALID"
   );
 }
 
