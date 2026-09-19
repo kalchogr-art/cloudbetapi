@@ -10936,6 +10936,37 @@ async function runEntriesProxy(
   };
 }
 
+async function runDailyDiagnosticsProxy(
+  env: Env,
+  url: URL
+): Promise<any> {
+  const params = new URLSearchParams();
+  const date = url.searchParams.get("date");
+  const limit = url.searchParams.get("limit");
+  if (date) params.set("date", date);
+  params.set("limit", limit || "500");
+
+  const path = `/diagnostics?${params.toString()}`;
+  const result = await fetchServiceJSON(
+    env.TRACKER,
+    path,
+    SERVICE_TIMEOUT_MS
+  );
+
+  return {
+    success: result.ok,
+    worker: "cloudbet-bet-worker",
+    version: VERSION,
+    diagnostic: "ALL_HUNTER_MATCHES_FOR_DAY",
+    source: "TRACKER /diagnostics",
+    date: date || "TODAY_EUROPE_SOFIA",
+    status: result.status,
+    latency_ms: result.latency_ms,
+    data: result.data,
+    error: result.error || null
+  };
+}
+
 function healthResponse():
   Response {
   return json({
@@ -11004,6 +11035,8 @@ function healthResponse():
       "/rest-post-diagnostic",
       "/trading-payload-preview",
       "/diagnostic",
+      "/diagnostics",
+      "/diagnostics?date=YYYY-MM-DD",
       "/odds-debug?event_id=EVENT_ID",
       "/entries"
     ]
@@ -11110,6 +11143,8 @@ export default {
             "/rest-post-diagnostic",
             "/trading-payload-preview",
             "/diagnostic",
+            "/diagnostics",
+            "/diagnostics?date=YYYY-MM-DD",
             "/odds-debug?event_id=EVENT_ID",
             "/entries"
           ]
@@ -11152,6 +11187,15 @@ export default {
               "id"
             )
           )
+        );
+      }
+
+      if (path === "/diagnostics") {
+        if (request.method !== "GET") {
+          return json({ success:false, error:"METHOD_NOT_ALLOWED", expected_method:"GET" },405);
+        }
+        return json(
+          await runDailyDiagnosticsProxy(env, url)
         );
       }
 
