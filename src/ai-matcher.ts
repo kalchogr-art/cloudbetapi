@@ -48,7 +48,7 @@ interface Env {
   CLOUDBET_API_KEY?: string;
 }
 
-const VERSION = "AI-MATCHER-V1.4.3-V2-RAW-SHAPE-DIAGNOSTIC";
+const VERSION = "AI-MATCHER-V1.4.4-V2-COMPETITIONS-PARSER-FIX";
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 
 const CLOUDBET_BASE = "https://sports-api.cloudbet.com";
@@ -417,7 +417,11 @@ async function getRawCloudbetLive(env?: Env): Promise<AnyObj[]> {
   url.searchParams.set("players", "false");
   url.searchParams.set("limit", String(LIVE_LIMIT));
 
-  const result = await fetchCloudbetJson(url.toString(), env?.CLOUDBET_API_KEY);
+  const result = await fetchCloudbetJson(
+    url.toString(),
+    env?.CLOUDBET_API_KEY
+  );
+
   if (!result.ok) {
     const diagnostic = {
       error: result.error ?? "UNKNOWN",
@@ -431,33 +435,45 @@ async function getRawCloudbetLive(env?: Env): Promise<AnyObj[]> {
       location: result.headers?.location ?? null,
       response_preview: result.preview ?? null
     };
+
     throw new Error(
       `CLOUDBET_LIVE_FAILED:${result.error ?? "UNKNOWN"}:${JSON.stringify(diagnostic)}`
     );
   }
 
   const events: AnyObj[] = [];
-  const sports = Array.isArray(result.data?.sports) ? result.data.sports : [];
 
-  for (const sport of sports) {
-    const competitions = Array.isArray(sport?.competitions) ? sport.competitions : [];
+  // V1.4.4:
+  // Official Cloudbet /pub/v2/odds/events response shape:
+  //   { competitions: [ { name, key, sport, events: [...] } ] }
+  //
+  // The old parser expected:
+  //   { sports: [ { competitions: [ { events: [...] } ] } ] }
+  //
+  // Parse the official V2 shape directly. Keep each event's original
+  // fields and attach sport/competition context exactly as the matcher expects.
+  const competitions = Array.isArray(result.data?.competitions)
+    ? result.data.competitions
+    : [];
 
-    for (const competition of competitions) {
-      const competitionEvents = Array.isArray(competition?.events) ? competition.events : [];
+  for (const competition of competitions) {
+    const competitionEvents = Array.isArray(competition?.events)
+      ? competition.events
+      : [];
 
-      for (const event of competitionEvents) {
-        events.push({
-          ...event,
-          sport: event?.sport ?? {
-            name: sport?.name ?? null,
-            key: sport?.key ?? null
-          },
-          competition: event?.competition ?? {
+    for (const event of competitionEvents) {
+      events.push({
+        ...event,
+        sport:
+          event?.sport ??
+          competition?.sport ??
+          null,
+        competition:
+          event?.competition ?? {
             name: competition?.name ?? null,
             key: competition?.key ?? null
           }
-        });
-      }
+      });
     }
   }
 
