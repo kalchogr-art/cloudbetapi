@@ -247,7 +247,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.51 ODDS RETRY DEEP DIAGNOSTICS";
+  "V7.6.52 STRICT OVER / UNDER SELECTION LOCK";
 
 const MODE =
   "DRY_RUN";
@@ -2245,11 +2245,22 @@ function selectionOutcomeIsOver(
       .toLowerCase()
       .trim();
 
+  // V7.6.52 HARD SIDE LOCK:
+  // If Cloudbet explicitly identifies the side, trust it and NEVER fall back
+  // to labels inherited from a parent market. This prevents an UNDER 0.5
+  // selection from being canonicalized as our OVER 0.5 target.
   if (
     explicit === "over" ||
     explicit === "o"
   ) {
     return true;
+  }
+
+  if (
+    explicit === "under" ||
+    explicit === "u"
+  ) {
+    return false;
   }
 
   const label =
@@ -2421,6 +2432,22 @@ function isTargetSelectionSemantic(
   selection: any
 ): boolean {
   if (!selection) {
+    return false;
+  }
+
+  // V7.6.52: reject an explicit UNDER URL before any canonicalization.
+  const rawMarketUrl = normalizeMarketUrl(
+    selection?.marketUrl ??
+    selection?.market_url ??
+    selection?.url ??
+    ""
+  );
+
+  if (
+    rawMarketUrl.includes("/under?") ||
+    rawMarketUrl.includes("/under/") ||
+    /(?:^|[?&])outcome=under(?:&|$)/.test(rawMarketUrl)
+  ) {
     return false;
   }
 
