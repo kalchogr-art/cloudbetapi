@@ -247,7 +247,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.52 STRICT OVER / UNDER SELECTION LOCK";
+  "V7.6.54 BET READY MAX 25M + LATE ODDS TRACKING";
 
 const MODE =
   "DRY_RUN";
@@ -363,6 +363,13 @@ const AGGRESSIVE_ODDS_RETRY_DELAYS_MS =
 // +45s absorbs feed/API timing jitter while still expiring around the end of 42'.
 const PENDING_WINDOW_GRACE_MS =
   45_000;
+
+// V7.6.54 — execution cutoff.
+// Hunter ENTRY may be 10–21′, but a recovered price is allowed to become
+// BET READY only while the live match minute is <= 25.
+// Later prices are still recorded diagnostically as ODDS_FOUND_TOO_LATE.
+const BET_READY_MAX_LIVE_MINUTE = 25;
+
 
 const MAX_MISSING_CHECKS =
   3;
@@ -1497,6 +1504,78 @@ async function pendingOddsExists(
       .first();
 
   return !!row;
+}
+
+
+// ============================================================
+// V7.6.54 — LIVE MINUTE CUTOFF FOR RECOVERED ODDS
+// ============================================================
+
+function extractCurrentLiveMinuteForBetReady(current: any): number | null {
+  const candidates = [
+    current?.event?.minute,
+    current?.event?.minute_extended,
+    current?.event?.live?.minute,
+    current?.event?.liveData?.minute,
+    current?.event?.live_data?.minute,
+    current?.event?.status?.minute,
+    current?.event?.clock?.minute,
+    current?.minute,
+    current?.validation?.minute,
+    current?.validation?.event_minute
+  ];
+
+  for (const value of candidates) {
+    if (value === null || value === undefined) continue;
+
+    if (typeof value === "number" && Number.isFinite(value)) {
+      return Math.floor(value);
+    }
+
+    const match = String(value).match(/(\d{1,3})/);
+    if (match) {
+      const minute = Number(match[1]);
+      if (Number.isFinite(minute)) return minute;
+    }
+  }
+
+  return null;
+}
+
+function recoveredOddsTimingDecision(
+  row: any,
+  current: any
+): {
+  allowed: boolean;
+  minute: number | null;
+  reason: string | null;
+} {
+  const liveMinute =
+    extractCurrentLiveMinuteForBetReady(current);
+
+  // Fail closed: if we cannot prove that the recovered odds arrived by 25′,
+  // do not activate BET READY. Keep the recovered price in diagnostics.
+  if (liveMinute === null) {
+    return {
+      allowed: false,
+      minute: null,
+      reason: "BET_READY_LIVE_MINUTE_UNKNOWN"
+    };
+  }
+
+  if (liveMinute > BET_READY_MAX_LIVE_MINUTE) {
+    return {
+      allowed: false,
+      minute: liveMinute,
+      reason: "ODDS_FOUND_TOO_LATE"
+    };
+  }
+
+  return {
+    allowed: true,
+    minute: liveMinute,
+    reason: null
+  };
 }
 
 async function removePendingRow(
@@ -6736,6 +6815,107 @@ async function processPending(
       continue;
     }
 
+    // V7.6.53 — FINAL RECHECK BEFORE PENDING ODDS IS SENT TO TRACKER.
+    //
+    // A recovered odds result is NOT allowed to activate BET READY immediately.
+    // Re-fetch the SAME locked Cloudbet event_id once more and prove that the
+    // exact FIRST HALF TOTAL GOALS OVER 0.5 selection is still valid.
+    //
+    // The second result becomes authoritative. If it disappears, changes side,
+    // is disabled, or fails the exact market lock, keep the row in PENDING_ODDS.
+    const finalRecheck =
+      await verifySameEventAndOdds(
+        env,
+        cloudbetId,
+        numberOrNull(
+          row.entry_minute
+        )
+      );
+
+    const finalRecheckValid =
+      finalRecheck.success === true &&
+      normalizeEventId(finalRecheck.event_id) === cloudbetId &&
+      safe(finalRecheck.market_url) === TARGET_MARKET_URL &&
+      safe(finalRecheck.selection_status).toUpperCase() === "SELECTION_ENABLED" &&
+      numberOrNull(finalRecheck.current_odds) !== null &&
+      Number(finalRecheck.current_odds) > 1;
+
+    if (!finalRecheckValid) {
+      const retry =
+        await incrementPendingRetry(
+          env,
+          row,
+          finalRecheck.error ||
+          "FINAL_ODDS_RECHECK_FAILED"
+        );
+
+      results.push({
+        pending_id: row.id,
+        cloudbet_id: cloudbetId,
+        action: "FINAL_ODDS_RECHECK_REJECTED",
+        odds_transition: "PENDING_ODDS_STAYS_PENDING",
+        first_odds_result: current,
+        final_recheck: finalRecheck,
+        ...retry
+      });
+
+      if (retry.action === "EXPIRED") {
+        expired++;
+      } else {
+        rescheduled++;
+      }
+
+      continue;
+    }
+
+    // Only the SECOND verification is allowed downstream.
+    // This is the value archived, sent to Tracker and used for handoff.
+    const confirmedCurrent =
+      finalRecheck;
+
+    // V7.6.54 — price is valid, but BET READY also depends on WHEN it was found.
+    // We intentionally keep late odds in diagnostics instead of forwarding them.
+    const timingDecision =
+      recoveredOddsTimingDecision(
+        row,
+        confirmedCurrent
+      );
+
+    if (!timingDecision.allowed) {
+      const retry =
+        await incrementPendingRetry(
+          env,
+          row,
+          timingDecision.reason ||
+          "BET_READY_TIME_GATE_FAILED"
+        );
+
+      results.push({
+        pending_id: row.id,
+        cloudbet_id: cloudbetId,
+        action:
+          timingDecision.reason === "ODDS_FOUND_TOO_LATE"
+            ? "ODDS_FOUND_TOO_LATE"
+            : "BET_READY_TIME_GATE_REJECTED",
+        odds_transition: "ODDS_FOUND_NOT_FORWARDED",
+        entry_minute: numberOrNull(row.entry_minute),
+        odds_found_live_minute: timingDecision.minute,
+        bet_ready_max_live_minute: BET_READY_MAX_LIVE_MINUTE,
+        recovered_odds: confirmedCurrent.current_odds ?? null,
+        market_url: confirmedCurrent.market_url ?? null,
+        confirmed_current: confirmedCurrent,
+        ...retry
+      });
+
+      if (retry.action === "EXPIRED") {
+        expired++;
+      } else {
+        rescheduled++;
+      }
+
+      continue;
+    }
+
     const signal =
       payload.signal ||
       {};
@@ -6762,7 +6942,7 @@ async function processPending(
       buildReadyBet(
         signal,
         trackerCloudbet,
-        current
+        confirmedCurrent
       );
 
     const archive =
@@ -6770,7 +6950,7 @@ async function processPending(
         env,
         bet,
         signal,
-        current
+        confirmedCurrent
       );
 
     if (
@@ -6814,7 +6994,7 @@ async function processPending(
         row,
         signal,
         cloudbetId,
-        current
+        confirmedCurrent
       );
 
     // V7.6.25 — callback is a required part of completing a pending odds row.
@@ -6861,7 +7041,7 @@ async function processPending(
     const handoff =
       buildTradingHandoff(
         bet,
-        current,
+        confirmedCurrent,
         account
       );
 
