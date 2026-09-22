@@ -1,4 +1,15 @@
-// ============================================================
+// V7.6.8 FIX:
+// - EFL Trophy academy/reserve provider-name recovery.
+// - Handles U21 / U23 / Reserve / Reserves being omitted or represented differently by Cloudbet.
+// - Examples: Liverpool U21 <-> Liverpool, Fulham U21 <-> Fulham,
+//   Exeter <-> Exeter City Reserve.
+// - Requires exact EFL Trophy competition context, normal +/-5 minute window,
+//   strong TWO-SIDED normalized team identity and a unique best candidate.
+// - Does NOT lower the global matcher/AI confidence threshold.
+// - Does NOT hardcode teams or event IDs.
+// - Existing category/minute/ambiguity protections remain active.
+//
+// // ============================================================
 // CLOUDBET MATCH MATCHER V7.6.6
 // CANDIDATE RANKING + D1 DIAGNOSTICS + SEPARATE ODDS LOOKUP
 // LIVE + 1H + 0:0 + CLOSE MINUTE FILTER
@@ -85,7 +96,7 @@ interface Env {
 type AnyObj = Record<string, any>;
 
 const VERSION =
-  "V7.6.7-AI-HANDOFF-LOCKED-CANDIDATE";
+  "V7.6.8-EFL-TROPHY-ACADEMY-RECOVERY";
 
 const DEFAULT_THRESHOLD =
   0.45;
@@ -3555,6 +3566,112 @@ function evaluateContextFallback(
 }
 
 
+
+// ============================================================
+// V7.6.8 — EFL TROPHY ACADEMY / RESERVE RECOVERY
+// ============================================================
+
+function isEflTrophyMatch(value: AnyObj): boolean {
+  const c = competitionText(value);
+  return c.includes("efl trophy");
+}
+
+function eflTrophyAcademyRecovery(
+  signal: AnyObj,
+  cloudbet: PreparedMatch[]
+): AnyObj | null {
+  if (!isEflTrophyMatch(signal)) return null;
+
+  const ranked: AnyObj[] = [];
+
+  for (const cb of cloudbet) {
+    if (!cb?.raw || !isEflTrophyMatch(cb.raw)) continue;
+
+    const diff = minuteDifference(signal, cb.raw);
+    if (diff === null || diff > MATCH_MINUTE_TOLERANCE) continue;
+
+    const detail = detailedMatchScore(signal, cb.raw);
+
+    // Only normal home/away direction. Both clubs must be strongly identified.
+    if (
+      detail.direction !== "NORMAL" ||
+      detail.homeScore < 0.90 ||
+      detail.awayScore < 0.90 ||
+      detail.competitionScore < 0.99
+    ) {
+      continue;
+    }
+
+    const hunterHome = signal?.home ?? "";
+    const hunterAway = signal?.away ?? "";
+    const cbHome = extractHome(cb.raw) ?? "";
+    const cbAway = extractAway(cb.raw) ?? "";
+
+    // normalizeTeam intentionally removes category/provider suffixes while
+    // teamCategory keeps them available for diagnostics/protection.
+    const normalizedHomeExact =
+      normalizeTeam(hunterHome) === normalizeTeam(cbHome);
+
+    const normalizedAwayExact =
+      normalizeTeam(hunterAway) === normalizeTeam(cbAway);
+
+    if (!normalizedHomeExact && !normalizedAwayExact) continue;
+
+    ranked.push({
+      cb,
+      detail,
+      minute: cloudbetMinute(cb.raw),
+      minuteDifference: diff,
+      normalizedHomeExact,
+      normalizedAwayExact,
+      hunterCategories: {
+        home: teamCategory(hunterHome),
+        away: teamCategory(hunterAway)
+      },
+      cloudbetCategories: {
+        home: teamCategory(cbHome),
+        away: teamCategory(cbAway)
+      }
+    });
+  }
+
+  ranked.sort((a, b) => {
+    if (b.detail.total !== a.detail.total) {
+      return b.detail.total - a.detail.total;
+    }
+    return a.minuteDifference - b.minuteDifference;
+  });
+
+  if (!ranked.length) return null;
+
+  const best = ranked[0];
+  const second = ranked.length > 1 ? ranked[1] : null;
+  const gap = second
+    ? Math.max(0, best.detail.total - second.detail.total)
+    : 1;
+
+  if (second && gap < MIN_CONFIDENT_SCORE_GAP) {
+    return {
+      accepted: false,
+      reason: "EFL_TROPHY_ACADEMY_AMBIGUOUS",
+      best,
+      second,
+      scoreGap: gap,
+      candidates: ranked.length
+    };
+  }
+
+  return {
+    accepted: true,
+    reason: "EFL_TROPHY_ACADEMY_CONFIDENT_MATCH",
+    best,
+    second,
+    scoreGap: gap,
+    candidates: ranked.length
+  };
+}
+
+
 function findHunterTargetMatch(
   signal: AnyObj,
   cloudbet:
@@ -3749,6 +3866,83 @@ function findHunterTargetMatch(
   if (
     ranked.length === 0
   ) {
+
+    const eflRecovery =
+      eflTrophyAcademyRecovery(
+        signal,
+        cloudbet
+      );
+
+    if (
+      eflRecovery?.accepted &&
+      eflRecovery.best
+    ) {
+      const recovered = eflRecovery.best;
+
+      return {
+        found: true,
+        best: recovered.cb,
+        second: eflRecovery.second?.cb ?? null,
+        detail: recovered.detail,
+        secondDetail: eflRecovery.second?.detail ?? null,
+        classification: "CONFIDENT_MATCH",
+        reason: "EFL_TROPHY_ACADEMY_CONFIDENT_MATCH",
+        matchMode: "EFL_TROPHY_ACADEMY_RECOVERY",
+        contextFallback: { accepted: false },
+        eflTrophyAcademyRecovery: {
+          accepted: true,
+          candidates: eflRecovery.candidates,
+          minute_difference: recovered.minuteDifference,
+          home_score: Number(recovered.detail.homeScore.toFixed(3)),
+          away_score: Number(recovered.detail.awayScore.toFixed(3)),
+          competition_score: Number(recovered.detail.competitionScore.toFixed(3)),
+          normalized_home_exact: recovered.normalizedHomeExact,
+          normalized_away_exact: recovered.normalizedAwayExact,
+          hunter_categories: recovered.hunterCategories,
+          cloudbet_categories: recovered.cloudbetCategories,
+          score_gap: eflRecovery.scoreGap
+        },
+        candidateEvaluations: candidateEvaluations + eflRecovery.candidates,
+        candidates: candidates.length,
+        minuteCandidates,
+        targetMinute,
+        bestMinute: recovered.minute,
+        bestMinuteDifference: recovered.minuteDifference,
+        scoreGap: eflRecovery.scoreGap,
+        topCandidates: [
+          candidateDiagnosticRecord(
+            recovered.cb,
+            recovered.detail,
+            signal
+          )
+        ]
+      };
+    }
+
+    if (
+      eflRecovery &&
+      eflRecovery.accepted === false
+    ) {
+      const rejected =
+        emptyResult(
+          eflRecovery.reason,
+          targetMinute,
+          candidates.length,
+          minuteCandidates,
+          candidateEvaluations + eflRecovery.candidates
+        );
+
+      return {
+        ...rejected,
+        matchMode: "EFL_TROPHY_ACADEMY_REJECTED",
+        eflTrophyAcademyRecovery: {
+          accepted: false,
+          reason: eflRecovery.reason,
+          candidates: eflRecovery.candidates,
+          score_gap: eflRecovery.scoreGap
+        }
+      };
+    }
 
     if (
       minuteCandidates === 0
@@ -3959,6 +4153,42 @@ function findHunterTargetMatch(
     finalReason = "BEST_AND_SECOND_CANDIDATES_TOO_CLOSE";
     finalFound = false;
     matchMode = "STRICT_AMBIGUOUS";
+  }
+
+  if (!initiallyConfident && !contextAccepted) {
+    const eflRecovery =
+      eflTrophyAcademyRecovery(
+        signal,
+        cloudbet
+      );
+
+    if (
+      eflRecovery?.accepted &&
+      eflRecovery.best
+    ) {
+      const recovered = eflRecovery.best;
+      finalClassification = "CONFIDENT_MATCH";
+      finalReason = "EFL_TROPHY_ACADEMY_CONFIDENT_MATCH";
+      finalFound = true;
+      finalBest = {
+        cb: recovered.cb,
+        detail: recovered.detail,
+        score: recovered.detail.total,
+        minute: recovered.minute,
+        minuteDifference: recovered.minuteDifference
+      };
+      finalSecond = eflRecovery.second
+        ? {
+            cb: eflRecovery.second.cb,
+            detail: eflRecovery.second.detail,
+            score: eflRecovery.second.detail.total,
+            minute: eflRecovery.second.minute,
+            minuteDifference: eflRecovery.second.minuteDifference
+          }
+        : null;
+      finalScoreGap = eflRecovery.scoreGap;
+      matchMode = "EFL_TROPHY_ACADEMY_RECOVERY";
+    }
   }
 
   if (!initiallyConfident && contextAccepted && contextBest) {
