@@ -1,3 +1,10 @@
+// V7.6.55:
+// - Captures the FIRST same-event odds verification snapshot at Hunter ENTRY.
+// - Persists it to odds_retry_log with attempt=0 before later pending retries.
+// - Keeps exact Cloudbet event_id, exact 1H O0.5 market lock and all safety gates.
+// - Stores direct /event result plus matcher/raw fallback diagnostics available at that moment.
+// - No betting/stake/matcher/filter behavior changed.
+//
 // V7.6.48:
 // - RAW_LIVE_HTTP_400 and temporary RAW live failures are recoverable.
 // - Existing 0s -> 3s -> 5s -> 10s SAME-event odds recovery continues.
@@ -247,7 +254,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.54 BET READY MAX 25M + LATE ODDS TRACKING";
+  "V7.6.55 ENTRY ODDS SNAPSHOT + RAW FALLBACK DIAGNOSTICS";
 
 const MODE =
   "DRY_RUN";
@@ -4626,6 +4633,10 @@ async function verifySameEventAndOddsAggressive(
       hunterEntryMinute
     );
 
+  // V7.6.55 — immutable snapshot of the FIRST verification at Hunter ENTRY.
+  // Later 3s/5s/10s retries must not overwrite what Cloudbet exposed at t=0.
+  const initialSnapshot = current;
+
   const attempts: any[] = [{
     attempt: 1,
     delay_ms: 0,
@@ -4640,7 +4651,8 @@ async function verifySameEventAndOddsAggressive(
       recovery: {
         mode: "AGGRESSIVE_SAME_EVENT",
         event_id_locked: expectedEventId,
-        attempts
+        attempts,
+        initial_snapshot: initialSnapshot
       }
     };
   }
@@ -4677,7 +4689,8 @@ async function verifySameEventAndOddsAggressive(
       event_id_locked: expectedEventId,
       schedule_ms: AGGRESSIVE_ODDS_RETRY_DELAYS_MS,
       attempts,
-      recovered: current.success === true
+      recovered: current.success === true,
+      initial_snapshot: initialSnapshot
     }
   };
 }
@@ -6509,6 +6522,145 @@ function diagnosticFlag(obj: any, keys: string[]): number | null {
   }
   return null;
 }
+
+async function logEntryOddsSnapshot(
+  env: Env,
+  signal: any,
+  cloudbetId: string,
+  current: any
+): Promise<void> {
+  try {
+    const initial =
+      current?.recovery?.initial_snapshot ??
+      current;
+
+    const reason =
+      safe(
+        initial?.error ||
+        initial?.reason ||
+        (initial?.success ? "ODDS_FOUND_AT_ENTRY" : "TARGET_ODDS_UNAVAILABLE_AT_ENTRY")
+      );
+
+    const odds =
+      numberOrNull(
+        initial?.current_odds ??
+        initial?.odds ??
+        initial?.price
+      );
+
+    const maxStake =
+      numberOrNull(
+        initial?.max_stake ??
+        initial?.maxStake
+      );
+
+    const validation =
+      initial?.validation ?? {};
+
+    const rawEventFound =
+      diagnosticFlag(initial, [
+        "raw_event_found",
+        "diagnostics.raw_event_found",
+        "raw_live_event_found",
+        "diagnostics.raw_live_event_found",
+        "event_found",
+        "diagnostics.event_found"
+      ]);
+
+    const exactMarketFound =
+      diagnosticFlag(initial, [
+        "exact_1h_market_found",
+        "diagnostics.exact_1h_market_found",
+        "target_market_found",
+        "diagnostics.target_market_found",
+        "market_found",
+        "diagnostics.market_found",
+        "validation.exact_market_url"
+      ]);
+
+    const over05Found =
+      diagnosticFlag(initial, [
+        "over_05_found",
+        "diagnostics.over_05_found",
+        "target_selection_found",
+        "diagnostics.target_selection_found",
+        "selection_found",
+        "diagnostics.selection_found",
+        "validation.direct_event_target_found"
+      ]);
+
+    const selectionEnabled =
+      diagnosticFlag(initial, [
+        "selection_enabled",
+        "diagnostics.selection_enabled",
+        "enabled",
+        "diagnostics.enabled",
+        "validation.selection_enabled"
+      ]);
+
+    const compactSnapshot = {
+      snapshot_type: "HUNTER_ENTRY_T0",
+      captured_at: nowISO(),
+      signal: {
+        match_id: signal?.match_id ?? signal?.id ?? null,
+        match: signalMatch(signal) || null,
+        entry_minute: numberOrNull(signal?.entry_minute ?? signal?.minute),
+        hunter_score: numberOrNull(signal?.hunter_score)
+      },
+      locked_event_id: normalizeEventId(cloudbetId),
+      result: {
+        success: initial?.success === true,
+        error: initial?.error ?? null,
+        current_odds: odds,
+        max_stake: maxStake,
+        min_stake: numberOrNull(initial?.min_stake ?? initial?.minStake),
+        selection_status: initial?.selection_status ?? null,
+        market_url: initial?.market_url ?? null
+      },
+      validation: {
+        valid: validation?.valid ?? null,
+        reason: validation?.reason ?? null,
+        odds_source: validation?.odds_source ?? null,
+        exact_event_id: validation?.exact_event_id ?? null,
+        exact_market_url: validation?.exact_market_url ?? null,
+        selection_enabled: validation?.selection_enabled ?? null,
+        direct_event_target_found: validation?.direct_event_target_found ?? null,
+        matcher_fallback_used: validation?.matcher_fallback_used ?? null,
+        matcher_fallback_error: validation?.matcher_fallback_error ?? null,
+        raw_live_fallback_used: validation?.raw_live_fallback_used ?? null,
+        raw_live_error: validation?.raw_live_error ?? null,
+        direct_event_rejection: validation?.direct_event_rejection ?? null
+      },
+      recovery_attempts: current?.recovery?.attempts ?? []
+    };
+
+    await env.DB.prepare(`
+      INSERT INTO odds_retry_log (
+        signal_match_id, cloudbet_id, match, attempt, success, reason,
+        current_odds, max_stake, raw_event_found, exact_1h_market_found,
+        over_05_found, selection_enabled, diagnostic_json, checked_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      signal?.match_id ?? signal?.id ?? null,
+      normalizeEventId(cloudbetId),
+      signalMatch(signal) || null,
+      0,
+      initial?.success === true ? 1 : 0,
+      reason || null,
+      odds,
+      maxStake,
+      rawEventFound,
+      exactMarketFound,
+      over05Found,
+      selectionEnabled,
+      JSON.stringify(compactSnapshot),
+      nowISO()
+    ).run();
+  } catch {
+    // Entry diagnostics must NEVER interrupt the betting pipeline.
+  }
+}
+
 
 async function logOddsRetryDiagnostic(
   env: Env,
@@ -10494,6 +10646,15 @@ async function runDirectPreflight(
         signal?.minute
       )
     );
+
+  // V7.6.55 — persist what the FIRST t=0 verification saw at Hunter ENTRY.
+  // This is diagnostic-only and never changes READY/PENDING/betting decisions.
+  await logEntryOddsSnapshot(
+    env,
+    signal,
+    eventId,
+    current
+  );
 
   if (!current.success) {
     if (isTerminalPreflightFailure(current.error)) {
