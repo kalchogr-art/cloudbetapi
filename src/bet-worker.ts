@@ -1,4 +1,4 @@
-// V7.6.55:
+// V7.6.56: adds READ-ONLY /entry-odds-debug for attempt=0 ENTRY snapshots. No betting logic changed.\n// V7.6.55:
 // - Captures the FIRST same-event odds verification snapshot at Hunter ENTRY.
 // - Persists it to odds_retry_log with attempt=0 before later pending retries.
 // - Keeps exact Cloudbet event_id, exact 1H O0.5 market lock and all safety gates.
@@ -254,7 +254,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.55 ENTRY ODDS SNAPSHOT + RAW FALLBACK DIAGNOSTICS";
+  "V7.6.56 ENTRY ODDS SNAPSHOT + DEBUG ENDPOINT";
 
 const MODE =
   "DRY_RUN";
@@ -11686,6 +11686,97 @@ export default {
             env
           )
         );
+      }
+
+      if (path === "/entry-odds-debug") {
+        if (request.method !== "GET") {
+          return json({
+            success: false,
+            worker: "cloudbet-bet-worker",
+            version: VERSION,
+            error: "METHOD_NOT_ALLOWED",
+            expected_method: "GET"
+          }, 405);
+        }
+
+        const eventId = normalizeEventId(
+          url.searchParams.get("event_id") ??
+          url.searchParams.get("id")
+        );
+
+        if (!eventId) {
+          return json({
+            success: false,
+            worker: "cloudbet-bet-worker",
+            version: VERSION,
+            diagnostic: "ENTRY_ODDS_SNAPSHOT",
+            error: "event_id is required",
+            example: "/entry-odds-debug?event_id=36450346"
+          }, 400);
+        }
+
+        try {
+          const result = await env.DB.prepare(`
+            SELECT
+              id, signal_match_id, cloudbet_id, match, attempt, success, reason,
+              current_odds, max_stake, raw_event_found, exact_1h_market_found,
+              over_05_found, selection_enabled, diagnostic_json, checked_at
+            FROM odds_retry_log
+            WHERE CAST(cloudbet_id AS TEXT) = ?
+              AND attempt = 0
+            ORDER BY checked_at ASC, id ASC
+          `).bind(eventId).all();
+
+          const snapshots = (result?.results || []).map((row: any) => {
+            let snapshot: any = null;
+            try {
+              snapshot = row?.diagnostic_json
+                ? JSON.parse(String(row.diagnostic_json))
+                : null;
+            } catch {
+              snapshot = row?.diagnostic_json ?? null;
+            }
+
+            return {
+              id: row?.id ?? null,
+              signal_match_id: row?.signal_match_id ?? null,
+              cloudbet_id: row?.cloudbet_id ?? null,
+              match: row?.match ?? null,
+              attempt: row?.attempt ?? null,
+              success: Number(row?.success || 0) === 1,
+              reason: row?.reason ?? null,
+              current_odds: numberOrNull(row?.current_odds),
+              max_stake: numberOrNull(row?.max_stake),
+              raw_event_found: row?.raw_event_found ?? null,
+              exact_1h_market_found: row?.exact_1h_market_found ?? null,
+              over_05_found: row?.over_05_found ?? null,
+              selection_enabled: row?.selection_enabled ?? null,
+              checked_at: row?.checked_at ?? null,
+              snapshot
+            };
+          });
+
+          return json({
+            success: true,
+            worker: "cloudbet-bet-worker",
+            version: VERSION,
+            diagnostic: "ENTRY_ODDS_SNAPSHOT",
+            mode: "READ_ONLY",
+            event_id: eventId,
+            found: snapshots.length > 0,
+            count: snapshots.length,
+            snapshots
+          });
+        } catch (error: any) {
+          return json({
+            success: false,
+            worker: "cloudbet-bet-worker",
+            version: VERSION,
+            diagnostic: "ENTRY_ODDS_SNAPSHOT",
+            event_id: eventId,
+            error: error?.message || String(error)
+          }, 500);
+        }
       }
 
       if (path === "/odds-debug") {
