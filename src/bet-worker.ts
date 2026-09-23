@@ -1,4 +1,12 @@
-// V7.6.56: adds READ-ONLY /entry-odds-debug for attempt=0 ENTRY snapshots. No betting logic changed.\n// V7.6.55:
+// V7.6.57:
+// - Deep diagnostic for RAW Cloudbet live HTTP failures, especially HTTP 400.
+// - Captures safe request URL/query + status + content-type + response body (max 4000 chars).
+// - Never stores authorization/API-key/cookie header values.
+// - Persists diagnostic inside the existing immutable Hunter ENTRY attempt=0 snapshot.
+// - Existing /entry-odds-debug?event_id=... exposes it under validation.raw_live_http_debug.
+// - No matcher, Hunter filter, exact-market lock, retry timing, stake or betting behavior changed.
+//
+// // V7.6.56: adds READ-ONLY /entry-odds-debug for attempt=0 ENTRY snapshots. No betting logic changed.\n// V7.6.55:
 // - Captures the FIRST same-event odds verification snapshot at Hunter ENTRY.
 // - Persists it to odds_retry_log with attempt=0 before later pending retries.
 // - Keeps exact Cloudbet event_id, exact 1H O0.5 market lock and all safety gates.
@@ -254,7 +262,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.56 ENTRY ODDS SNAPSHOT + DEBUG ENDPOINT";
+  "V7.6.57 RAW LIVE 400 DEEP DIAGNOSTIC";
 
 const MODE =
   "DRY_RUN";
@@ -2967,6 +2975,16 @@ interface MatcherOddsResult {
   market_url: string | null;
   available: boolean;
   error?: string;
+  raw_http_debug?: {
+    request_url: string;
+    request_method: string;
+    request_query: Record<string, string>;
+    http_status: number;
+    http_status_text: string;
+    response_content_type: string | null;
+    response_body: string | null;
+    response_body_truncated: boolean;
+  };
 }
 
 function matcherLiveMatches(
@@ -3310,7 +3328,17 @@ async function fetchExactRawLiveOdds(
         selection_status: null,
         market_url: null,
         available: false,
-        error: `RAW_LIVE_HTTP_${response.status}`
+        error: `RAW_LIVE_HTTP_${response.status}`,
+        raw_http_debug: {
+          request_url: url.toString(),
+          request_method: "GET",
+          request_query: Object.fromEntries(url.searchParams.entries()),
+          http_status: response.status,
+          http_status_text: response.statusText || "",
+          response_content_type: response.headers.get("content-type"),
+          response_body: text ? text.slice(0, 4000) : null,
+          response_body_truncated: text.length > 4000
+        }
       };
     }
 
@@ -4389,6 +4417,8 @@ async function verifySameEventAndOdds(
             true,
           raw_live_error:
             rawLiveOdds.error ?? null,
+          raw_live_http_debug:
+            rawLiveOdds.raw_http_debug ?? null,
           direct_event_rejection:
             directRejected
               ? {
@@ -4500,6 +4530,8 @@ async function verifySameEventAndOdds(
             true,
           raw_live_error:
             rawLiveOdds.error ?? null,
+          raw_live_http_debug:
+            rawLiveOdds.raw_http_debug ?? null,
           rejected_candidate_odds:
             !exactMarketUrl
               ? livePrice
@@ -6629,6 +6661,7 @@ async function logEntryOddsSnapshot(
         matcher_fallback_error: validation?.matcher_fallback_error ?? null,
         raw_live_fallback_used: validation?.raw_live_fallback_used ?? null,
         raw_live_error: validation?.raw_live_error ?? null,
+        raw_live_http_debug: validation?.raw_live_http_debug ?? null,
         direct_event_rejection: validation?.direct_event_rejection ?? null
       },
       recovery_attempts: current?.recovery?.attempts ?? []
