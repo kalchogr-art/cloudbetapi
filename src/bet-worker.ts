@@ -1,3 +1,9 @@
+// V7.6.58 TEAM TOTAL COLLISION GUARD:
+// - Rejects any TEAM TOTAL selection from the global 1H Over 0.5 target.
+// - Rejects params/URLs containing team= for the global total-goals market.
+// - Prevents nested team_total_goals keys from inheriting global total-goals context.
+// - Keeps event-id lock, retry timing, matcher, stake and betting behavior unchanged.
+//
 // V7.6.57:
 // - Deep diagnostic for RAW Cloudbet live HTTP failures, especially HTTP 400.
 // - Captures safe request URL/query + status + content-type + response body (max 4000 chars).
@@ -262,7 +268,7 @@ type Obj = Record<string, any>;
 // ============================================================
 
 const VERSION =
-  "V7.6.57 RAW LIVE 400 DEEP DIAGNOSTIC";
+  "V7.6.58 TEAM TOTAL COLLISION GUARD";
 
 const MODE =
   "DRY_RUN";
@@ -2183,6 +2189,17 @@ function marketImpliesFirstHalf(
     return false;
   }
 
+  // V7.6.58: TEAM TOTAL is never the global match total market.
+  // This blocks labels/keys such as "1st Half Team Total Goals".
+  if (
+    text.includes("team total") ||
+    text.includes("team_total") ||
+    text.includes("team total goals") ||
+    text.includes("team_total_goals")
+  ) {
+    return false;
+  }
+
   return (
     text ===
       norm(TARGET_MARKET) ||
@@ -2522,10 +2539,72 @@ function selectionExactTargetMarketUrl(
   );
 }
 
+function selectionHasTeamQualifier(
+  selection: any
+): boolean {
+  if (!selection) {
+    return false;
+  }
+
+  const params = selection?.params;
+
+  if (typeof params === "string") {
+    const p = params.toLowerCase();
+    if (/(?:^|[?&;\s])team\s*=/.test(p)) {
+      return true;
+    }
+  }
+
+  if (params && typeof params === "object") {
+    if (
+      params.team !== undefined ||
+      params.team_id !== undefined ||
+      params.teamId !== undefined
+    ) {
+      return true;
+    }
+  }
+
+  const rawUrl = normalizeMarketUrl(
+    selection?.marketUrl ??
+    selection?.market_url ??
+    selection?.url ??
+    ""
+  );
+
+  if (/(?:^|[?&])team=/.test(rawUrl)) {
+    return true;
+  }
+
+  const marketIdentity = [
+    selection?.market,
+    selection?.market_key,
+    selection?.marketKey,
+    selection?.market_name,
+    selection?.marketName
+  ]
+    .map(marketText)
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    marketIdentity.includes("team total") ||
+    marketIdentity.includes("team_total") ||
+    marketIdentity.includes("team total goals") ||
+    marketIdentity.includes("team_total_goals")
+  );
+}
+
 function isTargetSelectionSemantic(
   selection: any
 ): boolean {
   if (!selection) {
+    return false;
+  }
+
+  // V7.6.58 HARD GLOBAL-TOTAL LOCK:
+  // global 1H O0.5 can NEVER carry a team qualifier.
+  if (selectionHasTeamQualifier(selection)) {
     return false;
   }
 
@@ -2906,12 +2985,22 @@ function searchTargetRecursive(
       safe(childKey);
 
     // A property key can itself BE the Cloudbet market key.
-    // Only promote it when it is our exact target market family.
+    // V7.6.58: TEAM TOTAL keys must also replace inherited context,
+    // otherwise a nested team-total selection can inherit the previous
+    // global total-goals market and be canonicalized incorrectly.
+    const normalizedKeyText = marketText(keyText);
+    const isTeamTotalKey =
+      normalizedKeyText.includes("team total") ||
+      normalizedKeyText.includes("team_total") ||
+      normalizedKeyText.includes("team total goals") ||
+      normalizedKeyText.includes("team_total_goals");
+
     if (
       isTargetMarket(
         keyText
       ) ||
-      keyText === TARGET_MARKET
+      keyText === TARGET_MARKET ||
+      isTeamTotalKey
     ) {
       nextMarket =
         keyText;
